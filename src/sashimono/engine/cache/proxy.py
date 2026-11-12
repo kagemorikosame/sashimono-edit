@@ -77,6 +77,7 @@
 元 16 秒間隔               79.9ms     170.8ms
 元 50 秒間隔               197.3ms    419.4ms
 控え 8.3 秒間隔（版 2）     39.4ms     60.2ms
+元 60fps 250 コマごと      49.5ms     73.8ms
 控え 0.5 秒間隔（版 3）     5.8ms      7.6ms
 ======================= ========== ================
 
@@ -88,6 +89,11 @@
 * **控え自身の間隔も短くないと効かない** 版 2 までの控えは符号化器の既定（250 コマ
   30fps で 8.3 秒）のままで、540p に縮めても 39.4ms 1080p で 2 秒間隔の元（23.6ms）より遅かった
   版 3 から 0.5 秒ごとにキーフレームを置く（:data:`PROXY_KEYFRAME_SECONDS`）
+* **効くのは秒ではなくコマの数** 60fps で 250 コマごと（4.2 秒 録画ソフトの既定）は、
+  30fps の 8 秒間隔と同じくらい遅い（2026-11-08 #441 で足した行 素材は 30 秒）
+  線を秒で持つままでも、60fps の 4.2 秒は線を超えて控えの対象になるので、見直しでは線を
+  変えなかった 控えを作る時間の長さは、別のプロセスで作る（#440）ことと、使っていない
+  素材を後回しにする（#441）ことで払う
 * 線は :data:`KEYFRAME_GAP_LIMIT`（4 秒） 4 秒までは元のまま読んでも 2 秒間隔と 8ms ほどしか
   違わず、変換で CPU か GPU を使う方が損 8 秒では倍になる 録画ソフトの既定に多い
   250 コマごと（60fps で 4.2 秒 30fps で 8.3 秒）は線を超えるので控えを作る
@@ -102,10 +108,13 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
+import logging
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import cast
@@ -116,7 +125,8 @@ import av.error
 import av.video.stream
 import numpy as np
 
-from sashimono.core.model import MediaId, MediaItem
+from sashimono.core.model import MediaId, MediaItem, Project, SceneId
+from sashimono.core.model.timeline import Timeline
 from sashimono.engine.cache.progress import JobBoard, ProgressSnapshot
 from sashimono.engine.cache.store import CacheStore, media_key
 from sashimono.engine.colorspace import tag_bt709, to_bt709, to_rgb_array
@@ -130,11 +140,15 @@ from sashimono.engine.encoders import (
     order_by_priority,
     usable,
 )
+from sashimono.engine.worker import WorkerUnavailableError, run_in_process
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "KEYFRAME_GAP_LIMIT",
     "MEASURED_KEYFRAME_SEEK_MS",
     "MEASURED_PREFETCH_MS",
+    "MEASURED_PROXY_SPEED",
     "PROXY_HEIGHT",
     "PROXY_KEYFRAME_SECONDS",
     "ProxyBuilder",
@@ -143,6 +157,9 @@ __all__ = [
     "is_worth_proxying",
     "needs_keyframe_check",
     "proxy_codecs",
+    "proxy_job",
+    "proxy_order",
+    "used_media",
 ]
 
 #: 上の表の「3 枚」の行（元 + 等倍 / 控え + 等倍 / 控え + 1/4）と「1 枚」の元 + 等倍
@@ -179,6 +196,24 @@ PROXY_KEYFRAME_SECONDS = Fraction(1, 2)
 #: 上の表の、元 1080p の 2 秒・8 秒・50 秒間隔と 0.5 秒間隔の控え（中央値 ミリ秒）
 #: 設定の画面がここから文言を組み立てる
 MEASURED_KEYFRAME_SEEK_MS = (23.6, 46.7, 197.3, 5.8)
+
+#: 控えを作る速さ（素材の秒数 / 掛かった秒数 #440） 画面を操作しながら、裏で Python を
+#: 回し続けるスレッド（先読みや解析の代わり）もある所で、アプリの中のスレッドで作った場合と、
+#: 別のプロセスで作った場合 設定の画面がここから文言を組み立てる
+#:
+#: ``tools/bench_contention.py``（2026-11-08 RTX 5060 Ti 1080p60 60 秒 250 コマごと NVENC）
+#:
+#: ============================  ==============  ===============
+#: 条件                          スレッド         別のプロセス
+#: ============================  ==============  ===============
+#: 単体（画面は何もしない）        19.3 倍速        17.7 倍速
+#: 画面を操作しながら              13.5 倍速        16.9 倍速
+#: 同じ + Python の回るスレッド    0.2 倍速         14.4 倍速
+#: ============================  ==============  ===============
+#:
+#: 別のプロセスは 1 本ごとに子の起動と NVENC の用意（1 秒ほど）が乗るので、短い素材の単体では
+#: スレッドよりわずかに遅い 取り合いがあると、スレッドは 0.2 倍速まで落ちる（#440 の再現）
+MEASURED_PROXY_SPEED = (0.2, 14.4)
 
 #: 控えの置き場（:class:`~sashimono.engine.cache.store.CacheStore` の名前空間）
 NAMESPACE = "proxy"
@@ -227,6 +262,137 @@ def needs_keyframe_check(media: MediaItem) -> bool:
     大きい素材は調べなくても作る 調べると、4K の素材のたびに無駄に読むことになる
     """
     return media.has_video and not media.is_still and not is_worth_proxying(media)
+
+
+#: 別のシーンにだけある素材の順位の下駄 メインの再生位置からの距離は測れないので、
+#: メインで使う素材の後、使っていない素材の前に並べる
+_OTHER_SCENE = 1 << 40
+
+
+#: 置いたシーンの中へ入る回数の上限 入れ子のシーンをいくつもの速さで何か所にも置いた作品
+#: では、起点の組み合わせが段の数の指数で増え、先回りの枝切りでも減らないことがある
+#: 越えた先は中へ入らず、ほかのタイムラインとして後ろへ並べる 順が少し粗くなるだけで、
+#: 作品を開くたびに画面が長く止まるよりよい
+MAX_SCENE_VISITS = 4096
+
+
+@dataclass
+class _Walk:
+    """シーンの中をたどる間の覚え
+
+    ``seen`` はシーンの ID と中の再生位置ごとに、たどった（下駄, 縮み）の組 中の距離は
+    下駄 + 中のコマ数 × 縮み なので、下駄も縮みも前の組以上なら何も縮めず、たどらずに済む
+    """
+
+    seen: dict[tuple[SceneId, int], list[tuple[Fraction, Fraction]]] = field(default_factory=dict)
+    visits: int = 0
+
+    def enter(self, scene: SceneId, inner: int, base: Fraction, scale: Fraction) -> bool:
+        """この起点から中へ入るか 入るなら覚える"""
+        if self.visits >= MAX_SCENE_VISITS:
+            return False
+        known = self.seen.setdefault((scene, inner), [])
+        if any(old_base <= base and old_scale <= scale for old_base, old_scale in known):
+            return False
+        # 今度の組に負ける組は捨てる 残すと比べる数が増えるだけ
+        known[:] = [
+            (old_base, old_scale)
+            for old_base, old_scale in known
+            if not (base <= old_base and scale <= old_scale)
+        ]
+        known.append((base, scale))
+        self.visits += 1
+        return True
+
+
+def _distances(
+    project: Project,
+    timeline: Timeline,
+    playhead: int,
+    base: Fraction,
+    found: dict[MediaId, Fraction],
+    *,
+    deep: bool = True,
+    scale: Fraction = Fraction(1),
+    inside: frozenset[SceneId] = frozenset(),
+    walk: _Walk | None = None,
+) -> None:
+    """``timeline`` の素材の、再生位置からの距離（いちばん外の時間軸のコマ数）を ``found`` へ入れる
+
+    ``scale`` はこのタイムラインの 1 コマが外の何コマに当たるか 10 倍速で置いたシーンの中の
+    100 コマ先は、外では 10 コマ先に見える 縮めずに足すと、外のすぐ先の素材より後へ回る
+    ``deep`` が偽なら置いたシーンの中へ入らない どのタイムラインもそれぞれ 1 度ずつ数える
+    呼び方（使っている素材を集めるとき）で、中へ入ると同じシーンを何度も数えることになる
+    """
+    if walk is None:
+        walk = _Walk()
+    for track in timeline.tracks:
+        for clip in track.clips:
+            if clip.media_id is None and clip.scene_id is None:
+                continue
+            if clip.timeline_start <= playhead < clip.timeline_end:
+                distance = 0
+            else:
+                distance = min(
+                    abs(clip.timeline_start - playhead), abs(clip.timeline_end - 1 - playhead)
+                )
+            reach = base + distance * scale
+            if clip.scene_id is not None:
+                # 置いたシーンの中も、再生位置が指す所からの近さで並べる 中を見ないと、
+                # 再生位置で見えている素材が、ほかのシーンにだけある素材と同じ後ろへ回る
+                # 外れていればクリップの端の所を起点にし、離れている分を下駄に足す
+                scene = project.find_scene(clip.scene_id)
+                if not deep or scene is None or scene.id in inside:
+                    continue
+                local = min(max(playhead - clip.timeline_start, 0), clip.duration - 1)
+                rate = timeline.rate
+                inner = int(clip.picture_time(local, rate) / rate.frame_duration)
+                inner_scale = scale / clip.speed
+                if not walk.enter(scene.id, inner, reach, inner_scale):
+                    continue
+                _distances(
+                    project,
+                    scene.timeline,
+                    inner,
+                    reach,
+                    found,
+                    scale=inner_scale,
+                    inside=inside | {scene.id},
+                    walk=walk,
+                )
+                continue
+            assert clip.media_id is not None
+            current = found.get(clip.media_id)
+            if current is None or reach < current:
+                found[clip.media_id] = reach
+
+
+def proxy_order(project: Project, playhead: int, active: Timeline | None = None) -> list[MediaId]:
+    """控えを作る順（#441） タイムラインで使っている素材を再生位置に近い順 → それ以外
+
+    ``active`` は再生位置のあるタイムライン（開いているシーン） 省けばメイン
+    ほかのタイムライン（メインとシーン）でだけ使う素材は、そのあとに並べる 使っていない素材は
+    素材一覧の並びのまま最後に置く 開いてすぐ見る所の控えが先にできれば、待つのは
+    見ていない所の分だけになる
+    """
+    found: dict[MediaId, Fraction] = {}
+    _distances(
+        project, active if active is not None else project.timeline, playhead, Fraction(0), found
+    )
+    # ほかのタイムラインは全部並べて見るので、置いたシーンの中へは入らない
+    for timeline in (project.timeline, *(scene.timeline for scene in project.scenes)):
+        _distances(project, timeline, 0, Fraction(_OTHER_SCENE), found, deep=False)
+    used = sorted(found, key=lambda media_id: found[media_id])
+    taken = set(used)
+    return [*used, *(media.id for media in project.media if media.id not in taken)]
+
+
+def used_media(project: Project) -> set[MediaId]:
+    """どこかのタイムライン（シーンも）のクリップが指している素材"""
+    found: dict[MediaId, Fraction] = {}
+    for timeline in (project.timeline, *(scene.timeline for scene in project.scenes)):
+        _distances(project, timeline, 0, Fraction(0), found, deep=False)
+    return set(found)
 
 
 class ProxyStore:
@@ -315,9 +481,11 @@ def create_proxy(
     height: int = PROXY_HEIGHT,
     stream_index: int | None = None,
     codec: str | None = None,
+    codecs: Sequence[str] | None = None,
     encoder_priority: str = PRIORITY_AUTO,
     progress: Callable[[float], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    working: Path | None = None,
 ) -> Path | None:
     """``source`` の映像を縮めて ``target`` へ書く 作れなければ ``None``
 
@@ -331,16 +499,27 @@ def create_proxy(
     長さも変えない ここがずれると、控えのときだけ絵が 1 フレーム早い/遅い
     という、原因の分かりにくい不具合になる
 
-    ``codec`` を名指ししなければ、``encoder_priority`` の作り手を先に試す（#365）
+    ``codec`` を名指ししなければ、``codecs``（試す順）か、それも無ければ ``encoder_priority`` の
+    作り手を先に試す（#365） 別のプロセスで作るときは親が試した ``codecs`` を渡す 子の中で
+    試し直すと、控えを 1 本作るたびに NVENC を開く試し（1 回 100 ms ほど）を払う
+
+    ``working`` は書きかけの場所 別のプロセスで作るときに親が決めて渡す 子を止めたときに
+    消す物を、親の側で知っておくため
     """
-    names = [codec] if codec is not None else proxy_codecs(encoder_priority)
+    if codec is not None:
+        names = [codec]
+    elif codecs is not None:
+        names = list(codecs)
+    else:
+        names = proxy_codecs(encoder_priority)
     if not names:
         return None
 
     target.parent.mkdir(parents=True, exist_ok=True)
     # 書きかけの名前を分けておく 同じ素材を 2 回読み込んでも取り合いにならず、
     # 途中で落ちても壊れた控えが残らない
-    working = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.part")
+    if working is None:
+        working = working_path(target)
     # 次の候補で作り直しても進み具合を戻さない（#365） 戻ると素材の一覧の進み具合が下がる
     shown = MonotonicProgress(progress) if progress is not None else None
 
@@ -373,6 +552,39 @@ def create_proxy(
             # 変換を始め直すことになり、止めたのに止まらないように見える
             return None
     return None
+
+
+def working_path(target: Path) -> Path:
+    """``target`` の書きかけの場所 プロセスとスレッドごとに分ける"""
+    return target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.part")
+
+
+def proxy_job(
+    *,
+    progress: Callable[[float], None],
+    should_cancel: Callable[[], bool],
+    source: str,
+    target: str,
+    working: str,
+    height: int,
+    stream_index: int | None,
+    codecs: tuple[str, ...],
+) -> str | None:
+    """別のプロセスで控えを作る入口（:func:`~sashimono.engine.worker.run_in_process` が呼ぶ）
+
+    場所は文字で受け渡す 子と親で同じ物を指せばよく、型ごと pickle する理由が無い
+    """
+    made = create_proxy(
+        Path(source),
+        Path(target),
+        height=height,
+        stream_index=stream_index,
+        codecs=codecs,
+        progress=progress,
+        should_cancel=should_cancel,
+        working=Path(working),
+    )
+    return str(made) if made is not None else None
 
 
 def _has_a_frame(path: Path) -> bool:
@@ -589,12 +801,31 @@ class ProxyBuilder:
     :class:`~sashimono.engine.cache.analyzer.MediaAnalyzer` と同じ作りで、
     取り消しは「鍵の集合」で持つ Future を辞書に入れ直す形にすると、
     投入前に終わったものを消し損ねる
+
+    ``separate_process`` なら変換そのものを**別のプロセス**で走らせる（#440） 同じプロセスの
+    スレッドで走らせると、画面や先読みのスレッドと GIL を取り合い、単体の 8 分の 1 ほどの
+    速さになっていた 係のスレッドは子の知らせを待って眠るだけになる 子を起こせなかったら
+    （配布版の exe が止められた等）、以後はこのプロセスのスレッドで作る
+    画面は設定（:attr:`Preferences.proxy_process` 既定は入）から渡す 係そのものの既定は
+    同じプロセス 子を起こすと 1 本ごとに起動の分（0.2 秒ほど）掛かり、作り方を差し替えて
+    確かめる試験も子の中までは届かない
+
+    待っている物は頼まれた順ではなく、:meth:`set_order` で渡された順に作る（#441）
+    画面の側は、タイムラインで使っている素材 → 再生位置に近い順 → それ以外、の順を渡す
     """
 
     def __init__(
-        self, store: ProxyStore | None = None, *, encoder_priority: str = PRIORITY_AUTO
+        self,
+        store: ProxyStore | None = None,
+        *,
+        encoder_priority: str = PRIORITY_AUTO,
+        separate_process: bool = False,
     ) -> None:
         self._store = store if store is not None else ProxyStore()
+        self._separate = separate_process
+        #: 子のプロセスを起こせなかった 以後はスレッドで作る 毎回起こし直して失敗すると、
+        #: 素材ごとに起動の失敗を待つことになる
+        self._process_broken = False
         # どの作り手のエンコーダを先に試すか（#365） 本人の設定から来る 変えたときは
         # 呼ぶ側が作り直す（大きさを変えたときと同じ） 途中で替えられる形にすると、
         # 走っている変換と次の変換で選び方が混ざる
@@ -626,6 +857,13 @@ class ProxyBuilder:
         #: 走っている物のうち、間隔を調べて決める小さい素材 設定で間隔の長い素材への控えを
         #: 切ったとき、これだけを止める（:meth:`set_long_gop`）
         self._small: set[MediaId] = set()
+        #: 係のスレッドを待っている変換（頼まれた順の番号と、走らせる手）
+        #: 係は空くたびに :attr:`_ranks` の順で 1 つ選ぶ 投げた順に走らせると、素材一覧の
+        #: 並びの順に作ることになり、使っている素材の控えがいつまでも後回しになる（#441）
+        self._waiting: dict[MediaId, tuple[int, Callable[[], None]]] = {}
+        self._numbers = itertools.count()
+        #: 作る順（素材 → 順位） 無い素材は順位の付いた物の後ろに、頼まれた順で並ぶ
+        self._ranks: dict[MediaId, int] = {}
 
     @property
     def store(self) -> ProxyStore:
@@ -643,6 +881,25 @@ class ProxyBuilder:
     def settle(self, seen: ProgressSnapshot) -> bool:
         """画面が終わりを見届けた ひと続きの数を戻す（:meth:`JobBoard.settle`）"""
         return self._board.settle(seen)
+
+    @property
+    def separate_process(self) -> bool:
+        """変換を別のプロセスで走らせるか（起こせずにスレッドへ戻した後は偽）"""
+        return self._separate and not self._process_broken
+
+    def set_order(self, order: Sequence[MediaId]) -> None:
+        """待っている変換を作る順 先頭ほど先に作る 走っている変換は止めない
+
+        画面のスレッドから呼ぶ 係は次の 1 本を選ぶときにこれを見る
+        """
+        ranks = {media_id: index for index, media_id in enumerate(order)}
+        with self._lock:
+            self._ranks = ranks
+
+    def waiting(self) -> int:
+        """係のスレッドを待っている変換の数 順を渡し直す要があるかを画面が見るのに使う"""
+        with self._lock:
+            return len(self._waiting)
 
     def progress(self, media_id: MediaId) -> float | None:
         """作っている最中なら 0..1 それ以外は ``None``
@@ -699,7 +956,8 @@ class ProxyBuilder:
         """
         if counted:
             self._progress[media.id] = 0.0
-            self._board.start(media.id, media.id)
+            # 重さは素材の長さ 残り時間の見込み（#441）は、ここまでに作った秒数の速さで割る
+            self._board.start(media.id, media.id, weight=float(media.duration) or None)
 
     def _long_enough(self, media: MediaItem) -> bool:
         """キーフレームの間隔を調べて、控えを作るか決める 裏のスレッドで呼ぶ
@@ -754,18 +1012,11 @@ class ProxyBuilder:
                             # 一覧に無い素材の分が全体の割合に一瞬混ざる
                             if media.id not in self._cancelled and not self._closed:
                                 self._begin(media, counted=True)
-                if not skipped:
-                    made = create_proxy(
-                        media.path,
-                        self._store.prepare(media),
-                        height=self._store.height,
-                        # 1 本目の映像だけを控えにする 読む側（レンダラ）も
-                        # 1 本目を指すクリップにしか渡さない
-                        stream_index=media.video_streams[0].index if media.video_streams else None,
-                        encoder_priority=self._encoder_priority,
-                        progress=report,
-                        should_cancel=cancelled,
-                    )
+                # 待っている間に外された素材は、子を起こす前にやめる 起こすと消した素材を
+                # 開きに行き、その分だけ使っている素材の控えが遅れる
+                if not skipped and not cancelled():
+                    self._board.begin(media.id)
+                    made = self._make(media, report, cancelled)
             except Exception as exc:  # 裏のスレッドの例外は誰にも見えずに消える
                 # 投げ直さずに失敗として数える 前は executor の中で黙って消え、
                 # 控えが無いまま「作っている最中」にも見えなかった
@@ -813,7 +1064,75 @@ class ProxyBuilder:
                 self._progress.pop(media.id, None)
                 self._board.drop(media.id)
                 return
-            self._executor.submit(run)
+            # 投げるのは「次の 1 本を選んで走らせる」 何を走らせるかは係が空いたときに決める
+            # 待っている物と投げた数は同じなので、どれも 1 回ずつ走る
+            self._waiting[media.id] = (next(self._numbers), run)
+            self._executor.submit(self._run_next)
+
+    def _run_next(self) -> None:
+        """待っている変換のうち、順位が一番前の物を走らせる 係のスレッドで呼ぶ"""
+        with self._lock:
+            if not self._waiting:
+                return
+            last = len(self._ranks)
+            chosen = min(
+                self._waiting,
+                key=lambda media_id: (self._ranks.get(media_id, last), self._waiting[media_id][0]),
+            )
+            _number, run = self._waiting.pop(chosen)
+        run()
+
+    def _make(
+        self,
+        media: MediaItem,
+        report: Callable[[float], None],
+        cancelled: Callable[[], bool],
+    ) -> Path | None:
+        """控えを 1 本作る 別のプロセスで作れるならそちらで 係のスレッドで呼ぶ"""
+        target = self._store.prepare(media)
+        # 1 本目の映像だけを控えにする 読む側（レンダラ）も 1 本目を指すクリップにしか渡さない
+        stream_index = media.video_streams[0].index if media.video_streams else None
+        if self.separate_process:
+            # 試すのは親の側で 1 度だけ（:func:`usable` が覚える） 子は渡された順に試す
+            codecs = tuple(proxy_codecs(self._encoder_priority))
+            if not codecs:
+                return None
+            working = working_path(target)
+            try:
+                made = run_in_process(
+                    proxy_job,
+                    {
+                        "source": str(media.path),
+                        "target": str(target),
+                        "working": str(working),
+                        "height": self._store.height,
+                        "stream_index": stream_index,
+                        "codecs": codecs,
+                    },
+                    progress=report,
+                    should_cancel=cancelled,
+                    name="sashimono-proxy",
+                )
+            except WorkerUnavailableError as exc:
+                # 起こせない環境 このプロセスで作る 起動の失敗を素材ごとに待たないよう覚える
+                _log.warning("控えを別のプロセスで作れないので、スレッドで作る: %s", exc)
+                with self._lock:
+                    self._process_broken = True
+            else:
+                return Path(made) if made is not None else None
+            finally:
+                # 止めた子は書きかけを消せずに終わることがある 残すと置き場に溜まる
+                with contextlib.suppress(OSError):
+                    working.unlink(missing_ok=True)
+        return create_proxy(
+            media.path,
+            target,
+            height=self._store.height,
+            stream_index=stream_index,
+            encoder_priority=self._encoder_priority,
+            progress=report,
+            should_cancel=cancelled,
+        )
 
     def set_long_gop(self, enabled: bool) -> None:
         """間隔の長い小さい素材にも控えを作るかを切り替える（本人の設定）
@@ -849,4 +1168,7 @@ class ProxyBuilder:
             self._closed = True
             self._cancelled.update(self._running)
             self._again.clear()
+            # 待っている手は素材と知らせ先（画面の部品）を抱えている 消さないと、設定で
+            # 係を作り直した後も古い係ごと残り、次に開き直すまで解放されない
+            self._waiting.clear()
             self._executor.shutdown(wait=False, cancel_futures=True)

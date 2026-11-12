@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
 from types import TracebackType
@@ -34,8 +35,19 @@ class VideoDecoder:
     スレッドセーフではない 素材ごと・再生系統ごとに 1 つずつ持つこと
     """
 
-    def __init__(self, path: Path, stream_index: int | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        stream_index: int | None = None,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
         self._path = Path(path)
+        #: 真を返したら読むのをやめる（終端と同じに扱う） 長い GOP を読み進める間も止められる
+        #: ようにするため 止めたかどうかは呼ぶ側が自分で見る
+        self._should_stop = should_stop
+        #: 読めなかったときの理由 終端と同じに扱うので、絵が無いのか壊れているのかをここで分ける
+        self._decode_error: str | None = None
         try:
             self._container = av.open(str(self._path))
         except (av.error.FFmpegError, OSError) as exc:
@@ -76,6 +88,11 @@ class VideoDecoder:
         self._current: av.VideoFrame | None = None
         #: 1 つ先読みしたフレーム これの時刻が来るまで ``_current`` が表示され続ける
         self._pending: av.VideoFrame | None = None
+
+    @property
+    def decode_error(self) -> str | None:
+        """途中で読めなかったときの理由 読めていれば ``None``"""
+        return self._decode_error
 
     @property
     def info(self) -> VideoStreamInfo:
@@ -138,11 +155,15 @@ class VideoDecoder:
             return self._current
 
     def _read_next(self) -> av.VideoFrame | None:
+        """次のフレーム 終端・読めない・止めるよう頼まれたときは ``None``"""
+        if self._should_stop is not None and self._should_stop():
+            return None
         try:
             return next(self._frames)
         except StopIteration:
             return None
-        except av.error.FFmpegError:
+        except av.error.FFmpegError as exc:
+            self._decode_error = str(exc)
             return None
 
     def _needs_seek(self, target: Fraction) -> bool:
