@@ -8623,15 +8623,40 @@ def _use_standard_layout(host: EditorHost, arguments: dict[str, Any]) -> object:
 # 文字なら字幕と文字として宣言し、送る前の同意（#342）に乗せる 断った人の所では動かさない
 
 
-def _copy_snapshot(host: EditorHost, arguments: dict[str, Any]) -> object:
-    """静止画を OS のクリップボードへ置く（〔静止画をコピー〕と同じ描き方）"""
+def _snapshot_frame_of(host: EditorHost, arguments: dict[str, Any]) -> int:
+    """copy_snapshot の引数のフレーム 写す道具と下見で同じ確かめ方にする"""
     project = _project(host)
     if project.duration <= 0:
         raise ToolError("タイムラインが空なので静止画にできません")
     raw = arguments.get("frame", host.playhead)
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise ToolError("frame はフレーム番号（整数）で渡してください 省くと再生ヘッドの位置")
-    drawn = host.copy_snapshot_image(raw)
+    return raw
+
+
+def _snapshot_to_copy(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """copy_snapshot が写す絵 確かめの窓の下見に出す（写さない）
+
+    引数はフレームの番号だけなので、描かないと窓に絵が 1 枚も出ず「中身はありません」と
+    出たまま、絵をアプリの外へ出してよいかを尋ねてしまう（CodeRabbit の指摘 #450）
+    描くフレームは写す側（ホストの copy_snapshot_image）と同じく最後のフレームで止める
+    """
+    project = _project(host)
+    raw = _snapshot_frame_of(host, arguments)
+    frame = max(0, min(raw, project.duration - 1))
+    # 下見なので小さく描く 写すときは作品の解像度で描き直す
+    width = _width_within_edge(DEFAULT_PREVIEW_WIDTH, project.settings.resolution, host.image_edge)
+    # 再生しながら別のフレームを描くと GL の資源を取り合う（preview_frame と同じ）
+    host.stop_playback()
+    png = host.render_png(frame, width=width)
+    caption = f"{format_timecode(frame, project.rate)}（{frame} フレーム）を写します"
+    return {"image": ImageResult(png=png, caption=caption)}
+
+
+def _copy_snapshot(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """静止画を OS のクリップボードへ置く（〔静止画をコピー〕と同じ描き方）"""
+    project = _project(host)
+    drawn = host.copy_snapshot_image(_snapshot_frame_of(host, arguments))
     width, height = project.settings.resolution
     return {
         "copied_frame": drawn,
@@ -12092,7 +12117,7 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema({"frame": _integer("描くフレーム 省くと再生ヘッドの位置")}),
         handler=_copy_snapshot,
         sends=_WITH_FRAMES,
-        preview=from_arguments(),
+        preview=from_arguments(reader=_snapshot_to_copy),
         frames_elsewhere=True,
     ),
     Operation(

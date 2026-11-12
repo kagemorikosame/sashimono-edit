@@ -373,6 +373,23 @@ class TestFromTheReview:
         assert copied_when_asked == [0]
         assert secret_host.copied_texts == []
 
+    def test_the_copied_picture_shows_before_copying(self, secret_host: FakeHost) -> None:
+        # 壊れると、絵を写す道具の窓に絵が 1 枚も出ず「中身はありません」のまま尋ねる
+        # 断ったのに写っていてもいけない 下見は描くだけでクリップボードへは置かない
+        bridge = EditorBridge(secret_host)
+        copied_when_asked: list[int] = []
+
+        def deny(_request: SendRequest) -> SendAnswer:
+            copied_when_asked.append(len(secret_host.copied_frames))
+            return SendAnswer.DENY
+
+        seen, _box = _run(bridge, "copy_snapshot", deny, {"frame": 0})
+        (sample,) = [s for s in seen[0].samples if s.kind is Outbound.FRAMES]
+        assert sample.count == 1
+        assert len(sample.images) == 1
+        assert copied_when_asked == [0]
+        assert secret_host.copied_frames == []
+
     def test_the_check_is_not_run_before_asking(self) -> None:
         # 壊れると、断った下見の分まで検査の直しの回数と区切り（#339）が進む
         preview = _operation("check_output").preview
@@ -598,7 +615,9 @@ class TestLogStore:
         path = tmp_path / "ai_sends.json"
         path.write_text("{壊れた", encoding="utf-8")
         assert SendLogStore(path).load() == []
-        entries: list[Any] = [{"at": "nope"}, {"at": "2026-11-08T10:00:00", "tool": 1}]
+        # 日時は今から作る 決まった日時だと 90 日たった後は古さで除かれ、型の確かめを試さない
+        now = datetime.now().astimezone().isoformat()
+        entries: list[Any] = [{"at": "nope"}, {"at": now, "tool": 1}]
         path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
         assert SendLogStore(path).load() == []
 
@@ -606,8 +625,11 @@ class TestLogStore:
         # 壊れると、記録の一覧で種類の並びが行ごとに違い、見比べにくい
         path = tmp_path / "ai_sends.json"
         kinds = {kind.value: {"count": 1} for kind in reversed(ASKED)}
+        # 決まった日時にすると、90 日たった後は古い記録として除かれ、この試験が落ち続ける
+        # （CodeRabbit の指摘 #450）
+        now = datetime.now().astimezone().isoformat()
         path.write_text(
-            json.dumps({"entries": [{"at": "2026-11-08T10:00:00", "tool": "t", "kinds": kinds}]}),
+            json.dumps({"entries": [{"at": now, "tool": "t", "kinds": kinds}]}),
             encoding="utf-8",
         )
         (entry,) = SendLogStore(path).load()
