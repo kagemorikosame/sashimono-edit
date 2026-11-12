@@ -16,11 +16,13 @@ from sashimono.core.model import (
     Clip,
     GeneratedSource,
     MediaItem,
+    Project,
     Track,
     TrackKind,
     Transcript,
     TranscriptSegment,
     Word,
+    new_clip_id,
 )
 from tests.ai.conftest import FakeHost, make_loaded
 
@@ -72,9 +74,29 @@ SPOKEN = Transcript(
 )
 
 
+def _with_sound(project: Project) -> Project:
+    """映像のクリップと同じ所に、音声トラックの音のクリップを足す
+
+    make_loaded は映像トラックにだけ置き、映像トラックは音を鳴らさない 言いよどみは鳴らす
+    クリップが無いと断るので、話している作品の形にする
+    """
+    (video,) = project.timeline.tracks
+    sound = Track(
+        kind=TrackKind.AUDIO,
+        name="A1",
+        clips=tuple(replace(c, id=new_clip_id()) for c in video.clips),
+    )
+    return project.with_timeline(replace(project.timeline, tracks=(video, sound)))
+
+
+def loaded_with_sound(video_media: MediaItem, transcript: Transcript = SPOKEN) -> Project:
+    """言いよどみの語の時刻を持つ字幕の素材を、映像と音の 2 本で 10 秒置いた作品"""
+    return _with_sound(make_loaded(video_media, transcript))
+
+
 def filler_host(video_media: MediaItem) -> FakeHost:
     """言いよどみの語の時刻を持つ字幕の素材を、10 秒置いた作品"""
-    return FakeHost(make_loaded(video_media, SPOKEN))
+    return FakeHost(loaded_with_sound(video_media))
 
 
 def _run(host: FakeHost, **arguments: Any) -> Any:
@@ -158,14 +180,14 @@ class TestTheTool:
         self, video_media: MediaItem, transcript: Transcript
     ) -> None:
         """語の時刻が無いまま 0 件と返すと、言いよどみは無いと読む"""
-        host = FakeHost(make_loaded(video_media, transcript))
+        host = FakeHost(loaded_with_sound(video_media, transcript))
         with pytest.raises(ToolError, match="words_only"):
             _run(host, media_id=str(host.document.project.media[0].id))
 
     def test_nothing_found_says_why(self, video_media: MediaItem) -> None:
         """書かなかった言いよどみは探せないと言わないと、AI は無かったと伝える"""
         line = _line(1.0, 2.0, ("本", 1.0, 1.4), ("日", 1.4, 1.8))
-        host = FakeHost(make_loaded(video_media, Transcript((line,), language="ja")))
+        host = FakeHost(loaded_with_sound(video_media, Transcript((line,), language="ja")))
         with pytest.raises(ToolError, match="書かずに返す"):
             _run(host, media_id=str(host.document.project.media[0].id))
 
@@ -219,17 +241,13 @@ class TestReviewFixes:
         assert result["removed_frames"] == 21
         # 計画だけでなく、当てた後の作品からも「あのー」だけが抜けたのを見る
         project = host.document.project
-        voiced = [
-            (clip.source_in, clip.source_out(project.rate))
-            for track in project.timeline.tracks
-            for clip in track.clips
-            if clip.media_id is not None
-        ]
-        assert voiced == [(F(0), F(4)), (F(47, 10), F(10))]
+        for track in project.timeline.tracks:
+            kept = [(clip.source_in, clip.source_out(project.rate)) for clip in track.clips]
+            assert kept == [(F(0), F(4)), (F(47, 10), F(10))]
 
     def test_a_locked_track_is_reported(self, video_media: MediaItem) -> None:
         """声だけが詰まってロックした字幕が後ろでずれる 黙ると同期が崩れたまま進む"""
-        project = make_loaded(video_media, SPOKEN)
+        project = loaded_with_sound(video_media)
         text = Clip(0, 300, source=GeneratedSource(kind="text", params={"text": "題"}))
         locked = Track(kind=TrackKind.VIDEO, name="文字", clips=(text,), locked=True)
         project = project.with_timeline(
@@ -245,7 +263,7 @@ class TestReviewFixes:
 
         壊れると、声は残ったまま映像と字幕だけが詰まり、切った量も大きく返す
         """
-        project = make_loaded(video_media, SPOKEN)
+        project = loaded_with_sound(video_media)
         tracks = tuple(replace(track, locked=True) for track in project.timeline.tracks)
         project = project.with_timeline(replace(project.timeline, tracks=tracks))
         host = FakeHost(project)
@@ -259,10 +277,21 @@ class TestReviewFixes:
             index=2, sample_rate=48000, channels=2, time_base=F(1, 48000), codec="aac"
         )
         two = replace(video_media, audio_streams=(*video_media.audio_streams, second))
-        project = make_loaded(two, Transcript(segments=(), language="ja"))
+        project = loaded_with_sound(two, Transcript(segments=(), language="ja"))
         media = project.media[0].with_transcript(SPOKEN, stream=2)
         project = replace(project, media=(media,))
         host = FakeHost(project)
         with pytest.raises(ToolError, match="鳴らすクリップ"):
             _run(host, media_id=str(media.id), audio=2)
+        assert host.document.project == project
+
+    def test_a_picture_left_without_its_sound_is_refused(self, video_media: MediaItem) -> None:
+        """音のクリップを消して映像だけが残った作品
+
+        壊れると、鳴らさない映像を 1 本目の音声のクリップと読み、どの音も鳴っていない映像を切る
+        """
+        project = make_loaded(video_media, SPOKEN)
+        host = FakeHost(project)
+        with pytest.raises(ToolError, match="鳴らすクリップ"):
+            _run(host, media_id=str(project.media[0].id))
         assert host.document.project == project

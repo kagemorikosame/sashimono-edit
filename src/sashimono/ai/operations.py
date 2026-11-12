@@ -6529,11 +6529,15 @@ def _cut_fillers(host: EditorHost, arguments: dict[str, Any]) -> object:
     voice = media.transcript_stream(stream)
     # plan_cuts はこの音声を鳴らすクリップが無いと素材の全クリップへ戻す（無音カットが映像だけの
     # クリップも切れるように） 言いよどみは音声ごとの時刻なので、戻すと別の音声の話を切る
+    # 鳴らさない映像のクリップも subtitle_voice は 1 本目の音声と返すので、鳴らすかも見る 見ないと、
+    # 音声のクリップを消して映像だけが残った所で、どの音も鳴っていない映像を切る
     hearing = [
         track
         for track in project.timeline.tracks
         for clip in track.clips
-        if clip.media_id == media.id and subtitle_voice(project, track, clip, media) == voice
+        if clip.media_id == media.id
+        and project.plays_sound(track, clip)
+        and subtitle_voice(project, track, clip, media) == voice
     ]
     if not hearing:
         raise ToolError(
