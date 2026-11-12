@@ -17,17 +17,21 @@ from sashimono.engine.decode.probe import ProbeError, probe_media
 
 __all__ = ["LENGTH_TOLERANCE", "RelinkPlan", "differs", "plan_relink"]
 
+#: 読めないファイルの訳の頭 AI の道具は ``force`` でもこれを付け替えない（読めない物を付け替えると
+#: 画面も書き出しも何も出ず、何が起きたか分からない）
+UNREADABLE = "素材として読めません"
+
 #: 長さの違いを許す幅（秒） 書き出し直した素材や入れ物を替えた素材は、頭と終わりの端数で
 #: 数フレーム違うことがある それより大きく違えば別の素材と見る
 LENGTH_TOLERANCE = Fraction(1, 2)
 
 
-def differs(item: MediaItem, path: Path) -> str | None:
-    """``path`` が ``item`` と違う素材に見えるなら、その訳 同じに見えれば ``None``"""
+def _compare(item: MediaItem, path: Path) -> tuple[bool, str | None]:
+    """読めたかと、違う素材に見える訳"""
     try:
         found = probe_media(Path(path))
     except (ProbeError, OSError) as exc:
-        return f"素材として読めません（{exc}）"
+        return False, f"{UNREADABLE}（{exc}）"
     reasons = []
     if abs(found.duration - item.duration) > LENGTH_TOLERANCE:
         reasons.append(
@@ -44,7 +48,18 @@ def differs(item: MediaItem, path: Path) -> str | None:
             f"音声の数が違います（作品では {len(item.audio_streams)}、"
             f"選んだ物は {len(found.audio_streams)}）"
         )
-    return " ".join(reasons) or None
+    # 数が同じでも番号が違うと、クリップの覚えている道の番号（stream_index）が別の道を指し、
+    # デコーダは見つからない番号を頭の道へ置き換えるので、黙って別の音が鳴る
+    if [s.index for s in found.video_streams] != [s.index for s in item.video_streams]:
+        reasons.append("映像の道の番号が作品の覚えている物と違います")
+    if [s.index for s in found.audio_streams] != [s.index for s in item.audio_streams]:
+        reasons.append("音声の道の番号が作品の覚えている物と違います")
+    return True, " ".join(reasons) or None
+
+
+def differs(item: MediaItem, path: Path) -> str | None:
+    """``path`` が ``item`` と違う素材に見えるなら、その訳 同じに見えれば ``None``"""
+    return _compare(item, path)[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +72,8 @@ class RelinkPlan:
     concern: str | None
     #: 名前で見つかったが違う素材に見えたので付け替えない物（素材の名前と訳）
     skipped: tuple[tuple[str, str], ...]
+    #: 選んだファイルを素材として読めたか 読めなければ尋ねずに断る（付け替えても何も映らない）
+    readable: bool = True
 
 
 def plan_relink(
@@ -77,6 +94,7 @@ def plan_relink(
                 changes.append((other, place))
             else:
                 skipped.append((by_id[other].name, reason))
+    readable, concern = _compare(item, Path(chosen))
     return RelinkPlan(
-        changes=tuple(changes), concern=differs(item, Path(chosen)), skipped=tuple(skipped)
+        changes=tuple(changes), concern=concern, skipped=tuple(skipped), readable=readable
     )

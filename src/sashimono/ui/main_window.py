@@ -173,7 +173,7 @@ from sashimono.core.model import (
     heard_stream,
 )
 from sashimono.core.reframe import CENTER, ReframeError, ReframeStyle
-from sashimono.core.relink import RelinkMedia, missing_media
+from sashimono.core.relink import RelinkMedia, missing_media, moved_media
 from sashimono.core.seams import (
     SEAM_NONE,
     SeamStyle,
@@ -187,6 +187,7 @@ from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
+from sashimono.engine.audio.mixer import history_seconds
 from sashimono.engine.audio.speech import (
     SpeechError,
     WaveformPendingError,
@@ -506,7 +507,12 @@ class MainWindow(QMainWindow):
         #: 最初の空のプロジェクトを作る前に読む 起動した直後のプロジェクトも、新規作成と
         #: 同じくレイヤーの方式の好み（:attr:`Preferences.new_project_layers`）に従わせるため
         self._preferences = PreferenceStore().load()
-        self._document = Document(project if project is not None else self._blank_project())
+        self._document = Document(
+            project if project is not None else self._blank_project(), sound_history=history_seconds
+        )
+        #: 前に画面へ映した作品 素材の場所が変わった（付け替え・その取り消しとやり直し #447）かを
+        #: 見比べる 画面・AI・取り消しのどの道で変わっても、映す所の 1 か所で頼み直すため
+        self._shown_root = self._document.project
         #: 再生ヘッドのフレームを数えているレート 変わったら数え直す（:meth:`_retime_playhead`）
         self._playhead_rate = self._document.project.rate
         self._path: Path | None = path
@@ -1807,6 +1813,7 @@ class MainWindow(QMainWindow):
         # 置いたあとに自分で下げてもらうのでは遅い
         self._apply_auto_quality()
         self._reanalyze_returned(root)
+        self._reload_moved_media(root)
         self._update_history_actions()
         self._update_title()
         self.project_changed.emit(project)
@@ -2928,8 +2935,17 @@ class MainWindow(QMainWindow):
         """〔見つからない素材を探し直す…〕 見つからない素材の窓を出す（待たずに出す #447）
 
         ``only_if_missing`` なら、見つからない素材が無いときは何も出さない（開いたときの知らせ）
+        メニューから出したときは、持ち出し用パッケージの範囲だけが入った素材も並べる（#445
+        範囲の外を使うには元の素材へ付け替えるしかなく、ファイルはあるので見つからない素材に入らない）
         """
-        if not missing_media(self._document.project):
+        project = self._document.project
+        lost = missing_media(project)
+        packed = [item for item in project.media if item.packed]
+        if not lost and (only_if_missing or not packed):
+            if self._missing_dialog is not None:
+                # 前の作品の一覧を残さない 残ると、選んでも今の作品に無い素材で何も起きない
+                self._missing_dialog.refresh()
+                self._missing_dialog.hide()
             if not only_if_missing:
                 QMessageBox.information(
                     self, "見つからない素材", "素材のファイルはどれも見つかっています"
@@ -2946,6 +2962,9 @@ class MainWindow(QMainWindow):
     def _relink_from_dialog(self, media_id: MediaId, chosen: Path) -> str:
         """窓で選んだファイルへ付け替える 同じフォルダの残りもまとめて 知らせの文を返す"""
         plan = plan_relink(self._document.project, media_id, chosen)
+        if not plan.readable:
+            # 読めないファイルは尋ねずに断る 付け替えても絵も音も出ない
+            return f"付け替えませんでした {plan.concern}"
         if plan.concern is not None:
             answer = QMessageBox.question(
                 self._missing_dialog or self,
@@ -2955,10 +2974,8 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return "付け替えませんでした"
-        before = {media.id: media.path for media in self._document.project.media}
         if not self.execute(RelinkMedia(plan.changes)):
             return "付け替えられませんでした"
-        self._reload_moved_media(before)
         text = f"{len(plan.changes)} 本を付け替えました"
         if plan.skipped:
             text += "\n同じ名前でも違う素材に見えたので付け替えなかった物: " + "、".join(
@@ -2966,10 +2983,21 @@ class MainWindow(QMainWindow):
             )
         return text
 
-    def _reload_moved_media(self, before: dict[MediaId, Path]) -> None:
-        """場所が変わった素材の波形・縮小画像・控えを頼み直す（付け替え #447）"""
-        for media in self._document.project.media:
-            if media.id in before and before[media.id] != media.path:
+    def _reload_moved_media(self, root: Project) -> None:
+        """場所が変わった素材の波形・縮小画像・控えを捨てて頼み直す（付け替え #447）
+
+        係は素材の ID で結果を持ち、同じ ID の結果があれば頼まれても何もしない 捨てずに頼むと
+        前のファイルの波形と縮小画像が残る 作りかけの控えも捨てないと、前のファイルの変換が
+        終わるまで新しい物を受け付けない 取り消しとやり直しでも場所は変わるので、ここで見る
+        """
+        moved = moved_media(self._shown_root, root)
+        self._shown_root = root
+        for media in root.media:
+            if media.id in moved:
+                self._analyzer.forget(media.id)
+                self._screen.forget(media.id)
+                self._proxies.forget(media.id)
+                self._proxy_asked.discard(media.id)
                 self._request_analysis(media)
                 self._request_proxy(media)
 
@@ -4092,7 +4120,6 @@ class MainWindow(QMainWindow):
         if not commands:
             return
         before = {media.id for media in self._document.project.media}
-        places = {media.id: media.path for media in self._document.project.media}
         try:
             with self._document.checkpoint(label, by=Author.AI):
                 for command in commands:
@@ -4103,8 +4130,6 @@ class MainWindow(QMainWindow):
             self._on_project_changed()
         # AI が素材一覧から外した素材も、人の〔プールから外す〕と同じく解析を捨てる
         self._forget_media(before - {media.id for media in self._document.project.media})
-        # AI が付け替えた素材（relink_media #447）も、窓の付け替えと同じく解析を頼み直す
-        self._reload_moved_media(places)
 
     @property
     def project(self) -> Project:

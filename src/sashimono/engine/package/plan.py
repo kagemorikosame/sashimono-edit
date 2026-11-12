@@ -23,6 +23,7 @@ from sashimono.core.model import (
     Stroke,
     Timeline,
 )
+from sashimono.core.packed import read_window
 from sashimono.effects import registry
 from sashimono.effects.sources import source_registry
 from sashimono.effects.spec import FileSpec, FontSpec
@@ -34,6 +35,7 @@ from sashimono.engine.package.remux import (
     REENCODE_CRF,
     REENCODE_LEAST_PSNR,
     Span,
+    reencodable,
     spans_union,
 )
 
@@ -137,17 +139,12 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
         if _is_still(item):
             found[item.id] = None
             continue
-        rate = timeline.rate
-        start = clip.source_in
-        end = clip.source_out(rate)
-        if clip.hold_at is not None:
-            # 止めるのは絵だけで、音は source_in から長さの分を読み続ける（AudioMixer）
-            # 絵の読む所（止める時刻まで）と音の読む所の和を入れる 終わりを止める時刻へ縮めると、
-            # 音を鳴らすクリップの止めた後の音が持ち出した先で欠ける（#449 の Codex の指摘）
-            start = min(start, clip.hold_at)
-        sample_rate = project.settings.sample_rate
-        lookback = Fraction(history_seconds(clip, rate, sample_rate)).limit_denominator(sample_rate)
-        start -= lookback * clip.speed
+        # 止めるのは絵だけで、音は source_in から長さの分を読み続ける（AudioMixer） 絵の読む所と
+        # 音の読む所の和を入れる（#449 の Codex の指摘） 数え方は開いた先で範囲の外を断る確かめ
+        # （#445）と 1 つにする ずれると、入れていない所を読む編集が断られずに通る
+        start, end = read_window(
+            clip, timeline, history=history_seconds, sample_rate=project.settings.sample_rate
+        )
         start = max(Fraction(0), start - margin)
         end = end + margin
         if item.duration > 0:
@@ -202,8 +199,14 @@ def editing_media(project: Project) -> tuple[str, ...]:
     for item in project.media:
         if item.id not in used:
             continue
-        codecs = [stream.codec for stream in item.video_streams if stream.codec in EDITING_CODECS]
-        if codecs:
+        # し直せない形（透明を持つ ProRes 4444・RGB・12bit 以上）だけの素材は並べない 並べると、
+        # 選んでも元のまま入って「小さくなる」と読んだ人の見込みが外れる
+        codecs = [
+            stream.codec
+            for stream in item.video_streams
+            if stream.codec in EDITING_CODECS and reencodable(stream.pixel_format)
+        ]
+        if len(codecs) == 1:
             found.append(f"{item.name}（{EDITING_NAMES.get(codecs[0], codecs[0])}）")
     return tuple(found)
 

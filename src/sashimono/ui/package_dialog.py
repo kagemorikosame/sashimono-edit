@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 from fractions import Fraction
 from pathlib import Path
 
@@ -285,7 +286,8 @@ def packed_summary(result: PackResult) -> str:
 def _reencoded_text(name: str, report: Reencoded) -> str:
     """符号にし直した素材 1 つの知らせ"""
     shrink = f" {report.after / report.before:.0%} の大きさ" if report.before else ""
-    return f"{name}（{report.psnr:.1f} dB{shrink}）"
+    difference = f"{report.psnr:.1f} dB" if math.isfinite(report.psnr) else "元と同じ絵"
+    return f"{name}（{difference}{shrink}）"
 
 
 def opened_summary(opened: OpenedPackage) -> str:

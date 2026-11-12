@@ -1166,8 +1166,9 @@ def _work_area(project: Project) -> dict[str, Any] | None:
 def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     wanted = str(arguments.get("contains") or "")
-    rows = [
-        {
+
+    def row(item: MediaItem) -> dict[str, Any]:
+        return {
             "media_id": str(item.id),
             "name": item.name,
             "path": str(item.path),
@@ -1183,7 +1184,8 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
                 for number, stream in enumerate(item.audio_streams, start=1)
             },
             # 素材のファイルが無い（別の PC へ移した作品 #447） 絵は映らず音は無音になる
-            # relink_media で付け替えられる
+            # relink_media で付け替えられる 確かめは返すページの分だけ（_RowsOf） 切れた共有の
+            # フォルダは 1 件ごとに待つので、全部を確かめると一覧の返事が止まる
             "missing": not Path(item.path).is_file(),
             # 持ち出し用パッケージで範囲だけを入れた素材の、入っている区間（秒 #445）
             # 外を読む編集は断られるので、AI は先にここで読める所を知る
@@ -1198,9 +1200,9 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
                 else {}
             ),
         }
-        for item in project.media
-        if not wanted or wanted in item.name
-    ]
+
+    matched = [item for item in project.media if not wanted or wanted in item.name]
+    rows = _RowsOf(matched, row)
     return _paged(rows, arguments, name="media")
 
 
@@ -4798,6 +4800,10 @@ def _relink_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not isinstance(search, bool):
         raise ToolError("search_others は true か false で渡してください")
     plan = plan_relink(project, item.id, chosen, search=search)
+    if not plan.readable:
+        # 読めないファイルは force でも付け替えない 付け替えても絵も音も出ず、映らない理由が
+        # 「見つからない」から「読めない」へ変わるだけで、人は何が起きたか分からない
+        raise ToolError(f"選んだファイルは付け替えられません: {plan.concern}")
     if plan.concern is not None and not force:
         # 画面の窓は人に尋ねる所 AI は黙って付け替えず、訳を返して人に確かめさせる
         raise ToolError(

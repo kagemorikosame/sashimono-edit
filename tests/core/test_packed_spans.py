@@ -120,6 +120,17 @@ class TestRefusal:
             document.execute(_Slip(clip.id, Fraction(30)))
         document.execute(_Slip(clip.id, Fraction(15)))
 
+    def test_sound_read_before_the_head_is_checked_too(self) -> None:
+        """リバーブやディレイは頭より前の音も読む 書き出しはそこも入れるので、確かめも同じに数える
+        数えないと、展開した先でずらしても断られず、響きの頭が無音になる"""
+        document, clip = _document()
+        reach = Document(document.project, sound_history=lambda _c, _r, _s: 1.5)
+        # 頭は 11 秒 読むのは 9.5 秒から（入っているのは 10 秒から）
+        with pytest.raises(ValueError, match="外を読む"):
+            reach.execute(_Slip(clip.id, Fraction(11)))
+        # 頭より前を読まないクリップは同じずらし方で通る
+        document.execute(_Slip(clip.id, Fraction(11)))
+
     def test_a_clip_already_outside_does_not_block_other_edits(self) -> None:
         """前の本体で外へ伸ばしたクリップがあるだけで、ほかの編集が全部断られると困る"""
         document, clip = _document()

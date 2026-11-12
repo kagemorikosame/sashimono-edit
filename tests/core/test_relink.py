@@ -12,7 +12,7 @@ from sashimono.core.commands import Document
 from sashimono.core.io.recovery import RecoverySession
 from sashimono.core.io.serialize import load_project, project_to_dict, save_project
 from sashimono.core.model import MediaItem, PackedSpan, Project
-from sashimono.core.relink import RelinkMedia, missing_media, siblings
+from sashimono.core.relink import RelinkMedia, missing_media, moved_media, siblings
 
 
 def _project(*paths: Path) -> Project:
@@ -47,6 +47,21 @@ class TestSiblings:
         _touch(new / "音" / "b.wav")
         found = siblings(project, project.media[0].id, new / "映像" / "a.mp4")
         assert found == {project.media[1].id: new / "音" / "b.wav"}
+
+    def test_same_names_from_other_folders_are_not_merged(self, tmp_path: Path) -> None:
+        """カメラごとのフォルダに同じ名前の撮影があると、名前だけで拾えば 2 本が同じ絵になる"""
+        project = _project(Path("D:/撮影/カメラA/take.mp4"), Path("D:/撮影/カメラB/take.mp4"))
+        _touch(tmp_path / "移した" / "take.mp4")
+        assert siblings(project, project.media[0].id, tmp_path / "移した" / "take.mp4") == {}
+
+    def test_the_layout_still_finds_the_other_camera(self, tmp_path: Path) -> None:
+        """並びを保って移したなら、別のフォルダの同じ名前も正しい方を見つける"""
+        project = _project(Path("D:/撮影/カメラA/take.mp4"), Path("D:/撮影/カメラB/take.mp4"))
+        new = tmp_path / "撮影"
+        _touch(new / "カメラA" / "take.mp4")
+        _touch(new / "カメラB" / "take.mp4")
+        found = siblings(project, project.media[0].id, new / "カメラA" / "take.mp4")
+        assert found == {project.media[1].id: new / "カメラB" / "take.mp4"}
 
     def test_media_that_is_still_there_is_left_alone(self, tmp_path: Path) -> None:
         """見つかっている素材まで同じ名前の別の物へ付け替えると、正しい素材を失う"""
@@ -84,6 +99,26 @@ class TestRelinkCommand:
         assert moved.media[0].packed == ()
         # 字幕や長さなどの情報はそのまま（素材は同じ物）
         assert moved.media[0].duration == item.duration and moved.media[0].id == item.id
+
+    def test_choosing_the_same_packed_file_keeps_its_range(self) -> None:
+        """範囲だけのファイルを選び直しただけで範囲を外すと、無い所を読む編集が通る"""
+        item = MediaItem(
+            path=Path("D:/展開/media/0001.mp4"),
+            duration=Fraction(5),
+            packed=(PackedSpan(Fraction(1), Fraction(2)),),
+        )
+        project = Project.create(media=(item,))
+        again = RelinkMedia(((item.id, Path("d:/展開/media/0001.mp4")),)).apply(project)
+        assert again is project
+
+    def test_moved_media_sees_relinking_and_its_undo(self, tmp_path: Path) -> None:
+        """場所が変わったのを見落とすと、前のファイルのデコーダと波形を使い続ける"""
+        project = _project(Path("D:/無い/a.mp4"), Path("D:/無い/b.wav"))
+        a = project.media[0].id
+        moved = RelinkMedia(((a, tmp_path / "a.mp4"),)).apply(project)
+        assert moved_media(project, moved) == {a}
+        assert moved_media(moved, project) == {a}
+        assert moved_media(project, project) == set()
 
 
 class TestRelativePlace:

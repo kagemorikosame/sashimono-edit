@@ -281,6 +281,10 @@ def _write(
                 packet.stream = mapping[index]
                 writer.mux(packet)
 
+            # 隙間を持てない音の道（:func:`_steady`）
+            steady = [stream for stream in kept if _steady(stream, muxer)]
+            quiet = {stream.index for stream in steady}
+
             # 錨 どの道も頭のパケットを入れて、道の頭の時刻（素材の原点）を元と同じに保つ
             reader.seek(0)
             anchored: set[int] = set()
@@ -293,16 +297,25 @@ def _write(
                     continue
                 if index in picture_indices and not packet.is_keyframe:
                     continue
-                put(packet)
+                put(_hush(packet, spans, origin) if index in quiet else packet)
                 anchored.add(index)
                 if len(anchored) == len(kept):
                     break
 
-            # 隙間を持てない音の道は、頭から最後の区間の終わりまで続けて写す
-            steady = [stream for stream in kept if _steady(stream, muxer)]
+            # 隙間を持てない音の道は、頭から最後の区間の終わりまで続けて写す 区間の外は無音に
+            # 置き換える（時刻は保ったまま、使っていない所の声や会話を持ち出さない）
             if steady and spans:
                 whole = Span(Fraction(0), max(span.end for span in spans))
-                _copy_span(reader, steady, steady[0], set(), origin, whole, put, cancelled)
+                _copy_span(
+                    reader,
+                    steady,
+                    steady[0],
+                    set(),
+                    origin,
+                    whole,
+                    lambda packet: put(_hush(packet, spans, origin)),
+                    cancelled,
+                )
             rest = [stream for stream in kept if stream not in steady]
             for span in spans:
                 _copy_span(reader, rest, guide, picture_indices, origin, span, put, cancelled)
@@ -313,18 +326,60 @@ def _write(
     return True
 
 
+#: 無音を作れる PCM の形と、無音の 1 バイト 符号つきの整数と小数は 0 が無音 符号なしの
+#: 8bit は真ん中 a-law と μ-law は 0 を表す値（0 を入れると最大の音になる）
+_PCM_SILENCE = {
+    **{
+        f"pcm_{kind}": 0
+        for kind in (
+            "s16le", "s16be", "s24le", "s24be", "s32le", "s32be", "s64le", "s64be",
+            "f16le", "f24le", "f32le", "f32be", "f64le", "f64be", "s8",
+        )
+    },
+    "pcm_u8": 0x80,
+    "pcm_alaw": 0xD5,
+    "pcm_mulaw": 0xFF,
+}  # fmt: skip
+
+
 def _steady(stream: av.stream.Stream, muxer: str) -> bool:
     """区間の間の空きを書けない道か
 
     mov と mp4 の書き手は PCM の音を 1 標本ずつの決まった長さで並べ、パケットの時刻を書かない
     空きを空けて渡すと詰めて書くので、2 つ目の区間からの音が前へずれる（ProRes の .mov は
-    たいてい PCM の音を持つ） PCM は映像よりずっと小さいので、空けずに続けて写す
+    たいてい PCM の音を持つ） 空けずに続けて写し、区間の外は無音にする（:func:`_hush`）
+    無音を作れない形（見出しを持つ pcm_dvd など）は空けて写し、確かめに落ちて全体を入れる
     """
     return (
         stream.type == "audio"
         and muxer in ("mov", "mp4")
-        and str(stream.codec_context.name).startswith("pcm_")
+        and str(stream.codec_context.name) in _PCM_SILENCE
     )
+
+
+def _hush(packet: av.Packet[Any], spans: list[Span], origin: Fraction) -> av.Packet[Any]:
+    """区間（と前後の余り :data:`_TAIL_PAD`）に掛からない PCM のパケットを無音に置き換える
+
+    続けて写すと区間の間の音も入る 使っていない所の声や会話を持ち出すと、範囲だけを入れると
+    約束したパッケージから、渡した人の知らない音が漏れる 長さと時刻はそのまま（ずらさない）
+    """
+    shown = _seconds(packet)
+    if shown is None:
+        return packet
+    base = as_fraction(packet.time_base) if packet.time_base else Fraction(0)
+    length = Fraction(packet.duration or 0) * base
+    if any(
+        shown + length + _TAIL_PAD >= origin + span.start and shown <= origin + span.end + _TAIL_PAD
+        for span in spans
+    ):
+        return packet
+    quiet = av.Packet(bytes([_PCM_SILENCE[str(packet.stream.codec_context.name)]]) * packet.size)
+    quiet.pts = packet.pts
+    quiet.dts = packet.dts
+    quiet.duration = packet.duration
+    quiet.time_base = packet.time_base
+    quiet.stream = packet.stream
+    return quiet
 
 
 def _copy_span(
@@ -613,6 +668,11 @@ def editing_codec(source: Path) -> str | None:
     return None
 
 
+def reencodable(pixel_format: str | None) -> bool:
+    """その画素の形の映像を H.264 にし直せるか（窓に対象として並べるかの判断 #446）"""
+    return pixel_format is not None and _x264_format(pixel_format) is not None
+
+
 def _x264_format(name: str) -> str | None:
     """元の画素の形に一番近い、x264 が受け取れる形 寄せられない形は ``None``
 
@@ -627,9 +687,14 @@ def _x264_format(name: str) -> str | None:
         return None
     if fmt.is_rgb or fmt.has_palette or fmt.is_bayer or len(fmt.components) in (2, 4):
         return None
+    bits = max(component.bits for component in fmt.components)
+    if bits > 10:
+        # x264 は 10bit まで 12bit 以上を 10bit へ落とすと、確かめの差も落とした形で測るので、
+        # 深さを失ったことが差に出ない 写して大きいままにする
+        return None
     if len(fmt.components) == 1:
-        return "gray"
-    deep = max(component.bits for component in fmt.components) > 8
+        return "gray" if bits == 8 else None
+    deep = bits > 8
     wide = fmt.chroma_width(16) == 16
     tall = fmt.chroma_height(16) == 16
     if wide and tall:
@@ -754,7 +819,10 @@ def reencode_media(
             }
     except (av.error.FFmpegError, OSError):
         return None
-    if not chosen:
+    if len(chosen) != 1:
+        # 知らせと目録（:class:`Reencoded`）は符号と画素の形を 1 つずつしか持たない 2 本を
+        # し直すと、2 本目の素材の情報が元の符号のまま残り、中身の H.264 と食い違う
+        # 編集用の形式の映像を 2 本持つ素材はまれなので、元のまま入れる
         return None
     try:
         sizes: list[tuple[int, int]] = []

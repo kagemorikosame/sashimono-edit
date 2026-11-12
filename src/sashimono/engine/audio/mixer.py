@@ -25,6 +25,7 @@ from sashimono.core.model import (
     TrackKind,
     heard_stream,
 )
+from sashimono.core.relink import moved_media
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.audio import MAX_HISTORY_SECONDS, AudioContext
 from sashimono.effects.definition import EffectDefinition, registry
@@ -111,8 +112,17 @@ class AudioMixer:
             or project.settings.channels != previous.settings.channels
         )
         alive = {m.id for m in project.media}
-        for key in [k for k in self._decoders if changed_format or k[0] not in alive]:
+        # 付け替えた素材（#447）は ID もクリップも同じまま別のファイルになる 閉じないと前の
+        # ファイルの音を鳴らし続ける 前の音を読むエフェクトの貯めもクリップで照合しているので捨てる
+        moved = moved_media(previous, project)
+        for key in [
+            k for k in self._decoders if changed_format or k[0] not in alive or k[0] in moved
+        ]:
             self._decoders.pop(key).close()
+        if moved:
+            self._windows.clear()
+            self._raw.clear()
+            self._reaches.clear()
         # 前の音を読むエフェクトの貯めは、今のプロジェクトに同じクリップ（同じ物）がある分
         # だけ残す 消したクリップや値を変えたクリップの分は二度と使われず、残すと 1 本
         # 4 MB ほどずつ増え続ける（PR #231 の指摘） 形式が変われば中身ごと使えない

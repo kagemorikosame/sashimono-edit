@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -699,7 +700,13 @@ def _manifest(
                             "from": entry.reencoded.codec,
                             "to": entry.reencoded.to,
                             "pixel_format": entry.reencoded.pixel_format,
-                            "psnr_db": round(entry.reencoded.psnr, 2),
+                            # 元と同じ絵は差が無限大 JSON は無限大を書けない（標準の外の
+                            # Infinity になり、ほかの道具で読めない）ので null にする
+                            "psnr_db": (
+                                round(entry.reencoded.psnr, 2)
+                                if math.isfinite(entry.reencoded.psnr)
+                                else None
+                            ),
                         }
                     }
                     if entry.reencoded is not None

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from sashimono.core.commands.base import Command
 from sashimono.core.model import MediaId, Project
-from sashimono.core.packed import packed_refusal
+from sashimono.core.packed import HistoryReader, packed_refusal
 
 __all__ = ["REPLACED_REFUSAL", "Author", "Document", "HistoryEntry", "SeenMedia"]
 
@@ -65,10 +65,19 @@ class Document:
     :meth:`execute` 以外の経路でプロジェクトが変わることはない
     """
 
-    def __init__(self, project: Project, *, history_limit: int = DEFAULT_HISTORY_LIMIT) -> None:
+    def __init__(
+        self,
+        project: Project,
+        *,
+        history_limit: int = DEFAULT_HISTORY_LIMIT,
+        sound_history: HistoryReader | None = None,
+    ) -> None:
         if history_limit < 1:
             raise ValueError(f"履歴上限は 1 以上必要: {history_limit}")
         self._project = project
+        # 前の音を読むエフェクトの長さ（エンジン層が知る）を受け取って、持ち出し用パッケージの
+        # 範囲の確かめに使う（#445） 渡さなければ頭より前は数えない
+        self._sound_history = sound_history
         self._history_limit = history_limit
         self._undo: list[HistoryEntry] = []
         self._redo: list[HistoryEntry] = []
@@ -173,7 +182,7 @@ class Document:
         updated = command.apply(self._project)
         if updated is self._project:
             return updated
-        refusal = packed_refusal(self._project, updated)
+        refusal = packed_refusal(self._project, updated, self._sound_history)
         if refusal is not None:
             # 持ち出し用パッケージの範囲の外は素材が無い（#445） コマンドごとでなくここで断るので、
             # 画面の操作も AI の道具も、後から足すコマンドも同じ理由で断られる

@@ -17,7 +17,8 @@ import av
 import pytest
 
 from sashimono.core.io.serialize import load_project
-from sashimono.core.model import Clip, MediaItem, Project, Track, TrackKind
+from sashimono.core.model import Clip, MediaItem, Project, Track, TrackKind, VideoStreamInfo
+from sashimono.core.timebase import FrameRate
 from sashimono.engine.decode import AudioDecoder, probe_media
 from sashimono.engine.decode.rational import as_fraction
 from sashimono.engine.package.archive import (
@@ -30,12 +31,14 @@ from sashimono.engine.package.archive import (
 from sashimono.engine.package.plan import editing_media
 from sashimono.engine.package.remux import (
     REENCODE_LEAST_PSNR,
+    Reencoded,
     Span,
     cut_media,
     frame_psnr,
+    reencodable,
     reencode_media,
 )
-from tests.media_fixtures import libx264_available
+from tests.media_fixtures import encoder_available, libx264_available
 
 _KINDS = {
     "prores.mov": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"],
@@ -49,6 +52,10 @@ def _editing(directory: Path, name: str) -> Path:
     """編集用の形式の 4 秒の素材（PCM の音つき）"""
     if not libx264_available():
         pytest.skip("libx264 が無いので符号にし直す試験を飛ばす")
+    # 素材を作る符号化器も見る 無い組み立ての ffmpeg では、作る所で落ちて試験の失敗に見える
+    maker = _KINDS[name][1]
+    if not encoder_available(maker):
+        pytest.skip(f"{maker} が無いので {name} を作れない")
     path = directory / name
     if not path.exists():
         directory.mkdir(parents=True, exist_ok=True)
@@ -87,6 +94,43 @@ def _frames(path: Path, moments: list[Fraction]) -> list[av.VideoFrame]:
     return found
 
 
+def test_an_identical_picture_is_told_as_the_same() -> None:
+    """元と同じ絵の差は無限大 「inf dB」と出すと何のことか分からない（目録は null にする）"""
+    from sashimono.ui.package_dialog import _reencoded_text
+
+    report = Reencoded("prores", "h264", "yuv422p10le", float("inf"), 100, 40)
+    assert "元と同じ絵" in _reencoded_text("本編.mov", report)
+
+
+@pytest.mark.parametrize(
+    ("pixel_format", "expected"),
+    [
+        ("yuv422p10le", True),
+        ("uyvy422", True),
+        # 透明が消える・RGB の変換で色が変わる・x264 は 10bit までで深さが落ちる
+        ("yuva444p10le", False),
+        ("gbrp10le", False),
+        ("yuv422p12le", False),
+        ("gray10le", False),
+    ],
+)
+def test_only_formats_kept_as_they_are_are_offered(pixel_format: str, expected: bool) -> None:
+    """し直せない形を窓に並べると、選んでも元のまま入り、小さくなる見込みが外れる"""
+    assert reencodable(pixel_format) is expected
+    stream = VideoStreamInfo(
+        index=0,
+        width=64,
+        height=36,
+        frame_rate=FrameRate(25, 1),
+        time_base=Fraction(1, 25),
+        codec="prores",
+        pixel_format=pixel_format,
+    )
+    item = MediaItem(path=Path("D:/a.mov"), duration=Fraction(4), video_streams=(stream,))
+    clip = Clip(timeline_start=0, duration=25, media_id=item.id, source_in=Fraction(0))
+    assert bool(editing_media(_project(item, clip))) is expected
+
+
 class TestReencode:
     @pytest.mark.parametrize("name", ["prores.mov", "dnxhr.mov", "raw.mov"])
     def test_the_same_time_shows_nearly_the_same_picture(
@@ -123,6 +167,36 @@ class TestReencode:
             a = old.read_seconds(span.start, Fraction(1, 2))
             b = new.read_seconds(span.start, Fraction(1, 2))
         assert a.shape == b.shape and float(abs(a - b).max()) < 1e-4
+
+    def test_pcm_between_two_ranges_stays_on_time_and_silent(self, tmp_path: Path) -> None:
+        """離れた 2 つの区間の間を詰めると、後ろの区間の音が前へずれる 間の音を入れると、
+        使っていない所の声まで持ち出す（区間の外は無音にして時刻だけ保つ）"""
+        if not encoder_available("prores_ks"):
+            pytest.skip("prores_ks が無いので素材を作れない")
+        source = tmp_path / "chirp.mov"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=25:duration=6",
+             "-f", "lavfi", "-i", "aevalsrc=0.5*sin(2*PI*(200+150*t)*t):s=44100:d=6",
+             "-c:v", "prores_ks", "-c:a", "pcm_s16le", str(source)],
+            check=True,
+            capture_output=True,
+        )  # fmt: skip
+        target = tmp_path / "cut.mov"
+        first, second = Span(Fraction(1, 2), Fraction(1)), Span(Fraction(4), Fraction(9, 2))
+        assert cut_media(source, target, [first, second], muxer="mov")
+        with (
+            AudioDecoder(source, sample_rate=44100, channels=1, stream_index=1) as old,
+            AudioDecoder(target, sample_rate=44100, channels=1, stream_index=1) as new,
+        ):
+            # 時とともに高さの変わる音なので、ずれれば後ろの区間の形が合わない
+            a = old.read_seconds(second.start, Fraction(1, 2))
+            b = new.read_seconds(second.start, Fraction(1, 2))
+            assert a.shape == b.shape and float(abs(a - b).max()) < 1e-4
+            # 区間の間（前後の余りの外）は無音
+            gap = new.read_seconds(Fraction(2), Fraction(1, 2))
+            assert float(abs(gap).max()) < 1e-6
+            assert float(abs(old.read_seconds(Fraction(2), Fraction(1, 2))).max()) > 0.1
 
     def test_transparent_pictures_are_left_as_they_are(
         self, media_dir: Path, tmp_path: Path
