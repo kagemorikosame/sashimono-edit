@@ -7,8 +7,10 @@ AI の道具の呼び出しはスレッドを 1 本立てて行い、画面の�
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -36,7 +38,9 @@ from sashimono.ai.outbound import (
     SendChoice,
     SendRequest,
 )
+from sashimono.ai.send_log import KEEP_DAYS
 from sashimono.core.model import Project
+from sashimono.ui.chat.panel import SEND_LOG_FILE
 from sashimono.ui.chat.send_consent import (
     SEND_ALWAYS_TEXT,
     SEND_DENY_TEXT,
@@ -49,7 +53,7 @@ from sashimono.ui.chat.send_consent import (
 from sashimono.ui.chat.sent_record import SentRecordDialog
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
-from sashimono.ui.workspace import Preferences, PreferenceStore
+from sashimono.ui.workspace import Preferences, PreferenceStore, config_root
 from tests.ai.test_bridge import call_in_thread
 from tests.waiting import wait_until
 
@@ -494,6 +498,28 @@ class TestSentRecord:
                 record.deleteLater()
         finally:
             dialog.deleteLater()
+
+    def test_old_entries_are_dropped_when_the_app_starts(
+        self, qt_application: QApplication
+    ) -> None:
+        # 壊れると、送ることも記録を見ることも無いまま使い続けた人の所に、約束の日数より
+        # 古い記録がいつまでも残る（CodeRabbit の指摘 #450）
+        del qt_application
+        path = config_root() / SEND_LOG_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        old = (datetime.now().astimezone() - timedelta(days=KEEP_DAYS + 1)).isoformat()
+        kinds = {Outbound.TEXT.value: {"count": 1, "chars": 3}}
+        path.write_text(
+            json.dumps({"entries": [{"at": old, "tool": "t", "kinds": kinds}]}),
+            encoding="utf-8",
+        )
+        created = MainWindow(Project.create(), confirm_unsaved=False)
+        try:
+            assert json.loads(path.read_text(encoding="utf-8"))["entries"] == []
+        finally:
+            created._chat.close_session()
+            created.close()
+            created.deleteLater()
 
     def test_the_settings_reach_the_bridge(self, window: MainWindow) -> None:
         # 壊れると、設定画面で呼び出しごとに尋ねると選んでも、窓は 1 回しか出ない

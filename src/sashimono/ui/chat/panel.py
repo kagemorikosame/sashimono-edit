@@ -283,11 +283,15 @@ class ChatPanel(QWidget):
     ) -> None:
         super().__init__(parent)
         self._host = host
+        # 送った物の記録は、起動したときにも約束の日数より古い物を落とす 送ることも記録を
+        # 見ることも無いまま使い続けると、古い記録がいつまでも残る（CodeRabbit の指摘 #450）
+        send_log = SendLog(SendLogStore(config_root() / SEND_LOG_FILE))
+        send_log.store.prune()
         # 1 日の量はアプリを閉じても残す（#344） 置き場は設定と同じ（試験は一時フォルダへ向く）
         self._bridge = EditorBridge(
             host,
             usage=UsageMeter(DailyUsageStore(config_root() / USAGE_FILE)),
-            send_log=SendLog(SendLogStore(config_root() / SEND_LOG_FILE)),
+            send_log=send_log,
         )
         self._session: AgentSession | None = None
         #: 画面に出している「上限に達しました 続けますか」（#344）

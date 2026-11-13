@@ -715,8 +715,11 @@ class EditorBridge:
         保留した結果を返し（:class:`_Held`）、断ったら捨てる 外へ出るのは答えた後だけ
         """
         pending = self._pending_sends(operation)
+        # 尋ねない物の中に断った絵か文があれば、尋ねる前に断る 先に断らないと、名前と場所だけを
+        # 尋ねる間に下見のための道具（文字の読み取りなど）を動かし、待たせた後で結局断る
+        # （CodeRabbit の指摘 #450）
+        self._refuse_unsent(operation, waiting=frozenset(pending))
         if not pending:
-            self._refuse_unsent(operation)
             return None
         preview = operation.preview
         if preview is None:
@@ -795,12 +798,17 @@ class EditorBridge:
             pending.append(kind)
         return pending
 
-    def _refuse_unsent(self, operation: Operation) -> None:
-        """送ってよいと言われていない絵と文を返す道具を断る 名前と場所は伏せて通す"""
+    def _refuse_unsent(
+        self, operation: Operation, waiting: frozenset[Outbound] = frozenset()
+    ) -> None:
+        """送ってよいと言われていない絵と文を返す道具を断る 名前と場所は伏せて通す
+
+        ``waiting`` はこれから尋ねる物 答えを聞く前なので、まだ許していなくても断らない
+        """
         refused = [
             kind
             for kind in operation.asked_kinds
-            if kind is not Outbound.FILES and not self.may_send(kind)
+            if kind is not Outbound.FILES and kind not in waiting and not self.may_send(kind)
         ]
         if refused:
             names = "・".join(kind.label for kind in refused)

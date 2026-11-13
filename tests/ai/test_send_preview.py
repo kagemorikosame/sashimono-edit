@@ -390,6 +390,37 @@ class TestFromTheReview:
         assert copied_when_asked == [0]
         assert secret_host.copied_frames == []
 
+    def test_a_refused_text_stops_before_running_for_the_preview(self, host: FakeHost) -> None:
+        # 壊れると、文字を断って名前と場所だけを尋ねる人の所で、下見のために文字の読み取りを
+        # 先に動かし、待たせた後で結局「文字は送れない」と断る（CodeRabbit の指摘 #450）
+        ran: list[int] = []
+
+        def handler(_host: object, _arguments: dict[str, Any]) -> object:
+            ran.append(1)
+            return {"text": "読んだ文字"}
+
+        operation = Operation(
+            name="reads_text",
+            description="",
+            schema={},
+            handler=handler,
+            sends=frozenset({Outbound.TEXT, Outbound.FILES}),
+            preview=from_result(),
+        )
+        bridge = EditorBridge(host)
+        bridge.set_send_choices(
+            {
+                **dict.fromkeys(ASKED, SendChoice.ALLOW),
+                Outbound.TEXT: SendChoice.DENY,
+                Outbound.FILES: SendChoice.ASK,
+            }
+        )
+        done, box = call_in_thread(bridge, operation, {})
+        seen = answer_sends(bridge, done, lambda _request: SendAnswer.UNTIL_CLOSE)
+        assert isinstance(box.get("error"), ToolError)
+        assert seen == []
+        assert ran == []
+
     def test_the_check_is_not_run_before_asking(self) -> None:
         # 壊れると、断った下見の分まで検査の直しの回数と区切り（#339）が進む
         preview = _operation("check_output").preview
