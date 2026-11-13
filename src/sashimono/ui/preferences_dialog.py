@@ -71,6 +71,7 @@ from sashimono.engine.audio.voicevox import (
     check_engine_url,
 )
 from sashimono.engine.auto_color import AUTO_COLOR_STRENGTH_RANGE
+from sashimono.engine.cache.analyzer import MEASURED_ANALYSIS
 from sashimono.engine.cache.proxy import (
     BUDGET_MS,
     KEYFRAME_GAP_LIMIT,
@@ -89,6 +90,7 @@ from sashimono.engine.encode import (
     MEASURED_EXPORT_TOTAL_MS,
     MEASURED_GPU_COLOR_MS,
 )
+from sashimono.engine.encode.export_job import MEASURED_EXPORT_SPEED
 from sashimono.engine.encoders import (
     PRIORITY_AMD,
     PRIORITY_AUTO,
@@ -116,6 +118,7 @@ from sashimono.engine.vision.parts import (
     OCR_WINDOWS,
 )
 from sashimono.engine.vision.sampling import MEASURED_SCREEN_SAMPLE
+from sashimono.gc_policy import IDLE_S, MAX_DEFER_S
 from sashimono.stall_watch import DEFAULT_THRESHOLD_MS, default_log_path
 from sashimono.ui.backup_settings import BackupSection, confirm_backup_changes
 from sashimono.ui.flow_layout import FlowLayout
@@ -400,6 +403,32 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._proxy_process)
 
+        analysis_thread, analysis_process = MEASURED_ANALYSIS
+        self._analysis_process = QCheckBox(
+            "素材の解析（波形・サムネイル・場面）を別のプロセスで行う", self
+        )
+        self._analysis_process.setChecked(preferences.analysis_process)
+        self._analysis_process.setToolTip(
+            "解析をアプリの中のスレッドで行うと、先読みや画面と取り合って遅くなり、"
+            "解析している間は操作も重くなる\n"
+            "先読みを回しながら場面を解析した実測: "
+            f"スレッド {analysis_thread:g} 倍速 ／ 別のプロセス {analysis_process:g} 倍速\n"
+            "子のプロセスを起こせない機械では、入れたままでもスレッドで行う"
+        )
+        form.addRow(self._analysis_process)
+
+        export_thread, export_process = MEASURED_EXPORT_SPEED
+        self._export_process = QCheckBox("書き出しを別のプロセスで行う", self)
+        self._export_process.setChecked(preferences.export_process)
+        self._export_process.setToolTip(
+            "書き出しをアプリの中のスレッドで行うと、先読みや画面と取り合って遅くなる\n"
+            "先読みを回しながら書き出した実測: "
+            f"スレッド {export_thread:g} 倍速 ／ 別のプロセス {export_process:g} 倍速\n"
+            "子のプロセスで GPU を使えない機械では、入れたままでもスレッドで書き出す "
+            "書き出した絵が乱れるときは切る"
+        )
+        form.addRow(self._export_process)
+
         self._proxy_unused = QComboBox(self)
         for value, text in PROXY_UNUSED_CHOICES:
             self._proxy_unused.addItem(text, value)
@@ -476,6 +505,17 @@ class PreferencesDialog(QDialog):
             f"{quick_proxy:g} 倍速） 別のプロセスで作る控えには影響しない"
         )
         form.addRow(self._responsive_switch)
+
+        self._gc_manual = QCheckBox("ごみ集めの全体回を、手が止まってから回す", self)
+        self._gc_manual.setChecked(preferences.gc_manual)
+        self._gc_manual.setToolTip(
+            "Python のメモリの片付けのうち、全部を見て回る回（大きなプロジェクトで 1 回 30ms 前後）"
+            f"を自動で走らせず、操作が {IDLE_S:g} 秒止まったときに回す\n"
+            "選ぶ・動かす最中の 1〜2 コマの止まりが減る代わりに、操作し続ける間は片付けが遅れて"
+            f"メモリが少し増える（遅らせるのは長くて {MAX_DEFER_S:g} 秒）\n"
+            "画面の止まりの記録に、ごみ集めの世代 2 が多く出たときに入れる"
+        )
+        form.addRow(self._gc_manual)
 
         self._pipeline_depth = QComboBox(self)
         for label, depth in PIPELINE_DEPTHS:
@@ -1484,6 +1524,9 @@ class PreferencesDialog(QDialog):
             prefetch_thread=self._prefetch_thread.isChecked(),
             prefetch_yield=self._prefetch_yield.isChecked(),
             responsive_switch=self._responsive_switch.isChecked(),
+            gc_manual=self._gc_manual.isChecked(),
+            analysis_process=self._analysis_process.isChecked(),
+            export_process=self._export_process.isChecked(),
             export_pipeline_depth=int(self._pipeline_depth.currentData()),
             export_gpu_color=self._export_gpu_color.isChecked(),
             export_chapters=self._export_chapters.isChecked(),

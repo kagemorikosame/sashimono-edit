@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -44,6 +45,7 @@ __all__ = [
     "SceneScan",
     "SceneSignal",
     "analyze_scenes",
+    "scenes_job",
 ]
 
 #: 輝度を縮める横幅（画素） 縦は素材の縦横比に合わせる
@@ -329,6 +331,42 @@ def analyze_scenes(
         # InvalidDataError、CI では黙って止まった PR #358） どちらも同じ扱いにする
         return scan.snapshot(analyzed=last, broken=True)
     return scan.snapshot(complete=True, analyzed=max(last, duration))
+
+
+#: 別のプロセスで読むとき、途中の並びを親へ送る間隔（秒） 1 時間の 60fps の素材の並びは
+#: 20 万行（3 MB 前後）になり、送るたびに丸ごと pickle する 短くすると送るのが読むのより重くなり、
+#: 長くすると AI が途中を頼んだときに古い所までしか返せない
+PUBLISH_INTERVAL_S = 2.0
+
+
+def scenes_job(
+    *,
+    progress: Callable[[float], None],
+    should_cancel: Callable[[], bool],
+    publish: Callable[[SceneSignal], None] | None = None,
+    path: Path,
+    threads: int = 2,
+) -> SceneSignal | None:
+    """別のプロセスで場面を読む入口（:func:`~sashimono.engine.worker.run_in_process` が呼ぶ #453）
+
+    ``publish`` があれば、読み終えた所までの写しを :data:`PUBLISH_INTERVAL_S` ごとに送る
+    同じプロセスで読むときは :class:`SceneScan` を渡して親が直に写すが、プロセスを越えると
+    写せないので、子の側で写して送る
+    """
+    scan = SceneScan()
+    sent = time.monotonic()
+
+    def report(value: float) -> None:
+        nonlocal sent
+        progress(value)
+        now = time.monotonic()
+        if publish is not None and now - sent >= PUBLISH_INTERVAL_S:
+            sent = now
+            publish(scan.snapshot())
+
+    return analyze_scenes(
+        path, threads=threads, scan=scan, progress=report, should_cancel=should_cancel
+    )
 
 
 def _duration(container: av.container.InputContainer, stream: av.VideoStream) -> float:

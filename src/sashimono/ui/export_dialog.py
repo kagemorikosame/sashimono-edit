@@ -45,7 +45,9 @@ from sashimono.engine.encode import (
     chosen_range,
     export_target,
 )
-from sashimono.engine.encode import export_project as run_export
+
+# 試験が差し替える名前は前のまま（書き出しの偽物を ``run_export`` へ当てる）
+from sashimono.engine.encode.export_job import export_anywhere as run_export
 from sashimono.engine.encoders import PRIORITY_AUTO
 from sashimono.engine.render import DEFAULT_DECODE_THREADS
 from sashimono.ui.system_clipboard import clipboard
@@ -93,10 +95,13 @@ class _ExportWorker(QObject):
     finished = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, project: Project, settings: ExportSettings) -> None:
+    def __init__(
+        self, project: Project, settings: ExportSettings, *, separate_process: bool = False
+    ) -> None:
         super().__init__()
         self._project = project
         self._settings = settings
+        self._separate_process = separate_process
         self._cancel = threading.Event()
         #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365）
         #: 書き出しのスレッドが足し、終わりの知らせ（finished）が届いてから画面のスレッドが読む
@@ -110,6 +115,7 @@ class _ExportWorker(QObject):
             path = run_export(
                 self._project,
                 self._settings,
+                separate_process=self._separate_process,
                 progress=self.progressed.emit,
                 should_cancel=self._cancel.is_set,
                 notice=self.notes.append,
@@ -147,10 +153,12 @@ class ExportDialog(QDialog):
         chapters: bool = True,
         encoder_priority: str = PRIORITY_AUTO,
         bitrate: BitrateChoice | None = None,
+        separate_process: bool = False,
     ) -> None:
         """``project`` はメインを持つプロジェクト全体
 
         ``bitrate`` はビットレートの欄の初めの値の決め方（本人の設定 #414） 省くと前からの決め打ち
+        ``separate_process`` は別のプロセスで書き出すか（本人の設定 ``export_process`` #453）
 
         ``encoder_priority`` はどの作り手のエンコーダを先に試すか（本人の設定 #365）
         コーデックの並びと「自動」の中身がこれに従う
@@ -180,6 +188,7 @@ class ExportDialog(QDialog):
         #: 色変換を GPU で行うか（#372） 機械の駆動との相性で決まる物なので、ここも本人の設定から
         self._gpu_color = gpu_color
         self._encoder_priority = encoder_priority
+        self._separate_process = separate_process
         self._thread: QThread | None = None
         self._worker: _ExportWorker | None = None
         #: 書き出し中に閉じるよう頼まれた 止まった知らせが来たら閉じる
@@ -508,7 +517,9 @@ class ExportDialog(QDialog):
         self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
         self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("中止")
 
-        self._worker = _ExportWorker(self._project, settings)
+        self._worker = _ExportWorker(
+            self._project, settings, separate_process=self._separate_process
+        )
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
