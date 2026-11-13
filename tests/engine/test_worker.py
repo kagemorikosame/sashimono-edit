@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -171,9 +173,9 @@ class TestProxyInAnotherProcess:
         """壊れると、設定で別のプロセスを選んでも控えができない（スレッドで作っていても気付けない）"""
         jobs: list[object] = []
 
-        def recording(job: object, *args: object, **kwargs: object) -> object:
+        def recording(job: Callable[..., object], kwargs: dict[str, Any], **options: Any) -> object:
             jobs.append(job)
-            return run_in_process(job, *args, **kwargs)  # type: ignore[arg-type]
+            return run_in_process(job, kwargs, **options)
 
         monkeypatch.setattr(proxy_module, "run_in_process", recording)
         builder = ProxyBuilder(ProxyStore(CacheStore(tmp_path), height=120), separate_process=True)
@@ -265,9 +267,9 @@ class TestAnalysisInAnotherProcess:
         """壊れると、設定で別のプロセスを選んでも解析がアプリの中で走り、画面と取り合ったまま"""
         jobs: list[object] = []
 
-        def recording(job: object, *args: object, **kwargs: object) -> object:
+        def recording(job: Callable[..., object], kwargs: dict[str, Any], **options: Any) -> object:
             jobs.append(job)
-            return run_in_process(job, *args, **kwargs)  # type: ignore[arg-type]
+            return run_in_process(job, kwargs, **options)
 
         monkeypatch.setattr(analyzer_module, "run_in_process", recording)
         # 試験の素材は 2 秒しかない 長さの下限を外して、寄せる種類が子を通るかを見る
@@ -332,15 +334,39 @@ class TestAnalysisInAnotherProcess:
         finally:
             analyzer.close()
 
+    def test_a_cancelled_job_does_not_start_a_child(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、まとめて取り消した予約の数だけ子を起こして終わりを待ち、次の解析が遅れる"""
+        started: list[object] = []
+
+        def recording(job: Callable[..., object], kwargs: dict[str, Any], **options: Any) -> object:
+            started.append(job)
+            return None
+
+        monkeypatch.setattr(analyzer_module, "run_in_process", recording)
+        analyzer = MediaAnalyzer(CacheStore(tmp_path), separate_process=True)
+        media = MediaItem(path=tmp_path / "x.mp4", duration=Fraction(60), id=MediaId("m"))
+        key = ("scenes", media.id, None)
+        with analyzer._lock:
+            analyzer._cancelled.add(key)
+        try:
+            ran, result = analyzer._in_process(scenes_job, {}, key, media, lambda _p: None)
+            # 走らせた扱いにして、スレッドで読み直させない
+            assert (ran, result) == (True, None)
+            assert not started
+        finally:
+            analyzer.close()
+
     def test_short_media_stay_in_a_thread(
         self, tmp_path: Path, sample_av: SampleMedia, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """壊れると、短い素材を読むたびに子を起こして部品を読み直し、1 本に 1 秒ずつ余計に待つ"""
         jobs: list[object] = []
 
-        def recording(job: object, *args: object, **kwargs: object) -> object:
+        def recording(job: Callable[..., object], kwargs: dict[str, Any], **options: Any) -> object:
             jobs.append(job)
-            return run_in_process(job, *args, **kwargs)  # type: ignore[arg-type]
+            return run_in_process(job, kwargs, **options)
 
         monkeypatch.setattr(analyzer_module, "run_in_process", recording)
         analyzer = MediaAnalyzer(CacheStore(tmp_path), separate_process=True)

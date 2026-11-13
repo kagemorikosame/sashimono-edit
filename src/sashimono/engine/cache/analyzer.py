@@ -557,6 +557,11 @@ class MediaAnalyzer:
         if not self.separate_process or minimum is None or media.duration < minimum:
             # 短い素材と寄せない種類は、子の起動の分の方が重い（:data:`PROCESS_MIN_SECONDS`）
             return False, None
+        if self._is_cancelled(key):
+            # 取り消した予約は子を起こさずに終える 起こしてから中止を見ると、まとめて取り消した
+            # 本数だけ子の起動と終わりを待ち、そのあとに頼んだ解析まで待たされる
+            # 走らせた扱い（結果なし）にして、スレッドで読み直させない
+            return True, None
         try:
             result = run_in_process(
                 job,

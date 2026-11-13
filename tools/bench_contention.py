@@ -61,6 +61,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -465,15 +466,21 @@ class Load:
 
     def __init__(self, *parts: Spinner | Prefetcher) -> None:
         self._parts = parts
+        self._stack: ExitStack | None = None
 
     def __enter__(self) -> Load:
-        for part in self._parts:
-            part.__enter__()
+        # 途中の物（先読みの GL など）が入れずに投げても、先に入れた物を逆順で切る
+        # 切らないと、測りを飛ばした後も回るスレッドが残り、次からの測りを重くする
+        with ExitStack() as stack:
+            for part in self._parts:
+                stack.enter_context(part)
+            self._stack = stack.pop_all()
         return self
 
     def __exit__(self, *exc: object) -> None:
-        for part in reversed(self._parts):
-            part.__exit__(*exc)
+        stack, self._stack = self._stack, None
+        if stack is not None:
+            stack.close()
 
 
 def run_alone(job: Job, source: Path, scratch: Path, spinner: Load) -> float | None:
