@@ -29,10 +29,13 @@ from sashimono.ai.outbound import (
     DESTINATION,
     TEXT_MARK,
     Outbound,
+    Preview,
     SendAnswer,
     SendChoice,
     SendRequest,
     file_secrets,
+    from_arguments,
+    from_result,
     hide_text,
     redact,
     secret_pairs,
@@ -659,28 +662,40 @@ def undeclared(
 
 
 class TestAskingBeforeSending:
-    def test_the_first_preview_asks_before_drawing(self, host: FakeHost) -> None:
-        # 壊れると、本人が知らないうちに映像の絵が外へ出る
+    def test_the_first_preview_asks_before_sending_and_shows_the_frame(
+        self, host: FakeHost
+    ) -> None:
+        # 壊れると、本人が知らないうちに映像の絵が外へ出るか、どの絵が出るかを見ずに答えさせる
+        # 下見のために先に描く（#425） 描いた絵は答えるまで AI へ返らない
         bridge = EditorBridge(host)
         drawn_when_asked: list[int] = []
 
-        def deny(request: SendRequest) -> SendAnswer:
+        def allow(request: SendRequest) -> SendAnswer:
             drawn_when_asked.append(len(host.rendered))
-            return SendAnswer.DENY
+            return SendAnswer.UNTIL_CLOSE
 
-        seen, _box = _run(bridge, "preview_frame", deny)
+        seen, box = _run(bridge, "preview_frame", allow)
         assert [request.kinds for request in seen] == [(Outbound.FRAMES,)]
-        assert drawn_when_asked == [0]
+        assert drawn_when_asked == [1]
         assert DESTINATION in seen[0].text()
-        assert "映像の絵" in seen[0].text()
+        assert "映像の絵（1 枚）" in seen[0].text()
+        result = box["result"]
+        assert isinstance(result, ImageResult)
+        (sample,) = seen[0].samples
+        # 下見の絵と送った絵が同じ 描き直すと、見せた物と別の絵を送りうる
+        assert sample.images == (result.png,)
+        assert len(host.rendered) == 1
 
     def test_denying_sends_nothing(self, host: FakeHost) -> None:
-        # 壊れると、「送らない」を押しても絵が描かれて外へ出る
+        # 壊れると、「送らない」を押しても下見のために描いた絵が外へ出る
         bridge = EditorBridge(host)
         _seen, box = _run(bridge, "preview_frame", lambda _request: SendAnswer.DENY)
         assert isinstance(box.get("error"), ToolError)
         assert "映像の絵" in str(box["error"])
-        assert host.rendered == []
+        assert "result" not in box
+        # 断った絵は送った絵に数えない
+        assert bridge.usage.day_usage().images == 0
+        assert bridge.send_log.last() == {}
 
     def test_a_denial_is_kept_until_the_app_closes(self, host: FakeHost) -> None:
         # 壊れると、断ったのに AI が呼び直すたびに窓が出て、作業が止まり続ける
@@ -688,7 +703,8 @@ class TestAskingBeforeSending:
         _run(bridge, "preview_frame", lambda _request: SendAnswer.DENY)
         _seen, box = _run(bridge, "preview_frame")
         assert isinstance(box.get("error"), ToolError)
-        assert host.rendered == []
+        # 下見のために描いたのは尋ねた 1 回だけ 断った後は描かずに断る
+        assert len(host.rendered) == 1
 
     def test_allowing_until_close_does_not_ask_again(self, host: FakeHost) -> None:
         # 壊れると、AI が絵を見るたびに窓が出て、1 本の動画を見るのに何十回も押す
@@ -758,7 +774,8 @@ class TestAskingBeforeSending:
 
         _seen, box = _run(bridge, "preview_frame", interrupt)
         assert isinstance(box.get("error"), ToolError)
-        assert host.rendered == []
+        # 下見のために描いた絵は、畳んだ確かめの後に AI へ返らない
+        assert "result" not in box
 
     def test_no_answer_in_time_sends_nothing(
         self, host: FakeHost, monkeypatch: pytest.MonkeyPatch
@@ -772,7 +789,7 @@ class TestAskingBeforeSending:
             bridge.pump()
             time.sleep(0.005)
         assert isinstance(box.get("error"), ToolError)
-        assert host.rendered == []
+        assert "result" not in box
 
 
 # --- 素材の名前と場所 ---
@@ -1008,7 +1025,11 @@ class TestWaitingTools:
     """待ってから返す道具（:class:`Pending` #321 の detect_scenes など）"""
 
     @staticmethod
-    def _waiting(steps: list[str], answer: Callable[[EditorHost], object]) -> Operation:
+    def _waiting(
+        steps: list[str],
+        answer: Callable[[EditorHost], object],
+        preview: Preview | None = None,
+    ) -> Operation:
         def wait(seconds: float) -> bool:
             del seconds
             steps.append("待った")
@@ -1024,6 +1045,7 @@ class TestWaitingTools:
             schema={},
             handler=start,
             sends=frozenset({Outbound.PROJECT, Outbound.FILES}),
+            preview=preview if preview is not None else from_arguments(),
         )
 
     def test_consent_is_asked_before_running_and_waiting(self, secret_host: FakeHost) -> None:
@@ -1055,6 +1077,31 @@ class TestWaitingTools:
         answer_sends(bridge, done, _never)
         assert "秘密の人" not in str(box["result"])
         assert steps == ["動いた", "待った"]
+
+    def test_a_held_result_is_run_again_with_names_hidden_after_a_denial(
+        self, secret_host: FakeHost
+    ) -> None:
+        # 壊れると、下見のために名前を伏せずに作った結果を、名前と場所を断った人の所でも
+        # そのまま返す 断ったら伏せ字の道で動かし直す
+        steps: list[str] = []
+        operation = self._waiting(
+            steps, lambda host: {"media": host.document.project.media[0].name}, from_result()
+        )
+        bridge = EditorBridge(secret_host)
+        seen: list[SendRequest] = []
+
+        def deny(request: SendRequest) -> SendAnswer:
+            seen.append(request)
+            steps.append("尋ねた")
+            return SendAnswer.DENY
+
+        done, box = call_in_thread(bridge, operation, {})
+        answer_sends(bridge, done, deny)
+        assert steps == ["動いた", "待った", "尋ねた", "動いた", "待った"]
+        assert "結婚式" not in json.dumps(box["result"], ensure_ascii=False)
+        (sample,) = seen[0].samples
+        # 下見には伏せる前と後の両方を出す
+        assert any("結婚式" in line and "〔素材" in line for line in sample.lines)
 
     def test_detect_scenes_declares_names_and_places(self) -> None:
         # 壊れると、素材の名前の入った断りの文（映像がありません・調べられませんでした）を、

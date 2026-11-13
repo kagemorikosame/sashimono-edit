@@ -31,7 +31,7 @@ from sashimono.ai import operations
 from sashimono.ai.bridge import Approval, EditorBridge
 from sashimono.ai.host import EditorHost, ToolError
 from sashimono.ai.operations import OPERATIONS, Operation, find_operation
-from sashimono.ai.outbound import Outbound
+from sashimono.ai.outbound import Outbound, from_arguments
 from sashimono.ai.safety import Consent, Safety, check_writable, writable_path
 from sashimono.core.model import MediaItem, Transcript
 from tests.ai.conftest import FakeHost, allow_sending, make_loaded
@@ -64,6 +64,7 @@ WRITE_NOTE = Operation(
     consent=_note_consent,
     # 書いた場所を返す 作品のフォルダの場所なので名前と場所を送る物に書く（CodeRabbit の指摘 #366）
     sends=frozenset({Outbound.PROJECT, Outbound.FILES}),
+    preview=from_arguments(),
 )
 
 

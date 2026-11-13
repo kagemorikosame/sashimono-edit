@@ -940,6 +940,14 @@ class Preferences:
     ai_send_text: str = SEND_ASK
     #: 素材の名前と場所 送らないと決めたら、伏せ字にして送る
     ai_send_files: str = SEND_ASK
+    #: 送る前の確かめを、道具の呼び出しごとに出すか（#425） 既定は種類ごとにアプリを閉じるまで
+    #: 1 回 呼び出しごとにすると細かく確かめられるが、絵を何枚も見る作業で何十回も尋ねられる
+    #: 確かめたい細かさは人で違うので選べるようにする
+    ai_send_ask_each_call: bool = False
+    #: AI へ送った物の記録（日時・道具・種類・件数 #425 :mod:`sashimono.ai.send_log`）を残すか
+    #: 中身は残さない 既定は残す 尋ねない設定にした後も、何がどれだけ出たかを見直せるように
+    #: 使った履歴をこの機械に残したくない人は切れる
+    ai_send_log: bool = True
     #: AI アシスタントが使う量の上限（#344 :mod:`sashimono.ai.budget`） 0 は上限なし
     #: どこまで使ってよいかは契約と懐で人ごとに違う 既定は、ふつうの指示では当たらず、同じ道具を
     #: 繰り返して止まらなくなった指示は止まる量 当たっても、既定では続けるかを尋ねるだけ
@@ -1435,6 +1443,10 @@ class PreferenceStore:
             ai_send_frames=_choice(data.get("ai_send_frames"), SEND_MODES, plain.ai_send_frames),
             ai_send_text=_choice(data.get("ai_send_text"), SEND_MODES, plain.ai_send_text),
             ai_send_files=_choice(data.get("ai_send_files"), SEND_MODES, plain.ai_send_files),
+            ai_send_ask_each_call=_flag(
+                data.get("ai_send_ask_each_call"), plain.ai_send_ask_each_call
+            ),
+            ai_send_log=_flag(data.get("ai_send_log"), plain.ai_send_log),
             ai_limit_turn_tokens=_within(
                 data.get("ai_limit_turn_tokens"), AI_TOKEN_LIMITS, plain.ai_limit_turn_tokens
             ),
