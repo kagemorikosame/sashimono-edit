@@ -32,6 +32,7 @@ __all__ = [
     "START_QUIET_DB",
     "STEP",
     "fit_to_voice",
+    "found_edges",
     "loudness_of_samples",
     "loudness_of_waveform",
     "retime",
@@ -204,18 +205,47 @@ def fit_to_voice(
     """
     fitted: list[tuple[Fraction, Fraction]] = []
     for index, (start, end) in enumerate(times):
-        before = times[index - 1][1] if index > 0 else None
-        after = times[index + 1][0] if index + 1 < len(times) else None
-        # 元の行が重なっている（認識が重ねて返した）ときは、隣の行で窓を絞らない 絞ると窓の
-        # 向きが逆になる
-        low = start - REACH if before is None or before > start else max(start - REACH, before)
-        high = end + REACH if after is None or after < end else min(end + REACH, after)
+        low, high = _window(times, index)
         new_start = _start_edge(loudness, start, low, min(start + REACH, end))
         new_end = _end_edge(loudness, end, max(end - REACH, start), high)
+        new_start = start if new_start is None else new_start
+        new_end = end if new_end is None else new_end
         if new_end <= new_start:
             new_start, new_end = start, end
         fitted.append((new_start, new_end))
     return _untangled(times, fitted)
+
+
+def found_edges(
+    times: Sequence[tuple[Fraction, Fraction]], loudness: np.ndarray
+) -> list[tuple[bool, bool]]:
+    """行ごとの ``(頭, 終わり)`` から :func:`fit_to_voice` と同じ窓で、声の境目が見つかったか
+
+    寄せた結果が元の時刻と同じでも、境目の上にいたのか、窓の中に境目が無くて動かなかったのかは
+    分からない 字幕の時刻の確かめは、設定のずらしが足されているかどうかを、どちらの位置から
+    境目が見つかるかで見分ける（PR #451）
+    """
+    out: list[tuple[bool, bool]] = []
+    for index, (start, end) in enumerate(times):
+        low, high = _window(times, index)
+        head = _start_edge(loudness, start, low, min(start + REACH, end))
+        tail = _end_edge(loudness, end, max(end - REACH, start), high)
+        out.append((head is not None, tail is not None))
+    return out
+
+
+def _window(times: Sequence[tuple[Fraction, Fraction]], index: int) -> tuple[Fraction, Fraction]:
+    """``index`` の行の頭を探す窓の下端と、終わりを探す窓の上端
+
+    隣の行の元の時刻は越えない 元の行が重なっている（認識が重ねて返した）ときは、隣の行で窓を
+    絞らない 絞ると窓の向きが逆になる
+    """
+    start, end = times[index]
+    before = times[index - 1][1] if index > 0 else None
+    after = times[index + 1][0] if index + 1 < len(times) else None
+    low = start - REACH if before is None or before > start else max(start - REACH, before)
+    high = end + REACH if after is None or after < end else min(end + REACH, after)
+    return low, high
 
 
 def _untangled(
@@ -238,10 +268,13 @@ def _untangled(
     return out
 
 
-def _start_edge(loudness: np.ndarray, at: Fraction, low: Fraction, high: Fraction) -> Fraction:
+def _start_edge(
+    loudness: np.ndarray, at: Fraction, low: Fraction, high: Fraction
+) -> Fraction | None:
+    """窓の中の声の出だし 見つからなければ ``None``（呼ぶ側が元の時刻のまま残す）"""
     window = _voiced(loudness, low, high, START_QUIET_DB)
     if window is None:
-        return at
+        return None
     first, voiced = window
     here = min(max(_step(at) - first, 0), len(voiced) - 1)
     if voiced[here]:
@@ -250,15 +283,16 @@ def _start_edge(loudness: np.ndarray, at: Fraction, low: Fraction, high: Fractio
         head = here
         while head > 0 and voiced[head - 1]:
             head -= 1
-        return _seconds(first + head) if head > 0 else at
+        return _seconds(first + head) if head > 0 else None
     ahead = np.flatnonzero(voiced[here:])
-    return _seconds(first + here + int(ahead[0])) if ahead.size else at
+    return _seconds(first + here + int(ahead[0])) if ahead.size else None
 
 
-def _end_edge(loudness: np.ndarray, at: Fraction, low: Fraction, high: Fraction) -> Fraction:
+def _end_edge(loudness: np.ndarray, at: Fraction, low: Fraction, high: Fraction) -> Fraction | None:
+    """窓の中の声の終わり 見つからなければ ``None``（呼ぶ側が元の時刻のまま残す）"""
     window = _voiced(loudness, low, high, END_QUIET_DB)
     if window is None:
-        return at
+        return None
     first, voiced = window
     # 終わりの時刻を含むコマ（終わりのちょうど前の 10 ms）
     here = min(max(_step(at) - first - 1, 0), len(voiced) - 1)
@@ -266,9 +300,9 @@ def _end_edge(loudness: np.ndarray, at: Fraction, low: Fraction, high: Fraction)
         tail = here
         while tail < len(voiced) - 1 and voiced[tail + 1]:
             tail += 1
-        return _seconds(first + tail + 1) if tail < len(voiced) - 1 else at
+        return _seconds(first + tail + 1) if tail < len(voiced) - 1 else None
     behind = np.flatnonzero(voiced[: here + 1])
-    return _seconds(first + int(behind[-1]) + 1) if behind.size else at
+    return _seconds(first + int(behind[-1]) + 1) if behind.size else None
 
 
 def _voiced(

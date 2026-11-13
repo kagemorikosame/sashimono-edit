@@ -27,6 +27,9 @@ from sashimono.engine.checks.scan import SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
 from sashimono.engine.checks.words import WordReport, check_words
 from tests.words_helpers import in_scene, placed, sample_transcript, segment, spoken, wave
 
+#: 語の時刻で調べる種類 字幕の時刻のずれ（#414）は行と波形で見るので、語の有無の試験から外す
+WORDED = WORD_KINDS - {"subtitle_timing"}
+
 
 def _media(video_media: MediaItem) -> MediaItem:
     return video_media.with_transcript(sample_transcript())
@@ -42,7 +45,7 @@ def _check(
     project: Project,
     sound: Waveform | None = None,
     *,
-    kinds: frozenset[str] = WORD_KINDS,
+    kinds: frozenset[str] = WORDED,
 ) -> WordReport:
     return check_words(project, 0, project.duration, kinds, lambda _media, _stream: sound)
 
@@ -174,7 +177,7 @@ class TestNoWordTimes:
         media = video_media.with_transcript(transcript)
         project = placed(media, _clip(media, 0, 30, Fraction(1)))
         report = _check(project, wave())
-        assert report.skipped == WORD_KINDS
+        assert report.skipped == WORDED
         assert report.problems == ()
         assert "words_only" in " ".join(report.notes)
 
@@ -190,7 +193,7 @@ class TestNoWordTimes:
         changed = replace(track, clips=(*track.clips, _clip(other, 30, 30, Fraction(1))))
         project = project.with_timeline(replace(project.timeline, tracks=(changed,)))
         report = _check(project, wave())
-        assert report.skipped == WORD_KINDS
+        assert report.skipped == WORDED
         assert "語の時刻が無い字幕の行" in " ".join(report.notes)
 
     def test_a_sound_without_subtitles_is_only_counted(self, video_media: MediaItem) -> None:
@@ -220,7 +223,7 @@ def test_only_sounds_without_subtitles(video_media: MediaItem) -> None:
     """
     project = placed(video_media, _clip(video_media, 0, 30, Fraction(1)))
     report = _check(project, wave())
-    assert report.skipped == WORD_KINDS
+    assert report.skipped == WORDED
     assert "words_only" not in " ".join(report.notes)
     assert "transcribe" in " ".join(report.notes)
 
@@ -233,7 +236,7 @@ def test_a_cut_on_a_line_without_words_is_not_counted_as_checked(video_media: Me
     )
     media = video_media.with_transcript(Transcript(lines, language="ja"))
     project = placed(media, _clip(media, 0, 15, Fraction(5)))
-    assert _check(project, wave(())).skipped == WORD_KINDS
+    assert _check(project, wave(())).skipped == WORDED
 
 
 def test_a_line_without_words_away_from_the_cut_stays_checked(video_media: MediaItem) -> None:

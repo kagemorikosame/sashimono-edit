@@ -22,8 +22,10 @@ from sashimono.ai.host import EditorHost
 from sashimono.ai.operations import OPERATIONS
 from sashimono.ai.outbound import ASKED, Outbound, SendChoice
 from sashimono.asr.service import Job
+from sashimono.core.commands import AddTrack
 from sashimono.core.io.serialize import save_project
-from sashimono.core.model import MediaItem, Transcript
+from sashimono.core.model import MediaItem, Track, TrackKind, Transcript
+from sashimono.engine.package.archive import OpenedPackage
 from sashimono.ui.main_window import MainWindow
 from tests.ai.conftest import make_loaded
 from tests.ai.test_bridge import call_in_thread
@@ -45,6 +47,9 @@ TEXT_SOURCES = {
     # ファイルを残した場所・控えの置き場が入る 書いた場所と残した場所は remembered_names から返す
     "write_project",
     "export_status",
+    # 持ち出し用パッケージ（#423） 様子に書き出し先・開いたパッケージ・展開した作品の場所と、
+    # 素材と書体の名前が入る 場所は remembered_names から返し、素材の名前は作品の物
+    "package_status",
 }
 #: 本人の持ち物と設定（保存したプリセット・エイリアスと着せ方の設定 #308、音量の基準 #337、
 #: ダッキングの下げ幅と速さ #329） 送る（使う道具は sends に Outbound.APP_SETTINGS を書く）
@@ -77,6 +82,11 @@ OWN_LIBRARY = {
     "image_edge",
     # 画面の解析の部品が入っているか（#407） 本人の機械の様子 reframe が返事の faces に載せる
     "vision_ready",
+    # 字幕の時刻のずらし・山をリミッターで抑えるか・書き出しのビットレートの決め方（#414）
+    # check_output・normalize_loudness・export_video が問題の値と結果と確かめの箱に載せる
+    "subtitle_timing",
+    "loudness_limiter",
+    "export_bitrate",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
@@ -100,6 +110,10 @@ PROJECT_SIDE = {
     "is_modified",
     "open_project_file",
     "start_new_project",
+    # 持ち出し用パッケージ（#423） 何も返さない 様子は package_status が返し、待つ関数は真偽だけ
+    "start_package_export",
+    "start_package_open",
+    "package_waiter",
     # スクリプトを読み直す（本数だけ返す）・配置のテンプレート（命令だけ返す #349）
     "reload_scripts",
     "alignment_commands",
@@ -243,6 +257,26 @@ class TestAfterOpeningAnotherProject:
         assert any(MARK in value for value in remembered)
 
 
+class TestAnUnopenedPackage:
+    def test_the_unpacked_folder_is_not_sent(self, window: MainWindow, tmp_path: Path) -> None:
+        # 壊れると、展開した後に開かなかったパッケージ（展開の間に編集した など）の展開先が
+        # 様子の文に残り、名前と場所を送らないと決めた人の所でもユーザー名ごと外へ出る
+        folder = tmp_path / f"{MARK}展開"
+        opened = OpenedPackage(
+            project_path=folder / "作品.sme",
+            project=window.document.project,
+            folder=folder,
+            fonts=(),
+            scripts=(),
+            made_by="",
+        )
+        window._package._by_assistant = True
+        window.document.execute(AddTrack(Track(TrackKind.AUDIO, "未保存の変更")))
+        window._package_ended("open", opened)
+        assert MARK in str(window.package_status()["message"])
+        assert MARK not in _call(window, "package_status")
+
+
 class TestEveryTextSourceGoesThroughThePort:
     def test_the_list_of_text_sources_matches_the_host(self) -> None:
         # 壊れると、作品の外の物を返す口を EditorHost に足した人が、その口の名前を
@@ -301,6 +335,9 @@ class TestEveryTextSourceGoesThroughThePort:
             "preview_frame",
             "contact_sheet",
             "preview_range",
+            # 書き出しの既定のビットレート（#414） 本人の設定と素材から決めた値が確かめの箱に載る
+            "export_video",
+            "normalize_loudness",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name

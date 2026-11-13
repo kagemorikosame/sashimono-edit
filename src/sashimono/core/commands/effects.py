@@ -18,7 +18,7 @@ from fractions import Fraction
 from typing import cast
 
 from sashimono.core.commands.base import Command
-from sashimono.core.commands.fixed import fixed_slot, loose_slot
+from sashimono.core.commands.fixed import LAST_KINDS, fixed_slot, loose_slot
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -328,6 +328,7 @@ class AddEffect(Command):
     YMM4 で同じ設定にした絵と違う
     固定の項目を足すとき（前の版のファイルで欄が無かった物を、触ったときに足す）は、
     固定の項目どうしの並び（反転 → 配置 → 音量 → フェード）の所へ入る
+    リミッター（:data:`~sashimono.core.commands.fixed.LAST_KINDS`）は末尾へ入る
     """
 
     clip_id: ClipId
@@ -345,10 +346,18 @@ class AddEffect(Command):
         return "エフェクトを追加"
 
     def apply(self, project: Project) -> Project:
+        """縁取りの層には固定の項目を積めない（層の列は固定の欄を持たない）
+
+        層の列を読む側は固定の欄が無い物として読む 通すと、読む側と列の形が合わなくなる
+        """
         if self.stroke_id is not None and self.effect.fixed:
             raise ValueError("縁取りの層にクリップの欄（固定の項目）は積めない")
 
         def update(clip: Clip) -> Clip:
+            """エフェクトの列へ 1 つ差し込む 置く所を種類で変えるのは、掛ける順で絵と音が変わるため
+
+            リミッターを音量の欄より前に置くと、上げた音量で山が上限を越える
+            """
             effects = list(stack_of(clip, self.after, self.stroke_id))
             if self.index is not None:
                 position = self.index
@@ -356,6 +365,9 @@ class AddEffect(Command):
                 position = len(effects)
             elif self.effect.fixed:
                 position = fixed_slot(effects, self.effect.kind)
+            elif self.effect.kind in LAST_KINDS:
+                # リミッターは音量の欄の後に掛けないと、上げた音量で山が上限を越える
+                position = len(effects)
             else:
                 position = loose_slot(effects)
             effects.insert(position, self.effect)

@@ -32,9 +32,15 @@ import numpy as np
 from sashimono.ai.auto_fix import (
     ColorRequest,
     NoiseRequest,
+    clips_overlap,
+    has_limiter,
+    limited_ceiling,
+    limited_peak,
+    limiter_commands,
     picture_clip,
     plan_color_fix,
     plan_noise_fix,
+    raise_cap,
 )
 from sashimono.ai.fixes import ASK as FIX_ASK
 from sashimono.ai.fixes import AUTO as FIX_AUTO
@@ -54,6 +60,7 @@ from sashimono.ai.host import (
     UNSAVED_REFUSAL,
     EditorHost,
     ExportRequest,
+    PackageRequest,
     SheetCanvas,
     ToolError,
 )
@@ -262,6 +269,7 @@ from sashimono.core.mixing import (
     DUCK_ATTACK_MS_RANGE,
     DUCK_DEPTH_DB_RANGE,
     DUCK_RELEASE_MS_RANGE,
+    MAX_LIMITER_DB,
     VOLUME_LIMIT,
     DuckShape,
     audible_clips,
@@ -311,6 +319,7 @@ from sashimono.core.projection import (
     project_timeline,
     source_seconds_at,
     subtitle_stream,
+    subtitle_voice,
 )
 from sashimono.core.reframe import (
     CENTER,
@@ -476,6 +485,7 @@ from sashimono.engine.highlights import (
 from sashimono.engine.highlights import LOUD as HIGHLIGHT_LOUD
 from sashimono.engine.highlights import MOTION as HIGHLIGHT_MOTION
 from sashimono.engine.highlights import SIGNALS as HIGHLIGHT_SIGNALS
+from sashimono.engine.package.archive import PACKAGE_SUFFIX, RIGHTS_NOTE
 from sashimono.engine.reframe import (
     FaceSummary,
     GatheredFaces,
@@ -3909,7 +3919,14 @@ def _with_words(host: EditorHost, request: CheckRequest, report: CheckReport) ->
     project = request.project
     if project is None:
         return report
-    found = check_words(project, request.start, request.end, report.limits.kinds, host.waveform)
+    found = check_words(
+        project,
+        request.start,
+        request.end,
+        report.limits.kinds,
+        host.waveform,
+        host.subtitle_timing,
+    )
     if not found.problems and not found.notes and not found.skipped:
         return report
     return replace(
@@ -3927,6 +3944,11 @@ def _check_result(
     arguments: dict[str, Any],
     ticket: CheckTicket | None,
 ) -> object:
+    """検査の結果を AI へ返す形にする
+
+    頼みと違う・失敗した・まだ無い結果は断る 待つ間に作品が変わった・途中までの結果には直し方を
+    付けない 古い作品の位置で直すと、消えた・動いたクリップを触る
+    """
     # 数えを確定するのは、結果を使えたとき（頼みが一致し、失敗せず、結果があり、終わっていて、
     # 待つ間に作品が変わっていない）だけ ここより前で断る道はどれも数えを動かさない
     if state.request != request:
@@ -3954,6 +3976,9 @@ def _check_result(
             else settle_check(host.document, ticket, host.fix_rounds)
         )
     rate = request.project.rate if request.project is not None else None
+    # 天井に当たった音量をリミッターでまだ上げられるか（#414）
+    # 書き出したファイルは直さないので見ない
+    limitable = timeline and _limitable(host)
     rows: list[dict[str, Any]] = []
     for problem in report.problems:
         row: dict[str, Any] = {
@@ -3983,6 +4008,7 @@ def _check_result(
             problem.severity,
             problem.measure,
             peak_db=report.peak_db,
+            limiter=limitable,
             **_fix_state(rounds, unsettled),
         ).as_dict()
         rows.append(row)
@@ -3997,6 +4023,7 @@ def _check_result(
             problem.severity,
             problem.measure,
             peak_db=report.peak_db,
+            limiter=limitable,
             **_fix_state(rounds, unsettled),
         )
         fixes[action.action] += 1
@@ -5299,12 +5326,7 @@ def _cut_range(host: EditorHost, arguments: dict[str, Any]) -> object:
         "duration_frames": _project(host).duration,
     }
     notes: list[str] = []
-    # ロックしたトラックは切れない 切れたと読むと、そこだけずれたまま先へ進む
-    left = [
-        str(track.id)
-        for track in project.timeline.tracks
-        if track.locked and any(clip.timeline_end > start for clip in track.clips)
-    ]
+    left = _locked_left(project, start)
     if left:
         result["tracks_left"] = left
         notes.append("tracks_left のトラックはロックしているので切っていません")
@@ -5312,6 +5334,18 @@ def _cut_range(host: EditorHost, arguments: dict[str, Any]) -> object:
     if notes:
         result["note"] = " ".join(notes)
     return result
+
+
+def _locked_left(project: Project, start: int) -> list[str]:
+    """``start`` より後ろに物があるロックしたトラック 詰めても動かず、そこだけずれたまま残る
+
+    切れたと読むと、ずれたまま先へ進む（``cut_range`` と ``cut_fillers`` が答えに書く）
+    """
+    return [
+        str(track.id)
+        for track in project.timeline.tracks
+        if track.locked and any(clip.timeline_end > start for clip in track.clips)
+    ]
 
 
 def _duplicate_clips(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -6451,6 +6485,109 @@ def _jet_cut(host: EditorHost, arguments: dict[str, Any]) -> object:
     return result
 
 
+#: :func:`_cut_fillers` が返す所の数の上限 何百か所も並べると会話の費用だけが増える
+MAX_FILLERS_SHOWN = 30
+
+
+def _cut_fillers(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """言いよどみ（えーと・あのー）の音を切って詰める（#414） 無音カットと同じ命令を通す
+
+    字幕の文言は変えない（文言からは clean_subtitles が落とす） 語の時刻が無い字幕は探せない
+    """
+    from sashimono.core.fillers import AUDIO_FILLERS, filler_spans
+
+    project = _project(host)
+    media = _require_media(project, str(arguments.get("media_id", "")))
+    stream = _audio_stream(media, arguments)
+    transcript = media.transcript_for(stream)
+    if transcript is None or not transcript.segments:
+        raise ToolError(
+            f"{media.name} のこの音声には字幕がありません transcribe で起こしてください"
+        )
+    if not any(segment.words for segment in transcript.segments):
+        raise ToolError(
+            "字幕に語の時刻がありません transcribe の words_only で今の字幕に語の時刻を"
+            "足すと探せます"
+        )
+    _no_explicit_null(arguments, "words")
+    raw = arguments.get("words")
+    if raw is not None and not isinstance(raw, list):
+        raise ToolError("words は言いよどみの語（えーと など）の配列で渡してください")
+    extra = _string_items(raw, "words") if raw is not None else []
+    if _flag_argument(arguments, "only_words", False):
+        if not extra:
+            raise ToolError("only_words が true なら words に 1 つ以上の語を渡してください")
+        wanted: tuple[str, ...] = tuple(extra)
+    else:
+        wanted = (*AUDIO_FILLERS, *extra)
+    spans = filler_spans(transcript, wanted)
+    if not spans:
+        raise ToolError(
+            "字幕の語に言いよどみが見つかりません 字幕起こしは言いよどみを書かずに返すことが多く、"
+            "書かなかった言いよどみは探せません 間の長い所は jet_cut で詰められます"
+        )
+    voice = media.transcript_stream(stream)
+    # plan_cuts はこの音声を鳴らすクリップが無いと素材の全クリップへ戻す（無音カットが映像だけの
+    # クリップも切れるように） 言いよどみは音声ごとの時刻なので、戻すと別の音声の話を切る
+    # 鳴らさない映像のクリップも subtitle_voice は 1 本目の音声と返すので、鳴らすかも見る 見ないと、
+    # 音声のクリップを消して映像だけが残った所で、どの音も鳴っていない映像を切る
+    hearing = [
+        track
+        for track in project.timeline.tracks
+        for clip in track.clips
+        if clip.media_id == media.id
+        and project.plays_sound(track, clip)
+        and subtitle_voice(project, track, clip, media) == voice
+    ]
+    if not hearing:
+        raise ToolError(
+            f"{media.name} のこの音声を鳴らすクリップがタイムラインにありません 別の音声の話を"
+            "切らないよう止めました audio で鳴らしている音声を選んでください"
+        )
+    if all(track.locked for track in hearing):
+        # RippleCut はロックしたトラックを切らないが、ほかのトラックと目印は同じ幅で詰める 声は
+        # 残ったまま映像と字幕だけがずれ、切った量も実際より大きく返すことになる
+        raise ToolError(
+            "言いよどみの音を鳴らすクリップがどれもロックしたトラックにあります ロックを"
+            "外してから頼んでください"
+        )
+    ranges = plan_cuts(project, media.id, [(span.start, span.end) for span in spans], stream=voice)
+    if not ranges:
+        raise ToolError(
+            f"言いよどみが {len(spans)} か所ありましたが、どれもタイムラインに置いた範囲の外です"
+        )
+    removed = sum(end - start for start, end in ranges)
+    host.apply_commands([RippleCut(ranges)], f"言いよどみを詰める: {len(ranges)} か所")
+    rate = project.rate
+    result: dict[str, object] = {
+        "found": len(spans),
+        "cuts": len(ranges),
+        "removed_frames": removed,
+        "removed_seconds": round(float(removed * rate.frame_duration), 2),
+        # 文言は返さない（字幕と文字の同意 #342 の外で本人の文を渡さない） 時刻だけで足りる
+        "places": [
+            {"start_frame": start, "end_frame": end, "timecode": format_timecode(start, rate)}
+            for start, end in ranges[:MAX_FILLERS_SHOWN]
+        ],
+    }
+    notes = [
+        "字幕の文言の言いよどみはそのまま残っています 文言からも落とすなら clean_subtitles を"
+        "使ってください 切った所が言葉の途中になっていないかは check_output の word_cut で"
+        "確かめられます"
+    ]
+    if len(ranges) > MAX_FILLERS_SHOWN:
+        result["places_more"] = len(ranges) - MAX_FILLERS_SHOWN
+    left = _locked_left(project, min(start for start, _ in ranges))
+    if left:
+        # 声だけが詰まって、ロックした映像や字幕が後ろでずれる 黙ると同期が崩れたまま進む
+        result["tracks_left"] = left
+        notes.append("tracks_left のトラックはロックしているので切っていません")
+    asked = cut_targets(project, media.id, [(span.start, span.end) for span in spans], stream=voice)
+    notes.extend(_lost_clips(project, _project(host), asked, result))
+    result["note"] = " ".join(notes)
+    return result
+
+
 # --- ジャンプカットのつなぎ目（#332 B6） ---
 #
 # 詰めたつなぎ目へ、人が手で付けるのと同じ物を付ける（core/seams.py） クロスフェードは
@@ -6827,6 +6964,11 @@ def _duck_audio(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 
 def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """``normalize_loudness`` の道具 ``clip_ids`` を省くと、書き出しで鳴る音の全体を測る
+
+    選択を使わないのは、たまたま選んでいた 1 本だけが変わるのを防ぐため リミッターを使うかは
+    本人の設定が既定で、測る前に決める（測り終えてから断ると測り直しになる）
+    """
     project = _project(host)
     # 明示の null を省いたのと同じに読むと、選んだつもりの 1 本ではなく作品全体が変わる
     _no_explicit_null(arguments, "clip_ids")
@@ -6850,6 +6992,13 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
             raise ToolError("どのクリップも無効です 有効にしてから呼んでください")
     target = _limit_number(arguments, "target_lufs", float(host.loudness_target), -40.0, -5.0)
     ceiling = _limit_number(arguments, "peak_ceiling_db", DEFAULT_PEAK_CEILING_DB, -20.0, 0.0)
+    # 山を抑えるかは本人の設定（#414） 測る前に読む 測り終えてから断ると測り直しになる
+    squeeze = MAX_LIMITER_DB if _flag_argument(arguments, "limiter", host.loudness_limiter) else 0.0
+    if any(has_limiter(clip) for _, clip in targets):
+        # 前に積んだリミッターで抑えた後の音を測るので、もう 1 度抑えると上限の 6 dB を越えて重なる
+        # 1 本でも積んであれば抑えない 後から足したクリップに引かれて抑えた所を上げ直すと、
+        # 前のクリップだけが積み重ねて潰れる（PR #451 の Codex の指摘）
+        squeeze = 0.0
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
     start = min(clip.timeline_start for _, clip in targets)
     end = max(clip.timeline_end for _, clip in targets)
@@ -6863,7 +7012,7 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     host.request_check(request)
 
     def finish() -> object:
-        return _apply_loudness(host, project, request, [clip for _, clip in targets], ceiling)
+        return _apply_loudness(host, project, request, targets, ceiling, squeeze)
 
     if not host.check_state().running or wait <= 0:
         return finish()
@@ -6878,10 +7027,16 @@ def _apply_loudness(
     host: EditorHost,
     project: Project,
     request: CheckRequest,
-    clips: list[Clip],
+    targets: list[tuple[Track, Clip]],
     ceiling: float,
+    squeeze: float = 0.0,
 ) -> object:
-    """測り終えた音量から、全部のクリップへ同じ dB を掛ける 測り終えていなければ何も変えない"""
+    """測り終えた音量から、全部のクリップへ同じ dB を掛ける 測り終えていなければ何も変えない
+
+    ``squeeze`` はリミッターで抑えてよい山の量（dB #414） 山が天井を越える分だけ、どのクリップにも
+    リミッターを積む
+    """
+    clips = [clip for _, clip in targets]
     state = host.check_state()
     if state.request != request:
         raise ToolError("測っている間に別の検査に替わりました もう 1 度呼んでください")
@@ -6911,12 +7066,16 @@ def _apply_loudness(
             "測っている間に作品が変わりました 何も変えていません もう 1 度呼ぶと測り直します"
         )
     measured = report.loudness
+    # 前に積んだリミッターの上限より上へは上げない 上げた分は潰れて、基準に届いたと嘘を答える
+    cap = limited_ceiling(targets, ceiling)
     decided = loudness_gain(
         clips,
         measured=measured,
         peak_db=report.peak_db,
         target=request.limits.loudness_target,
         ceiling=ceiling,
+        squeeze=squeeze,
+        raise_ceiling=raise_cap(targets, ceiling),
     )
     gain = decided.gain_db
     limited = list(decided.limited_by)
@@ -6932,34 +7091,120 @@ def _apply_loudness(
     }
     if not reached:
         result |= {"short_of_target_lu": round(short, 1), "limited_by": limited}
-    if abs(gain) < _ON_TARGET_LU:
+    moved = abs(gain) >= _ON_TARGET_LU
+    # 丸めの誤差ほどの越えでは積まない 0.05 dB は聞き分けられず、効かないリミッターが残るだけ
+    # 音量を変えなくても山が天井を越えていれば積む 基準に合った音の山を割れたまま残さない
+    squeezed = decided.squeeze_db >= _ON_TARGET_LU
+    if not moved and not squeezed:
         result["gain_db"] = 0.0
         if reached:
             result["note"] = "すでに基準に合っています 何も変えていません"
         else:
             result["note"] = (
                 f"何も変えていません 基準まで {short:.1f} LU 足りませんが、"
-                f"{_limit_reason(limited, ceiling)}、全部を同じだけ上げる道具ではこれ以上"
+                f"{_limit_reason(limited, cap)}、全部を同じだけ上げる道具ではこれ以上"
                 "上がりません 山の出る音のクリップだけを set_volume で下げてから呼び直すか、"
                 "基準に届かないまま進めるかを人に尋ねてください"
             )
         return result
-    commands = gain_commands(clips, gain)
+    commands = gain_commands(clips, gain) if moved else []
+    if squeezed:
+        commands += limiter_commands(targets, ceiling)
     host.apply_commands(commands, f"音量を {request.limits.loudness_target:g} LUFS へそろえる")
     result |= {
-        "gain_db": round(gain, 2),
-        "expected_lufs": round(measured + gain, 1),
-        "expected_peak_dbfs": None if report.peak_db is None else round(report.peak_db + gain, 2),
+        "gain_db": round(gain, 2) if moved else 0.0,
+        "expected_lufs": round(measured + (gain if moved else 0.0), 1),
+        "expected_peak_dbfs": None
+        if report.peak_db is None
+        else round(report.peak_db + (gain if moved else 0.0), 2),
     }
-    notes = ["どのクリップにも同じだけ掛けました（声と BGM の釣り合いは変えない）"]
+    notes = (
+        ["どのクリップにも同じだけ掛けました（声と BGM の釣り合いは変えない）"]
+        if moved
+        # 山を抑える上限（6 dB）で上げる量が 0 になったときも、ここへ来る 基準に合っていると
+        # 書くと、届いていない音量をそのまま書き出す
+        else [
+            "音量の欄は変えていません"
+            if reached
+            else "音量の欄は変えていません 基準には届いていません"
+        ]
+    )
+    if moved and any(has_limiter(clip) for clip in clips):
+        # 前に積んだリミッターを通る音は、掛けた dB どおりには動かない 下げると抑えていた分が
+        # 戻り、上げるとクリップの山が上限に当たって潰れる 測る前の値から届いたと言い切らない
+        result |= {
+            "reached": None if reached else False,
+            "expected_lufs": None,
+            "loudness_rechecked": False,
+        }
+        notes.append(
+            "前に積んだリミッターを通る音なので、音量は掛けた量どおりには動きません"
+            " 基準に届いたかは check_output の loudness で測り直してください"
+        )
+    if squeezed:
+        overlap = clips_overlap(clips)
+        held = limited_peak(targets, ceiling)
+        raised = None if report.peak_db is None else report.peak_db + (gain if moved else 0.0)
+        result |= {
+            "limiter_db": round(decided.squeeze_db, 1),
+            # リミッターはクリップごと 重なって鳴る音の和は上限を越えうるので、言い切らない
+            "expected_peak_dbfs": None
+            if overlap
+            else round(held if raised is None else min(raised, held), 2),
+            # 抑えた分だけ音量は測った値より下がる どれだけ下がるかは山の続き方で決まり、
+            # 測る前の値から言い切ると、目標より大きく下がっても届いたと答える 届かないと
+            # 分かっている所は、抑えるとさらに下がるだけなので false のまま
+            "reached": None if reached else False,
+            "expected_lufs": None,
+            "loudness_rechecked": False,
+        }
+        notes.append(
+            f"音の山が {ceiling:g} dBFS を {decided.squeeze_db:.1f} dB 越えるので、"
+            "どの音のクリップにも"
+            "最後にリミッター（上限は同じ値）を積みました 山だけを抑えるので、音量は見込みより"
+            "下がります 基準に届いたかは check_output の loudness で測り直してください"
+        )
+        if held > ceiling + _ON_TARGET_LU:
+            notes.append(
+                f"トラックの音量か定位で、リミッターの後の山が {held:g} dBFS まで上がります"
+                " そのトラックの音量を下げてから呼び直してください"
+            )
+        if overlap:
+            result["mixed_peak_checked"] = False
+            notes.append(
+                "リミッターはクリップごとに掛かるので、重なって鳴る音の和は上限を越えることが"
+                "あります check_output の clipping で確かめ、越えていればその区間の音を"
+                " set_volume で下げてください"
+            )
     if limited:
         result["limited_by"] = limited
-        if "peak" in limited:
+        if "peak" in limited and cap < ceiling:
+            notes.append(
+                f"前に積んだリミッターの上限 {cap:g} dBFS より上へは上げられないので、"
+                "基準の手前で止めました そのリミッターの上限を上げるか、外してから呼び直せます"
+            )
+        elif "peak" in limited and squeezed:
+            notes.append(
+                f"リミッターで {MAX_LIMITER_DB:g} dB 抑えても山が {ceiling:g} dBFS を超えるので、"
+                "基準の手前で止めました"
+            )
+        elif "peak" in limited:
             notes.append(f"音の山が {ceiling:g} dBFS を超えるので、基準の手前で止めました")
         if "volume_limit" in limited:
             notes.append(f"音量の欄の上限 {VOLUME_LIMIT:g}% で止めました")
     result["note"] = " ".join(notes)
     return result
+
+
+def _limitable(host: EditorHost) -> bool:
+    """天井に当たった音量を、リミッターを積んでまだ上げられるか 検査の直し方を選ぶのに使う
+
+    鳴るクリップのどれかにリミッターがあれば、もう抑えた後の音なので上げられない（尋ねる側へ回す
+    ``normalize_loudness`` も 1 本でも積んであれば抑えない）
+    """
+    if not host.loudness_limiter:
+        return False
+    return not any(has_limiter(clip) for _, clip in audible_clips(_project(host)))
 
 
 def _limit_reason(limited: list[str], ceiling: float) -> str:
@@ -8807,6 +9052,140 @@ def _open_project(host: EditorHost, arguments: dict[str, Any], consent: Consent)
     }
 
 
+# --- 持ち出し用パッケージ（#423 取り消せない操作） ---
+#
+# 書き出しは画面の〔持ち出し用に書き出す…〕、開くは〔持ち出し用パッケージを開く…〕と同じ処理を
+# ホストに頼む（道具はファイルを書かない） 書く場所と開ける場所は作品の保存・開くと同じ決まり
+# どちらも数分かかるので裏で進め、終わりを待つのは書き出し（export_video）と同じ Pending
+
+#: 使う範囲の前後の余裕（秒）の範囲 画面の窓（``Preferences.package_margin_seconds``）と同じ
+_PACKAGE_MARGIN_RANGE = (0, 60)
+#: 余裕の既定 画面の窓の既定と同じ
+_PACKAGE_MARGIN_DEFAULT = 1
+
+
+def _package_flag(arguments: dict[str, Any], name: str) -> bool:
+    raw = arguments.get(name, False)
+    if not isinstance(raw, bool):
+        raise ToolError(f"{name} は true か false で渡してください")
+    return raw
+
+
+def _refuse_running_package(host: EditorHost) -> None:
+    if host.package_status().get("state") == "working":
+        raise ToolError(
+            "持ち出し用パッケージの書き出しか展開がもう走っています package_status で"
+            "終わるのを待ってから始めてください"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PackagePlan:
+    request: PackageRequest
+    detail: str
+
+
+def _package_plan(host: EditorHost, arguments: dict[str, Any]) -> _PackagePlan:
+    """書き出しの引数を画面の窓と同じ選び方で確かめる（確かめと実行の 2 度呼ぶ）"""
+    raw = arguments.get("path")
+    _require_suffix(raw, (PACKAGE_SUFFIX,), "持ち出し用パッケージ")
+    _wait_seconds(arguments)
+    whole = _package_flag(arguments, "whole")
+    keep = _package_flag(arguments, "keep_metadata")
+    margin = arguments.get("margin_seconds", _PACKAGE_MARGIN_DEFAULT)
+    low, high = _PACKAGE_MARGIN_RANGE
+    if isinstance(margin, bool) or not isinstance(margin, int) or not low <= margin <= high:
+        raise ToolError(f"margin_seconds は {low}〜{high} の整数で渡してください")
+    _refuse_running_package(host)
+    path = _write_target(host, raw)
+    media = len(host.document.project.media)
+    parts = [
+        f"素材 {media} 本の"
+        + ("全体を入れます" if whole else f"使っている範囲だけ（前後 {margin} 秒）を入れます"),
+        "撮った場所などの付け足しの情報を"
+        + ("残します" if keep else "取り除きます（回転と色の情報は残ります）"),
+        "画質と音質は元のまま 書体と AviUtl のスクリプトは入れません",
+        RIGHTS_NOTE,
+        _replacing(path, "ファイル"),
+    ]
+    request = PackageRequest(
+        path=path,
+        whole=whole,
+        margin=Fraction(margin),
+        keep_metadata=keep,
+        expect=expect_now(path),
+    )
+    _refuse_elsewhere()
+    return _PackagePlan(request=request, detail="\n".join(part for part in parts if part))
+
+
+def _package_export_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    plan = _package_plan(host, arguments)
+    return Consent(
+        action="持ち出し用パッケージを書き出します",
+        target=str(plan.request.path),
+        detail=plan.detail,
+        basis=plan.request.expect,
+    )
+
+
+def _awaiting_package(host: EditorHost, seconds: float) -> Pending:
+    return Pending(wait=host.package_waiter(), seconds=seconds, then=host.package_status)
+
+
+def _export_package(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
+    wait = _wait_seconds(arguments)
+    plan = _package_plan(host, arguments)
+    host.start_package_export(replace(plan.request, expect=_basis(consent)))
+    if wait > 0:
+        return _awaiting_package(host, wait)
+    return {
+        "started": str(plan.request.path),
+        "next": "書き出しは裏で進みます package_status で進み具合と、入れなかった物の一覧を"
+        "読めます（wait_seconds を付けると、その秒数まで終わるのを待ちます）",
+    }
+
+
+def _package_open_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    raw = arguments.get("path")
+    _require_suffix(raw, (PACKAGE_SUFFIX,), "持ち出し用パッケージ")
+    _wait_seconds(arguments)
+    _refuse_unsaved(host)
+    _refuse_running_package(host)
+    path = openable_project(host, raw)
+    status = path.stat()
+    when = datetime.fromtimestamp(status.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    return Consent(
+        action="持ち出し用パッケージを開きます",
+        target=str(path),
+        detail=(
+            f"パッケージは {status.st_size:,} バイト {when} 更新 作業用のフォルダへ素材ごと"
+            f"展開してから開きます {_CLOSING_NOTE}"
+        ),
+        basis=expect_now(path),
+    )
+
+
+def _open_package(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
+    wait = _wait_seconds(arguments)
+    # 開くのは人が許した場所（:func:`_open_project` と同じ訳）
+    host.start_package_open(Path(consent.target))
+    if wait > 0:
+        return _awaiting_package(host, wait)
+    return {
+        "started": str(consent.target),
+        "next": "展開は裏で進みます 終われば作品を開きます package_status で様子を読めます"
+        " この指示の中では、開いた作品をもう編集しません",
+    }
+
+
+def _package_status(host: EditorHost, arguments: dict[str, Any]) -> object:
+    wait = _wait_seconds(arguments)
+    if wait > 0 and host.package_status().get("state") == "working":
+        return _awaiting_package(host, wait)
+    return host.package_status()
+
+
 def _new_settings(arguments: dict[str, Any]) -> tuple[tuple[int, int] | None, FrameRate | None]:
     """新しい作品の解像度とフレームレート 省けば本人の「新しい作品」の設定のまま"""
     resolution: tuple[int, int] | None = None
@@ -9573,7 +9952,13 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
     if raw_codec != AUTO and raw_codec not in codecs:
         raise ToolError(f"codec は {AUTO} か、使える物（{', '.join(codecs)}）から選んでください")
     codec = None if raw_codec == AUTO else raw_codec
-    raw_bitrate = arguments.get("bitrate_mbps", DEFAULT_BITRATE_MBPS)
+    # 省いたら画面の書き出しの窓の初めの値と同じ（素材に合わせるかは本人の設定 #414）
+    raw_bitrate = arguments.get("bitrate_mbps")
+    # 素材に合わせる値は書き出すスレッドで求める ここ（画面のスレッド 許す前）で素材の大きさを
+    # 読むと、応えないネットワークの共有で窓が出る前に画面が固まる（PR #451 の CodeRabbit の指摘）
+    match = raw_bitrate is None and host.export_bitrate.auto
+    if raw_bitrate is None:
+        raw_bitrate = host.export_bitrate.mbps
     low, high = BITRATE_RANGE_MBPS
     if isinstance(raw_bitrate, bool) or not isinstance(raw_bitrate, int):
         raise ToolError(f"bitrate_mbps は {low}〜{high} の整数で渡してください")
@@ -9589,7 +9974,8 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
     parts = [
         f"{what} の{span}（{format_timecode(start, rate)} 〜 {format_timecode(end, rate)}、"
         f"{end - start} フレーム）",
-        f"形式 {path.suffix.lstrip('.')} / 映像 {label} / {raw_bitrate} Mbps",
+        f"形式 {path.suffix.lstrip('.')} / 映像 {label} / "
+        + (f"素材に合わせる（上限 {raw_bitrate} Mbps）" if match else f"{raw_bitrate} Mbps"),
         _replacing(path, "ファイル"),
     ]
     request = ExportRequest(
@@ -9598,6 +9984,7 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
         range_choice=RANGE_ALL if frame_range is None else RANGE_WORK_AREA,
         codec=codec,
         bitrate_mbps=raw_bitrate,
+        match_bitrate=match,
         # 許したときの書き出し先 描く数分の間に名前が現れたり中身が変わったりしたら置かない
         expect=expect_now(path),
     )
@@ -10012,6 +10399,8 @@ _SEAMS = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 _REFRAME = frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS})
 #: 無音カット 断る文に素材の名前が入り、つなぎ目も処理すれば本人の設定が載る（#332）
 _JET_CUT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
+#: 書き出し（#414） 確かめの箱と結果に、本人の設定と素材から決めたビットレートが載る
+_EXPORT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
 #: 声の一覧（#335） エンジンの名前・声の名前と規約の文・本人の設定（エンジンの場所と既定の声）
 _VOICES = frozenset({Outbound.APP_SETTINGS})
 #: ナレーションを作って置く（#335） 書いた WAV の場所・置いたクリップ・声の名前と表記
@@ -10713,8 +11102,10 @@ OPERATIONS: tuple[Operation, ...] = (
             "音の入りと出が語の途中で、切った所に声が続く シーンの中と速度変更も元の時刻で見る"
             " suggested_head_delta か suggested_tail_delta は trim_clip へそのまま渡せる）・"
             "字幕と音の食い違い（subtitle_words 字幕の文言の語が残した音に無い heard は残った語、"
-            "missing は無い語）を調べる word_cut と subtitle_words は語の時刻が要り、タイムライン"
-            "だけ 既定は今のタイムライン"
+            "missing は無い語）・字幕の時刻のずれ（subtitle_timing 行の出る・消える時刻が声から"
+            "0.25 秒以上離れた行 start_offset_seconds と end_offset_seconds は正が声より遅い 本人の"
+            "設定のずらしを足した所と比べる）を調べる word_cut と subtitle_words は語の時刻、"
+            "subtitle_timing は波形の解析が要り、どれもタイムラインだけ 既定は今のタイムライン"
             "（書き出す前の、描いた絵と混ぜた音） path を渡すと書き出した動画のファイルを調べる"
             "（作品のフォルダと書き出しのフォルダの中だけ 字幕のはみ出しは調べられない"
             " AAC など圧縮した音では音割れを取りこぼすことがある）"
@@ -12476,12 +12867,45 @@ OPERATIONS: tuple[Operation, ...] = (
         writes=True,
     ),
     Operation(
+        name="cut_fillers",
+        description=(
+            "言いよどみ（えーと・えっと・あのー・えー・あー・うーん など）の音を、字幕の語の"
+            "時刻から探してタイムラインから削って詰める（#414 無音カットと同じ詰め方） 字幕の文言は"
+            "変えない（文言は clean_subtitles） 語の時刻が要る（無ければ transcribe の words_only）"
+            " 字幕起こしは言いよどみを書かないことが多く、書かなかった物は探せない 驚きの「えっ」"
+            "と、意味を持ちうる「まあ」「なんか」は既定では切らない（words で足せる） 切った後は"
+            " check_output の word_cut で言葉の途中になっていないかを確かめる ロックしたトラックは"
+            "切らず、答えの tracks_left に書く 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("素材"),
+                "audio": _integer(
+                    "音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
+                    " 字幕は音声ごとに別"
+                ),
+                "words": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "既定の言いよどみに足す語（まあ など）",
+                },
+                "only_words": _boolean("true なら既定の言いよどみを使わず words だけを探す"),
+            },
+            ["media_id"],
+        ),
+        handler=_cut_fillers,
+        sends=_WITH_FILES,
+        writes=True,
+    ),
+    Operation(
         name="smooth_cuts",
         description=(
             "ジャンプカットのつなぎ目を目立たなくする frames を省くと、同じ素材を飛び飛びに"
             "つないだ所（無音を詰めた所など）を探す video は crossfade（場面切り替えの短い"
             "クロスフェードを重ねる）zoom（後ろのクリップを 1 本おきに少し拡大する パンチイン）"
-            "none（映像は触らない） 音は継ぎ目の前後に短いフェードを入れて「プツッ」を消す"
+            "none（映像は触らない） 三脚で据えた話し手のように同じ構図が続く映像は、"
+            "crossfade では人が跳ぶのが見えて隠れないので zoom を選ぶ"
+            " 音は継ぎ目の前後に短いフェードを入れて「プツッ」を消す"
             " 省いた値は本人の設定 同じ所へ掛け直しても重ならない"
         ),
         schema=_schema(
@@ -12586,7 +13010,9 @@ OPERATIONS: tuple[Operation, ...] = (
             "音量をラウドネスの基準（ITU-R BS.1770 の積分ラウドネス）へそろえる 測った音へ"
             "同じ dB を掛けるので、声と BGM の釣り合いは変えない clip_ids を省くと作品全体"
             "（ミュートしていないトラックの音すべて）、渡すとそのクリップだけを混ぜて測る"
-            " 音の山が peak_ceiling_db を超えるときと、音量の欄の上限 400% に当たるときは、"
+            " 音の山が peak_ceiling_db を超えるときは、limiter が true ならリミッターで山を抑えて"
+            "上げ（limiter_db に抑えた量）、それでも届かないときと音量の欄の上限 400% に"
+            "当たるときは、"
             "基準の手前で止めて limited_by に書く（reached が false なら基準に届いていない）"
             " 測るのに時間がかかる 終わらなければ"
             "何も変えずに measuring を返す（同じ引数でもう 1 度呼ぶと続きから）"
@@ -12609,6 +13035,14 @@ OPERATIONS: tuple[Operation, ...] = (
                 "peak_ceiling_db": _number(
                     f"音の山の上限 dBFS（-20〜0 既定 {DEFAULT_PEAK_CEILING_DB:g}）"
                 ),
+                "limiter": {
+                    "type": "boolean",
+                    "description": (
+                        "山が上限に当たって基準に届かないとき、音のクリップの最後にリミッターを"
+                        f"積んで山を {MAX_LIMITER_DB:g} dB まで抑え、基準まで上げるか（省くと本人の"
+                        "設定 既定は true） false なら山の手前で止める"
+                    ),
+                },
                 "wait_seconds": _number(
                     f"測り終えるまで待つ秒（0〜{MAX_CHECK_WAIT:g}、既定 {DEFAULT_CHECK_WAIT:g}）"
                 ),
@@ -13032,8 +13466,10 @@ OPERATIONS: tuple[Operation, ...] = (
                     "h264_nvenc / h264_amf / h264_qsv / libx264 などこの機械で使える物"
                 ),
                 "bitrate_mbps": _integer(
-                    f"映像のビットレート（{BITRATE_RANGE_MBPS[0]}〜{BITRATE_RANGE_MBPS[1]} Mbps、"
-                    f"既定 {DEFAULT_BITRATE_MBPS}）"
+                    f"映像のビットレート（{BITRATE_RANGE_MBPS[0]}〜{BITRATE_RANGE_MBPS[1]} Mbps）"
+                    " 省くと画面の書き出しの窓と同じ初めの値（本人の設定で、置いた素材に合わせて"
+                    f"上限 {DEFAULT_BITRATE_MBPS} Mbps か、決めた値）"
+                    " 素材より高くしても見た目は良くならず、ファイルだけが大きくなる"
                 ),
                 "wait_seconds": _number(
                     f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"
@@ -13048,8 +13484,102 @@ OPERATIONS: tuple[Operation, ...] = (
         irreversible=True,
         consent=_export_consent,
         # 結果は書き出し先の場所 待ったときは書き出しの様子（場所と、終わりの文に場所が入る）
+        sends=_EXPORT,
+        name_keys=frozenset({"started"}),
+    ),
+    Operation(
+        name="export_package",
+        description=(
+            "作品と素材を 1 つのファイル（"
+            + PACKAGE_SUFFIX
+            + "）にまとめて、素材の無い別の PC でも"
+            "開いて編集・書き出しできるようにする（画面の〔持ち出し用に書き出す…〕と同じ）"
+            " 毎回ユーザーに確かめる 画質と音質は元のまま（再エンコードしない） 既定は使っている"
+            "範囲だけを入れ、撮った場所などの付け足しの情報を取り除く 書体と AviUtl のスクリプトは"
+            "入れない 書き出しは裏で進み、すぐ戻る 様子は package_status で読む 書けるのは今の"
+            "作品のフォルダと、書き出しの窓で前に選んだフォルダの中だけ"
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    f"書き出し先（{PACKAGE_SUFFIX} で終える） "
+                    "相対の場所は今の作品のフォルダから読む"
+                ),
+                "whole": _boolean(
+                    "素材の全体を入れる（既定 false は使っている範囲だけ 全体なら範囲の外へも"
+                    "トリムを伸ばせるが大きくなる）"
+                ),
+                "margin_seconds": _integer(
+                    f"使っている範囲の前後に足す秒（{_PACKAGE_MARGIN_RANGE[0]}〜"
+                    f"{_PACKAGE_MARGIN_RANGE[1]}、既定 {_PACKAGE_MARGIN_DEFAULT}）"
+                ),
+                "keep_metadata": _boolean(
+                    "撮った場所・機器の名前などを残す（既定 false は取り除く 回転と色は残る）"
+                ),
+                "wait_seconds": _number(
+                    f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"
+                ),
+            },
+            ["path"],
+        ),
+        handler=_consented(_export_package, _package_export_consent),
+        approved=_export_package,
+        writes=True,
+        irreversible=True,
+        consent=_package_export_consent,
+        # 結果は書き出し先の場所 待ったときは様子（場所と、入れなかった書体・スクリプト・
+        # 素材の名前の一覧）
         sends=_WITH_FILES,
         name_keys=frozenset({"started"}),
+    ),
+    Operation(
+        name="open_package",
+        description=(
+            "持ち出し用パッケージ（" + PACKAGE_SUFFIX + "）を作業用のフォルダへ展開し、今の作品と"
+            "差し替える（画面の〔持ち出し用パッケージを開く…〕と同じ） 毎回ユーザーに確かめる"
+            " 中身は SHA-256 で確かめ、壊れていれば開かない 展開は裏で進み、すぐ戻る 様子は "
+            "package_status で読む 開けるのは今の作品のフォルダと、書き出しの窓で前に選んだ"
+            "フォルダの中だけ 保存していない変更があれば断る 開いた後、この指示の中では編集の"
+            "道具を使えない"
+        ),
+        schema=_schema(
+            {
+                "path": _string(
+                    f"開くパッケージ（{PACKAGE_SUFFIX}） 相対の場所は今の作品のフォルダから読む"
+                ),
+                "wait_seconds": _number(
+                    f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"
+                ),
+            },
+            ["path"],
+        ),
+        handler=_consented(_open_package, _package_open_consent),
+        approved=_open_package,
+        writes=True,
+        irreversible=True,
+        consent=_package_open_consent,
+        # 開いたパッケージの場所 待ったときは様子（展開した作品の場所と足りない書体の名前）
+        sends=_WITH_FILES,
+        name_keys=frozenset({"started"}),
+    ),
+    Operation(
+        name="package_status",
+        description=(
+            "持ち出し用パッケージの書き出しか展開の様子を読む kind は export / open、state は "
+            "idle / working / done / failed / cancelled message に入れなかった物（書き出し）や"
+            "この PC に足りない書体とスクリプト（展開）の一覧が入る wait_seconds を付けると、"
+            "終わるかその秒数まで待ってから返す"
+        ),
+        schema=_schema(
+            {
+                "wait_seconds": _number(
+                    f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は今の様子をすぐ返す）"
+                )
+            }
+        ),
+        handler=_package_status,
+        # 様子には書き出し先・展開した作品の場所と、素材の名前・書体の名前が入る
+        sends=_WITH_FILES,
     ),
     Operation(
         name="export_status",

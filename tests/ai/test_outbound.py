@@ -477,6 +477,8 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     # 無い見た目を頼むと、保存してある見た目の名前を並べて断る（#308）
     "place_subtitles": lambda ids: {"media_id": ids["media"], "look_name": "無い見た目"},
     "jet_cut": lambda ids: {"media_id": ids["media"], "smooth": True},
+    # 言いよどみ（#414） 例の作品の字幕には語の時刻が無いので、素材の名前を書かずに断る
+    "cut_fillers": lambda ids: {"media_id": ids["media"]},
     # 再生速度とつなぎ目（#332） 動画のクリップを半分の速さにし、10 フレーム目をつなぎ目として扱う
     "set_speed": lambda ids: {"clip_ids": [ids["video"]], "speed_percent": 50},
     "smooth_cuts": lambda _ids: {"frames": [10]},
@@ -561,6 +563,9 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     # 開く・新規（#349） 試験の作品は変えてあるので、どちらも保存していない変更で断る
     "open_project": lambda _ids: {"path": "第二稿.sme"},
     "new_project": lambda _ids: {"width": 1280, "height": 720},
+    # 持ち出し用パッケージ（#423） 書き出しは作品のフォルダへ頼み、開くは保存していない変更で断る
+    "export_package": lambda _ids: {"path": "持ち出し.smex"},
+    "open_package": lambda _ids: {"path": "持ち出し.smex"},
     # 作品の設定・置き方の方式・置く・揃える（#349） 無いカスタムオブジェクトは置き場の名前を
     # 並べて断る 揃える枠は偽のホストに無いので断る
     "switch_layer_mode": lambda _ids: {"convert": True},

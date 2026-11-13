@@ -8,18 +8,20 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, Word
+import numpy as np
+
+from sashimono.core.model import MediaId, MediaItem, Project, SegmentId, TranscriptSegment, Word
 from sashimono.core.projection import (
     HeardPiece,
     burned_subtitles,
     heard_pieces,
     heard_timeline,
 )
-from sashimono.core.subtitle_timing import OFFSET_MS_RANGE
+from sashimono.core.subtitle_timing import OFFSET_MS_RANGE, SubtitleTiming, shifted
 from sashimono.core.timebase import Rounding, seconds_to_frame
 from sashimono.core.words import (
     CUT_IN,
@@ -32,7 +34,12 @@ from sashimono.core.words import (
     phrases,
     split_seam,
 )
-from sashimono.engine.audio.voice_edges import REACH
+from sashimono.engine.audio.voice_edges import (
+    REACH,
+    fit_to_voice,
+    found_edges,
+    loudness_of_waveform,
+)
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.audio.word_cuts import (
     JOINED,
@@ -44,7 +51,7 @@ from sashimono.engine.audio.word_cuts import (
     read_cut,
 )
 from sashimono.engine.checks.report import HIGH, MEDIUM, Problem
-from sashimono.engine.checks.scan import SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
+from sashimono.engine.checks.scan import SUBTITLE_TIMING, SUBTITLE_WORDS, WORD_CUT, WORD_KINDS
 
 __all__ = ["WordReport", "check_words"]
 
@@ -61,6 +68,10 @@ _SLIVER_SECONDS = Fraction(1, 2)
 #: 行の中だけで数えると、音を切っていないのに聞こえている語を残した音に無いと報告する
 #: 語は行ごとに別の物なので、この幅の中で鳴れば音は残っている 切って消した語はどこでも鳴らない
 _HEARD_SLACK = REACH + Fraction(max(abs(ms) for ms in OFFSET_MS_RANGE), 1000)
+#: 字幕の出る・消える時刻が声からこれだけ離れていたら知らせる（秒 #414） 声へ寄せた後のずれは
+#: 合成の声で 9 割が 0.09 秒以内（#426） 読む人が字幕と声のずれに気付くのは 0.2〜0.3 秒から
+#: 寄せた後の揺れで知らせないよう、気付く側の端に置いた
+TIMING_TOLERANCE = Fraction(1, 4)
 #: 文言と語を比べるときに外す字 句読点は認識の語と字幕の文言で付き方が違う
 _MARKS = frozenset(" 　、\u3002，．！？!?,.…・「」『』（）()\n")
 
@@ -421,10 +432,274 @@ def _has_subtitles(project: Project, key: tuple[MediaId, int]) -> bool:
     return transcript is not None and bool(transcript.segments)
 
 
+@dataclass(slots=True)
+class _Shown:
+    """タイムラインに映る字幕 1 つ 時刻は実際に映る範囲（タイムラインのフレーム）
+
+    焼き込んでいない行は、同じ行の続けて映る所（クリップを分けただけの所・詰めた所）を
+    まとめた物 離れた所に映る同じ行はまとめない（間の関係の無い所まで問題の範囲に入る）
+    """
+
+    segment_id: str
+    start: Fraction
+    end: Fraction
+    clip_ids: list[str]
+    burned: bool
+
+
+def _shown_lines(project: Project, start: int, end: int) -> dict[tuple[MediaId, int], list[_Shown]]:
+    """``[start, end)`` に映る字幕を、素材と音ごとに集める（焼き込んでいない行と焼き込んだ文字）
+
+    焼き込んだ文字は元の行とは別に動かせる（行を合わせ直しても文字は元の時刻のまま） 元の行で
+    見ると、行だけを直して文字が残ったずれを通してしまい、文字だけを動かして合わせた形をずれと読む
+    同じ行を焼き込んだ所は、焼き込んでいない行としては数えない（見る人に出るのは文字の方）
+    続けて映る所は範囲で絞る前にまとめる 先に絞ると、範囲の頭で切れた後半だけを行の全体と読み、
+    声に合った字幕の頭をずれと言う（PR #451 の CodeRabbit の指摘）
+    """
+    shown: dict[tuple[MediaId, int], list[_Shown]] = {}
+    burned: dict[tuple[MediaId, int], list[_Shown]] = {}
+    # 素材・音・行ごとの、いちばん後に足した所 長いタイムラインで、行ごとに前の全部を探さない
+    latest: dict[tuple[tuple[MediaId, int], str], _Shown] = {}
+    #: 焼き込んだ文字を元の行ごとに引く 素材ごとの全部を行ごとに見比べると、行の数の 2 乗になり、
+    #: 長い作品で検査の結果を返すのが待たされる（PR #451 の CodeRabbit の指摘）
+    by_line: dict[tuple[tuple[MediaId, int], str], list[_Shown]] = {}
+    for item in burned_subtitles(project):
+        origin = item.origin
+        media_id = origin.media_id or _owner(project, origin.segment_id, origin.stream)
+        if media_id is None:
+            continue
+        copy = _Shown(str(origin.segment_id), item.start, item.end, [str(item.clip_id)], True)
+        burned.setdefault((media_id, origin.stream), []).append(copy)
+        by_line.setdefault(((media_id, origin.stream), copy.segment_id), []).append(copy)
+    for subtitle in heard_timeline(project):
+        if subtitle.media_id is None:
+            continue
+        key = (subtitle.media_id, subtitle.stream)
+        segment = str(subtitle.segment.id)
+        if any(
+            copy.start < subtitle.end_frame and subtitle.start_frame < copy.end
+            for copy in by_line.get((key, segment), [])
+        ):
+            continue
+        # 開始位置の順に来るので、続けて映る所は直前の同じ行へ足す
+        found = latest.get((key, segment))
+        if found is None or subtitle.start_frame > found.end:
+            found = _Shown(
+                segment,
+                Fraction(subtitle.start_frame),
+                Fraction(subtitle.end_frame),
+                [str(subtitle.clip_id)],
+                False,
+            )
+            shown.setdefault(key, []).append(found)
+            latest[(key, segment)] = found
+            continue
+        found.end = max(found.end, Fraction(subtitle.end_frame))
+        if str(subtitle.clip_id) not in found.clip_ids:
+            found.clip_ids.append(str(subtitle.clip_id))
+    for key, copies in burned.items():
+        shown.setdefault(key, []).extend(copies)
+    return {
+        key: inside
+        for key, lines in shown.items()
+        if (inside := [line for line in lines if line.end > start and line.start < end])
+    }
+
+
+def _placed_with(heard: list[HeardPiece], line: _Shown) -> list[HeardPiece]:
+    """字幕 ``line`` の声として比べる配置 同じ素材を離れた所にも置いたとき、そちらで比べない
+
+    焼き込んでいない行は、行を出したクリップの音だけ 焼き込んだ文字は元のクリップと切り離せる
+    ので、文字の映る所にいちばん近い配置 どこでも比べると、頭を切った行の頭を離れた配置で
+    見つけて、大きなずれと要らない直しを返す（PR #451 の CodeRabbit の指摘）
+    """
+    if not line.burned:
+        return [piece for piece in heard if str(piece.clip_id) in line.clip_ids]
+    gaps = [
+        (max(Fraction(0), piece.start - line.end, line.start - piece.end), piece) for piece in heard
+    ]
+    if not gaps:
+        return []
+    nearest = min(gap for gap, _ in gaps)
+    return [piece for gap, piece in gaps if gap == nearest]
+
+
+def _projected(
+    pieces: list[HeardPiece], seconds: Fraction, near: Fraction, project: Project
+) -> Fraction | None:
+    """素材の秒が鳴るタイムラインのフレーム 同じ所が何度も鳴るときは ``near`` に近い方"""
+    frames = [
+        piece.frame_at(seconds, project.rate)
+        for piece in pieces
+        if piece.source_start <= seconds <= piece.source_end
+    ]
+    if not frames:
+        return None
+    return min(frames, key=lambda frame: abs(frame - near))
+
+
+def _timing_problem(
+    low: int,
+    high: int,
+    early: Fraction | None,
+    late: Fraction | None,
+    clip_ids: tuple[str, ...],
+    values: dict[str, float | int | str | bool],
+) -> Problem:
+    """比べられた端のずれだけを書いた問題
+
+    比べられなかった端（寄せた所を切った）を 0 と書くと、合っていると読まれる
+    """
+    # 正は声より遅い 負は声より早い（設定のずらしを足した後の所から 映る時刻の秒）
+    # 比べられなかった端（寄せた所を切った）は書かない 0 と書くと、合っていると読む
+    offsets: dict[str, float | int | str | bool] = {}
+    if early is not None:
+        offsets["start_offset_seconds"] = round(float(early), 3)
+    if late is not None:
+        offsets["end_offset_seconds"] = round(float(late), 3)
+    return Problem(
+        SUBTITLE_TIMING,
+        MEDIUM,
+        low,
+        high,
+        "字幕の出る・消える時刻が声とずれている",
+        {**offsets, **values},
+        clip_ids,
+    )
+
+
+def _expected_edges(
+    segments: Sequence[TranscriptSegment], timing: SubtitleTiming, loudness: np.ndarray
+) -> dict[str, tuple[Fraction | None, Fraction | None]]:
+    """行ごとに、声へ寄せて設定のずらしを足した（あるべき）頭と終わり 行の ID で引く
+
+    行の時刻に設定のずらしが足してあるか（起こしたときや合わせ直したときに足した）どうかは、
+    行を見ても分からない 足してあると決めて足したまま寄せると、ずらしが寄せる幅
+    （``voice_edges.REACH``）を越えた端は声を見つけられずに残り、もう 1 度ずらしを足して比べる先が
+    倍ずれる（PR #451 の Codex の指摘） 足していないと決めて外してから寄せると、足していない行では
+    外した先から寄せ直すのでずれの幅が小さく出る
+    そこで端ごとに、外した位置と外さない位置の両方から寄せ、声の境目が見つかった方を採る 両方で
+    見つかれば動きの小さい方（境目のすぐそばにいた方） どちらからも見つからない端は ``None``
+    元の時刻をあるべき時刻にすると差が 0 になり、声の無い所に映る字幕を合っていると読む
+    """
+    ordered = sorted(segments, key=lambda s: (s.start, s.end))
+    raw = [(s.start, s.end) for s in ordered]
+    seeds = [shifted(raw, -timing.start_offset, -timing.end_offset), raw]
+    if not (timing.start_offset_ms or timing.end_offset_ms):
+        seeds = [raw]
+    guesses = []
+    for times in seeds:
+        fitted = fit_to_voice(times, loudness)
+        expected = shifted(fitted, timing.start_offset, timing.end_offset)
+        found = found_edges(times, loudness)
+        guesses.append(list(zip(times, fitted, expected, found, strict=True)))
+    out: dict[str, tuple[Fraction | None, Fraction | None]] = {}
+    for index, segment in enumerate(ordered):
+        edges: list[Fraction | None] = []
+        for side in (0, 1):
+            choices = [
+                (abs(fit[side] - seed[side]), order, expected[side])
+                for order, (seed, fit, expected, found) in enumerate(g[index] for g in guesses)
+                if found[side]
+            ]
+            edges.append(min(choices)[2] if choices else None)
+        out[str(segment.id)] = (edges[0], edges[1])
+    return out
+
+
+def _subtitle_timing(
+    project: Project, start: int, end: int, waveform_of: WaveformOf, timing: SubtitleTiming
+) -> tuple[list[Problem], int, int, int]:
+    """映る字幕の頭と終わりが、声へ寄せた時刻（#426 と同じ寄せ方）から離れている所
+
+    寄せた時刻は本人の設定のずらし（``timing`` の頭と終わりのミリ秒）も足した物と比べる 足さないと、
+    わざと早く出している人の字幕を全部ずれと読む 比べるのはタイムラインの上（映る時刻） 素材の秒で
+    比べると、速度を変えたクリップのずれ（半速なら倍）を見落とす
+    戻り値は（問題、波形が無く比べられなかった所の数、寄せた頭か終わりを切って比べられなかった行の数、
+    頭か終わりの近くに声の境目が見つからず比べられなかった行の数）
+    """
+    problems: list[Problem] = []
+    unknown = unplaced = voiceless = 0
+    frame = project.rate.frame_duration
+    pieces = heard_pieces(project)
+    for key, lines in _shown_lines(project, start, end).items():
+        media_id, stream = key
+        media = project.find_media(media_id)
+        transcript = None if media is None else media.transcript_for(stream)
+        if media is None or transcript is None or not transcript.segments:
+            continue
+        waveform = waveform_of(media, stream)
+        if waveform is None:
+            unknown += len(lines)
+            continue
+        fitted = _expected_edges(transcript.segments, timing, loudness_of_waveform(waveform))
+        known = [s.index for s in media.audio_streams]
+        common: dict[str, float | int | str | bool] = {
+            "media_id": str(media_id),
+            # 直す道具（retime_subtitles）の audio と同じ 1 から数えた番号 省くと 1 本目の字幕を探す
+            "audio": known.index(stream) + 1 if stream in known else 1,
+            "start_offset_ms": timing.start_offset_ms,
+            "end_offset_ms": timing.end_offset_ms,
+        }
+        edited = {str(s.id): s.edited for s in transcript.segments}
+        heard = [piece for piece in pieces if (piece.media_id, piece.stream) == key]
+        for line in lines:
+            target = fitted.get(line.segment_id)
+            if target is None:
+                continue
+            if target[0] is None or target[1] is None:
+                # 声の境目が見つからなかった端は、あるべき時刻が分からない 合っていると読まない
+                # 片端でも数える（切った端と同じ決まり）
+                voiceless += 1
+            if target[0] is None and target[1] is None:
+                continue
+            placed = _placed_with(heard, line)
+            head = None if target[0] is None else _projected(placed, target[0], line.start, project)
+            tail = None if target[1] is None else _projected(placed, target[1], line.end, project)
+            cut = (target[0] is not None and head is None) or (
+                target[1] is not None and tail is None
+            )
+            if cut:
+                # 寄せた端を切って鳴らない 比べられない端を、合っていると読まない 片端でも数える
+                # （残った端が合っていても、切った側の字幕が声の無い所に映っているかもしれない）
+                unplaced += 1
+            if head is None and tail is None:
+                continue
+            early = None if head is None else (line.start - head) * frame
+            late = None if tail is None else (line.end - tail) * frame
+            if max(abs(x) for x in (early, late) if x is not None) < TIMING_TOLERANCE:
+                continue
+            values: dict[str, float | int | str | bool] = {
+                "segment_id": line.segment_id,
+                "burned": line.burned,
+                "edited": False if line.burned else edited.get(line.segment_id, False),
+            }
+            problems.append(
+                _timing_problem(
+                    max(math.floor(line.start), start),
+                    min(math.ceil(line.end), end),
+                    early,
+                    late,
+                    tuple(line.clip_ids),
+                    {**common, **values},
+                )
+            )
+    problems.sort(key=lambda problem: (problem.start, problem.end))
+    return problems, unknown, unplaced, voiceless
+
+
 def check_words(
-    project: Project, start: int, end: int, kinds: frozenset[str], waveform_of: WaveformOf
+    project: Project,
+    start: int,
+    end: int,
+    kinds: frozenset[str],
+    waveform_of: WaveformOf,
+    timing: SubtitleTiming | None = None,
 ) -> WordReport:
-    """タイムラインの ``[start, end)`` を語の時刻で調べる"""
+    """タイムラインの ``[start, end)`` を語の時刻で調べる
+
+    ``timing`` は本人の字幕の時刻の設定（#426） 声へ寄せない人の字幕は、時刻のずれを調べない
+    """
     wanted = kinds & WORD_KINDS
     if not wanted:
         return WordReport()
@@ -440,6 +715,40 @@ def check_words(
     if SUBTITLE_WORDS in wanted:
         lines, blind = _subtitle_words(project, start, end)
         problems += lines
+    if SUBTITLE_TIMING in wanted:
+        chosen = timing if timing is not None else SubtitleTiming()
+        if chosen.fit_to_voice:
+            late, deaf, unplaced, voiceless = _subtitle_timing(
+                project, start, end, waveform_of, chosen
+            )
+            problems += late
+            if deaf:
+                # 比べられなかった行を問題 0 件へ混ぜない
+                skipped.add(SUBTITLE_TIMING)
+                notes.append(
+                    f"波形の解析がまだの音の字幕が {deaf} 行あり、出る時刻と声を比べていません"
+                    " 解析が終わってから調べ直してください"
+                )
+            if unplaced:
+                skipped.add(SUBTITLE_TIMING)
+                notes.append(
+                    f"声の頭か終わりを切った所に映る字幕が {unplaced} 行あり、切った側の端は"
+                    "声と比べていません（残った端は比べています） 字幕が声の無い所に映って"
+                    "いないかを preview_frame で確かめてください"
+                )
+            if voiceless:
+                skipped.add(SUBTITLE_TIMING)
+                notes.append(
+                    f"頭か終わりの近く（前後 {float(REACH)} 秒）に声の出だしや終わりが見つからない"
+                    f"字幕が {voiceless} 行あり、その端は声と比べていません 声の無い所に映って"
+                    "いないかを preview_frame で確かめてください"
+                )
+        else:
+            skipped.add(SUBTITLE_TIMING)
+            notes.append(
+                "本人の設定で字幕の時刻を声に合わせない（起こした字幕の時刻を声に合わせる が切）"
+                "ので、字幕の時刻は調べていません"
+            )
     sounding = {
         (piece.media_id, piece.stream)
         for piece in heard_pieces(project)
@@ -448,16 +757,23 @@ def check_words(
     # 語の時刻が 1 つも無い作品だけを作品の単位で断る ほかは切れ目と行を 1 つずつ読んだ数で決める
     # 音の単位で断ると、語の無い所に切れ目が無い作品まで調べられなかった扱いになる
     timed = {key for key in sounding if _has_phrases(project, key)}
-    if sounding and not timed and not any(_has_subtitles(project, key) for key in sounding):
+    # 語の時刻で調べる種類 字幕の時刻（#414）は語ではなく行と波形で見るので、語の有無で断らない
+    worded = wanted & {WORD_CUT, SUBTITLE_WORDS}
+    if (
+        worded
+        and sounding
+        and not timed
+        and not any(_has_subtitles(project, key) for key in sounding)
+    ):
         # 字幕の無い音だけ 話し声が無いとは言えないので調べたことにしない 足す字幕も無い
-        skipped |= wanted
+        skipped |= worded
         notes.append(
             "字幕の無い音だけが鳴っているので、語の境目は調べていません"
             " 話している音なら transcribe で起こすと調べられます"
         )
-    elif sounding and not timed:
+    elif worded and sounding and not timed:
         # 調べたことにしない 語の時刻が無いのに問題 0 件と読むと、切れ目は無事と言ったことになる
-        skipped |= wanted
+        skipped |= worded
         notes.append(
             "鳴っている素材に語の時刻が無いので、語の境目と字幕の文言は調べていません"
             " transcribe の words_only で今の字幕に語の時刻を足せます"

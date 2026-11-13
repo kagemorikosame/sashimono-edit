@@ -22,6 +22,7 @@ from sashimono.ai.host import (
     UNSAVED_REFUSAL,
     CompatReport,
     ExportRequest,
+    PackageRequest,
     ToolError,
     ViewState,
 )
@@ -54,6 +55,7 @@ from sashimono.core.model import (
 from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.search import SceneNote
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.core.timebase import FrameRate
 from sashimono.effects.denoise import DEFAULT_REDUCTION_DB
 from sashimono.engine.audio.voicevox import NARRATION_FOLDER, NarrationSettings
@@ -64,6 +66,7 @@ from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckRequest, CheckState
 from sashimono.engine.checks.profile import SoundProfile
 from sashimono.engine.checks.report import assemble
+from sashimono.engine.encode import BitrateChoice
 from sashimono.engine.vision import ScreenKind
 from tests.conftest import make_clip
 
@@ -129,6 +132,12 @@ class FakeHost:
         self.wrap_share = 90
         #: 完成物の検査（#337） 本人の設定の音量の基準と、頼まれた検査・試験が入れる様子
         self.loudness = -14.0
+        #: 音量をそろえるときに山をリミッターで抑えるか（#414 本人の設定の既定は入り）
+        self.limiter = True
+        #: 字幕の時刻の合わせ方（#426 本人の設定の既定）
+        self.timing = SubtitleTiming()
+        #: 書き出しのビットレートの決め方（#414） 試験の素材の大きさに左右されないよう決め打ち
+        self.bitrate = BitrateChoice(auto=False)
         #: ダッキング（#329）の本人の設定 既定は設定と同じ
         self.duck = DuckShape()
         #: 強調の動き（#331）の本人の設定 既定は設定と同じ
@@ -197,6 +206,16 @@ class FakeHost:
         self.export_state: dict[str, object] = {"state": "idle", "progress": 0.0, "path": None}
         #: 書き出しの終わりを待った（export_waiter の関数を呼んだ）スレッド
         self.export_waits: list[int] = []
+        #: 頼まれた持ち出し用パッケージの書き出しと展開（#423） 偽物なので中身は走らせない
+        self.package_exports: list[PackageRequest] = []
+        self.package_opens: list[Path] = []
+        self.package_state: dict[str, object] = {
+            "kind": None,
+            "state": "idle",
+            "progress": 0.0,
+            "path": None,
+            "message": "",
+        }
 
         #: アプリが作品の外で覚えている名前（本物は字幕起こしの記録・前に開いた作品の場所など）
         self.remembered: list[str] = []
@@ -440,6 +459,18 @@ class FakeHost:
         return self.loudness
 
     @property
+    def subtitle_timing(self) -> SubtitleTiming:
+        return self.timing
+
+    @property
+    def loudness_limiter(self) -> bool:
+        return self.limiter
+
+    @property
+    def export_bitrate(self) -> BitrateChoice:
+        return self.bitrate
+
+    @property
     def fix_rounds(self) -> int:
         return self.fix_limit
 
@@ -650,6 +681,46 @@ class FakeHost:
             return False
         self.export_state = {**self.export_state, "state": "cancelled"}
         return True
+
+    def start_package_export(self, request: PackageRequest) -> None:
+        if self.package_state["state"] == "working":
+            raise ToolError("持ち出し用パッケージの書き出しか展開がもう走っています")
+        self.package_exports.append(request)
+        self.package_state = {
+            "kind": "export",
+            "state": "working",
+            "progress": 0.0,
+            "path": str(request.path),
+            "message": "",
+        }
+
+    def start_package_open(self, path: Path) -> None:
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        if self.package_state["state"] == "working":
+            raise ToolError("持ち出し用パッケージの書き出しか展開がもう走っています")
+        self.package_opens.append(path)
+        self.package_state = {
+            "kind": "open",
+            "state": "working",
+            "progress": 0.0,
+            "path": str(path),
+            "message": "",
+        }
+
+    def package_status(self) -> dict[str, object]:
+        return dict(self.package_state)
+
+    def package_waiter(self) -> Callable[[float], bool]:
+        def wait(seconds: float) -> bool:
+            deadline = time.monotonic() + seconds
+            while self.package_state["state"] == "working":
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.005)
+            return True
+
+        return wait
 
     def view_state(self) -> ViewState:
         return self.screen

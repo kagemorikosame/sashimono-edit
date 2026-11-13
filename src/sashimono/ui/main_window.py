@@ -11,7 +11,9 @@ import contextlib
 import functools
 import gc
 import math
+import os
 import platform
+import re
 import threading
 import time
 import weakref
@@ -59,8 +61,24 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono import __version__
-from sashimono.ai.auto_fix import can_auto_color, plan_color_fix, plan_noise_fix
-from sashimono.ai.host import UNSAVED_REFUSAL, CompatReport, ExportRequest, ToolError, ViewState
+from sashimono.ai.auto_fix import (
+    can_auto_color,
+    clips_overlap,
+    has_limiter,
+    limited_peak,
+    limiter_commands,
+    plan_color_fix,
+    plan_noise_fix,
+    raise_cap,
+)
+from sashimono.ai.host import (
+    UNSAVED_REFUSAL,
+    CompatReport,
+    ExportRequest,
+    PackageRequest,
+    ToolError,
+    ViewState,
+)
 from sashimono.ai.operations import (
     NarrationJob,
     narration_consent,
@@ -69,7 +87,7 @@ from sashimono.ai.operations import (
     write_and_place_narration,
 )
 from sashimono.ai.outbound import Outbound, SendChoice
-from sashimono.ai.safety import Consent, check_writable
+from sashimono.ai.safety import Consent, check_writable, pinned
 from sashimono.ai.sheet import SheetLayout
 from sashimono.ai.sound_graph import SoundGraph
 from sashimono.compat.aviutl import native, plugin
@@ -136,11 +154,12 @@ from sashimono.core.io import (
     tidy_orphans,
     trim_state,
 )
-from sashimono.core.io.atomic import Expected, write_atomic_bytes
+from sashimono.core.io.atomic import Expected, expect_now, write_atomic_bytes
 from sashimono.core.io.library import Library
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.mixing import (
+    MAX_LIMITER_DB,
     DuckShape,
     gain_commands,
     loudness_gain,
@@ -172,6 +191,7 @@ from sashimono.core.seams import (
     touching_scope,
 )
 from sashimono.core.search import SceneNote, hit_places
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.core.timebase import FrameRate, Rounding, format_timecode, seconds_to_frame
 from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
@@ -199,8 +219,16 @@ from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckSt
 from sashimono.engine.checks.scan import LOUDNESS
 from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
-from sashimono.engine.encode import build_settings, chosen_range, export_target
+from sashimono.engine.encode import BitrateChoice, build_settings, chosen_range, export_target
 from sashimono.engine.gpu import opengl_usable
+from sashimono.engine.package.archive import (
+    PACKAGE_SUFFIX,
+    OpenedPackage,
+    PackOptions,
+    PackResult,
+    write_package,
+)
+from sashimono.engine.package.archive import open_package as unpack_package
 from sashimono.engine.reframe import (
     FACES_CENTER,
     FACES_OFF,
@@ -242,6 +270,13 @@ from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.media_search import MediaSearchDialog
 from sashimono.ui.mix_dialogs import ask_duck, ask_loudness
 from sashimono.ui.narration_dialog import ask_narration
+from sashimono.ui.package_dialog import (
+    PackageExportDialog,
+    opened_summary,
+    package_root,
+    packed_summary,
+)
+from sashimono.ui.package_job import PackageJob
 from sashimono.ui.playback import PlaybackController
 from sashimono.ui.preview import PreviewWidget
 from sashimono.ui.progress_display import (
@@ -851,6 +886,18 @@ class MainWindow(QMainWindow):
             stop.clicked.connect(self._assistant_export.cancel)
         self._assistant_export.changed.connect(self._show_assistant_export)
         self.statusBar().addPermanentWidget(self._assistant_export_indicator)
+        # 持ち出し用パッケージ（#423）の書き出しと展開 数十 GB になりうるので裏で回し、右端に
+        # 進み具合と〔止める〕を出す 人の窓と AI の道具が同じ 1 本を使う
+        self._package = PackageJob(self)
+        #: 展開を始めたときの作品の世代（:attr:`Document.generation`）
+        self._package_from = 0
+        self._package_indicator = ProgressIndicator(self, cancel_text="止める")
+        stop = self._package_indicator.cancel_button
+        if stop is not None:
+            stop.clicked.connect(self._package.cancel)
+        self._package.changed.connect(self._show_package)
+        self._package.ended.connect(self._package_ended)
+        self.statusBar().addPermanentWidget(self._package_indicator)
         # AI の完成物の検査（#337）は長い作品で数分かかる 裏で走っていると分かるように出し、
         # 人がその場で止められるようにする
         self._checks = CheckJob(self)
@@ -890,6 +937,7 @@ class MainWindow(QMainWindow):
         file_menu = self._menu("ファイル")
         self._add(file_menu, "新規", QKeySequence.StandardKey.New, self.new_project)
         self._add(file_menu, "開く…", QKeySequence.StandardKey.Open, self.open_project)
+        self._add(file_menu, "持ち出し用パッケージを開く…", QKeySequence(), self.open_package)
         self._add(file_menu, "保存", QKeySequence.StandardKey.Save, self.save_project)
         self._add(file_menu, "名前を付けて保存…", QKeySequence("Ctrl+Shift+S"), self.save_as)
         self._add(
@@ -902,6 +950,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         self._add(file_menu, "素材を読み込む…", QKeySequence("Ctrl+I"), self._import_dialog)
         self._add(file_menu, "書き出し…", QKeySequence("Ctrl+E"), self.export)
+        self._add(file_menu, "持ち出し用に書き出す…", QKeySequence(), self.export_package)
         self._snapshot_save_action = self._add(
             # triggered の checked（偽）が保存先として渡らないよう、引数なしで呼ぶ
             file_menu,
@@ -3402,6 +3451,7 @@ class MainWindow(QMainWindow):
             folder=self.export_folder,
             chapters=self._preferences.export_chapters,
             encoder_priority=self._preferences.encoder_priority,
+            bitrate=self._preferences.export_bitrate,
         )
         self._person_export = dialog
         try:
@@ -3426,6 +3476,195 @@ class MainWindow(QMainWindow):
         # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
         # この後で結果を読む間は残る
         dialog.deleteLater()
+
+    # --- 持ち出し用パッケージ（#423）---
+
+    def export_package(self) -> None:
+        """〔持ち出し用に書き出す…〕 作品と素材を 1 つのファイルにまとめる（裏で回す）"""
+        if self._package.running:
+            QMessageBox.information(
+                self,
+                "持ち出し用に書き出す",
+                "持ち出し用パッケージの書き出しか展開がもう走っています",
+            )
+            return
+        self._playback.stop()
+        project = self._document.project
+        folder = (
+            self._path.parent if self._path is not None else (self.export_folder or Path.home())
+        )
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", project.name).strip(" .") or "作品"
+        dialog = PackageExportDialog(self._preferences, folder / f"{stem}{PACKAGE_SUFFIX}", self)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            # 窓で選んだ物を覚える 次に開いた窓の初めの値になる
+            self._remember_preferences(dialog.remembered(self._preferences))
+            target, options = dialog.target(), dialog.options()
+        finally:
+            dialog.deleteLater()
+        # 確かめたときの書き出し先を覚え、書き終えて名前を付ける所で照らす 書いている数分の間に
+        # 同じ名前が現れたり置き換えを許したファイルが差し替わったりすると、許していない物を
+        # 置き換える（作品の保存と同じ #449 の CodeRabbit の指摘）
+        approved = expect_now(target)
+        if approved.identity is not None:
+            answer = QMessageBox.question(
+                self,
+                "持ち出し用に書き出す",
+                f"{target} はもうあります 置き換えますか（書き終えるまで前のファイルは残ります）",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._start_package_export(
+            project,
+            target,
+            options,
+            expect=replace(approved, keep=self._preferences.backup_generations),
+            check=None,
+        )
+
+    def open_package(self) -> None:
+        """〔持ち出し用パッケージを開く…〕 作業用のフォルダへ展開して普段の作品として開く"""
+        if self._package.running:
+            QMessageBox.information(
+                self,
+                "持ち出し用パッケージを開く",
+                "持ち出し用パッケージの書き出しか展開がもう走っています",
+            )
+            return
+        if not self._confirm_discard():
+            return
+        name, _ = QFileDialog.getOpenFileName(
+            self,
+            "持ち出し用パッケージを開く",
+            "",
+            f"Sashimono Edit 持ち出し用パッケージ (*{PACKAGE_SUFFIX})",
+        )
+        if name:
+            self._start_package_open(Path(name), by_assistant=False)
+
+    def _start_package_export(
+        self,
+        project: Project,
+        target: Path,
+        options: PackOptions,
+        *,
+        expect: Expected | None,
+        check: Callable[[], Path] | None,
+        by_assistant: bool = False,
+    ) -> None:
+        """書き出しを裏で始める ``check`` を渡すと、書き出し先のフォルダを持ったまま書く（AI）
+
+        書き終えるまで数分かかる その間にフォルダや名前を差し替えられて、確かめていない所へ
+        書かないよう、AI の書き出しはフォルダを開いたまま持ち、持った後にもう 1 度確かめる
+        （:func:`~sashimono.ai.safety.pinned` AI の書き出し #327 と同じ）
+        """
+        scratch = userdirs.cache_root() / "package-scratch"
+
+        def work(progress: Callable[[float, str], None], cancelled: Callable[[], bool]) -> object:
+            def write(path: Path) -> PackResult:
+                return write_package(
+                    project,
+                    path,
+                    options,
+                    scratch=scratch,
+                    progress=progress,
+                    cancelled=cancelled,
+                    expect=expect,
+                )
+
+            if check is None:
+                return write(target)
+            with pinned(check) as path:
+                if os.path.normcase(str(path)) != os.path.normcase(str(target)):
+                    raise ToolError(f"書き出し先が確かめた時と変わりました: {target} → {path}")
+                return write(path)
+
+        self._package.start("export", target, work, by_assistant=by_assistant)
+
+    def _start_package_open(self, package: Path, *, by_assistant: bool) -> None:
+        """展開を裏で始める 終わったら :meth:`_package_ended` が作品へ差し替える"""
+        root = package_root(self._preferences)
+        # 始めたときに開いていた作品 展開している間に別の作品を開いたら、終わっても差し替えない
+        self._package_from = self._document.generation
+        # 選んだときのパッケージの身元 展開では開いた物をこれと照らし、違えば開かない
+        # 選んでから裏で開くまでに差し替えられると、人が選んでいない物を展開する
+        chosen = expect_now(package)
+
+        def work(progress: Callable[[float, str], None], cancelled: Callable[[], bool]) -> object:
+            return unpack_package(
+                package, root, progress=progress, cancelled=cancelled, expect=chosen
+            )
+
+        self._package.start("open", package, work, by_assistant=by_assistant)
+
+    def _package_ended(self, kind: str, result: object) -> None:
+        """書き出しか展開が終わった 展開なら作品へ差し替え、入れなかった物・足りない物を知らせる"""
+        job = self._package
+        status = job.status()
+        if result is None:
+            if status.get("state") == "failed" and not job.by_assistant:
+                QMessageBox.warning(self, "持ち出し用パッケージ", str(status.get("message", "")))
+            return
+        if kind == "export" and isinstance(result, PackResult):
+            summary = packed_summary(result)
+            # 知らせに並ぶスクリプトとファイルの名前は、作品の外の名前（元の PC のフォルダの
+            # 名前やユーザー名を含みうる） 様子（package_status）で AI へ渡るので、名前を送らない
+            # と決めた人の所では伏せ字の表に入れて伏せる（#342 #449 の CodeRabbit の指摘）
+            job.remember(
+                *result.scripts,
+                *result.metadata_kept,
+                *result.whole_instead,
+                *result.missing_files,
+                *result.unused_media,
+            )
+            job.note(summary)
+            if not job.by_assistant:
+                QMessageBox.information(self, "持ち出し用に書き出しました", summary)
+            return
+        if kind != "open" or not isinstance(result, OpenedPackage):
+            return
+        opened = result
+        # 展開した先の場所は様子の文に載る 開いても開かなくても伏せ字の表に入れる
+        job.remember(str(opened.folder), str(opened.project_path))
+        if self._document.generation != self._package_from:
+            # 展開している間に別の作品を開いた 黙って差し替えると、その作品から離れてしまう
+            # （#449 の CodeRabbit の指摘）
+            job.note(
+                f"展開しました（{opened.folder}）が、その間に別の作品を開いたので開いていません"
+                " 開くなら〔開く…〕で展開した作品を選んでください"
+            )
+            return
+        # 展開している間に編集した物を黙って捨てない 人には尋ね、AI の展開なら開かずに知らせる
+        if self.is_modified and (job.by_assistant or not self._confirm_discard()):
+            job.note(
+                f"展開しました（{opened.folder}）が、保存していない変更があるので開いていません"
+                " 開くなら〔開く…〕で展開した作品を選んでください"
+            )
+            return
+        if not self._claim(opened.project_path, ask=not job.by_assistant):
+            job.note(f"展開しました（{opened.folder}）が、別の窓で開いているので開いていません")
+            return
+        self._adopt_opened(opened.project, opened.project_path)
+        lacking = opened_summary(opened)
+        job.note(f"開きました: {opened.project_path}" + (f"\n{lacking}" if lacking else ""))
+        if lacking and not job.by_assistant:
+            QMessageBox.information(self, "持ち出し用パッケージを開きました", lacking)
+
+    def _show_package(self) -> None:
+        """パッケージの進み具合をステータスバーへ出す 終わったら知らせて隠す"""
+        job = self._package
+        indicator = self._package_indicator
+        if job.running:
+            text, fraction = job.progress_text()
+            indicator.show_progress(
+                f"{text} {round(fraction * 100)}%", fraction, tooltip=str(job.status().get("path"))
+            )
+            return
+        if not indicator.isHidden():
+            indicator.hide()
+            message = str(job.status().get("message", "")).split("\n", 1)[0]
+            self.statusBar().showMessage(message, 8000)
 
     def _active_scene_name(self) -> str | None:
         """開いているシーンの名前 メインなら ``None``"""
@@ -3683,6 +3922,9 @@ class MainWindow(QMainWindow):
             found.append("字幕を起こしています")
         if self._assistant_export.running:
             found.append("AI アシスタントが書き出しています")
+        if self._package.running:
+            # 再起動すると書きかけ・展開しかけを捨てる（前のファイルは残るが、やり直しになる）
+            found.append("持ち出し用パッケージを書き出しているか展開しています")
         if self._narration_job is not None:
             # 人の窓〔ナレーションを作る…〕で声を作っている途中（#335） 再起動すると作った声を捨てる
             found.append("ナレーションの声を作っています")
@@ -4167,6 +4409,18 @@ class MainWindow(QMainWindow):
         return float(self._preferences.check_loudness_target)
 
     @property
+    def subtitle_timing(self) -> SubtitleTiming:
+        return self._preferences.subtitle_timing
+
+    @property
+    def loudness_limiter(self) -> bool:
+        return self._preferences.loudness_limiter
+
+    @property
+    def export_bitrate(self) -> BitrateChoice:
+        return self._preferences.export_bitrate
+
+    @property
     def fix_rounds(self) -> int:
         return self._preferences.ai_fix_rounds
 
@@ -4515,11 +4769,16 @@ class MainWindow(QMainWindow):
         if not targets:
             self.statusBar().showMessage("音を鳴らすクリップを選んでください", 5000)
             return False
-        choice = ask_loudness(self, float(self._preferences.check_loudness_target))
+        choice = ask_loudness(
+            self,
+            float(self._preferences.check_loudness_target),
+            self._preferences.loudness_limiter,
+        )
         if choice is None:
             return False
         # 無効のクリップはミキサが鳴らさず測りに入らない 掛けると有効に戻したときにずれる
-        clips = [clip for _, clip in targets if clip.enabled]
+        enabled = [(track, clip) for track, clip in targets if clip.enabled]
+        clips = [clip for _, clip in enabled]
         if not clips:
             self.statusBar().showMessage("選んだクリップはどれも無効です", 5000)
             return False
@@ -4530,7 +4789,13 @@ class MainWindow(QMainWindow):
             end=max(clip.timeline_end for clip in clips),
             scene=str(self._active_scene) if self._active_scene is not None else None,
         )
-        self._pending_loudness = _PendingLoudness(request, project, tuple(clips), choice.ceiling)
+        # 前に積んだリミッターで抑えた後の音を測るので、もう 1 度抑えると 6 dB を越えて重なる
+        squeeze = (
+            MAX_LIMITER_DB if choice.limiter and not any(has_limiter(c) for c in clips) else 0.0
+        )
+        self._pending_loudness = _PendingLoudness(
+            request, project, tuple(enabled), choice.ceiling, squeeze
+        )
         self.request_check(request)
         # 同じ頼みを前に測り終えていれば、知らせを待たずにそのまま当てる
         self._finish_loudness()
@@ -4565,25 +4830,62 @@ class MainWindow(QMainWindow):
                 "測るあいだに作品が変わったので、音量を変えなかった もう 1 度選んでください", 8000
             )
             return
+        # 前に積んだリミッターの上限より上へは上げない（AI の normalize_loudness と同じ）
+        clips = [clip for _, clip in pending.targets]
         decided = loudness_gain(
-            pending.clips,
+            clips,
             measured=report.loudness,
             peak_db=report.peak_db,
             target=pending.request.limits.loudness_target,
             ceiling=pending.ceiling,
+            squeeze=pending.squeeze,
+            raise_ceiling=raise_cap(pending.targets, pending.ceiling),
         )
-        if abs(decided.gain_db) < 0.05:
-            self.statusBar().showMessage("すでに基準の音量です", 5000)
-            return
+        moved = abs(decided.gain_db) >= 0.05
+        # 音量を変えなくても、山が天井を越えていればリミッターは積む
+        squeezed = decided.squeeze_db >= 0.05
         target = pending.request.limits.loudness_target
-        if not self.execute_all(
-            gain_commands(pending.clips, decided.gain_db), f"音量を {target:g} LUFS へそろえる"
-        ):
+        if not moved and not squeezed:
+            short = target - report.loudness
+            if abs(short) < 0.05 or not decided.limited_by:
+                self.statusBar().showMessage("すでに基準の音量です", 5000)
+            else:
+                # 上限で 1 dB も上げられなかったのを「基準の音量」と言うと、足りないまま進める
+                self.statusBar().showMessage(
+                    f"音量を変えなかった 基準まで {short:.1f} LU 足りないが、音の山か前に積んだ"
+                    "リミッターの上限、または音量の欄の上限でこれ以上上がらない"
+                    " リミッターの上限か、山の出るクリップの音量を見直してください",
+                    10000,
+                )
+            return
+        commands = gain_commands(clips, decided.gain_db) if moved else []
+        try:
+            if squeezed:
+                commands += limiter_commands(pending.targets, pending.ceiling)
+        except ToolError as error:
+            self.statusBar().showMessage(f"音量をそろえられなかった: {error}", 8000)
+            return
+        if not self.execute_all(commands, f"音量を {target:g} LUFS へそろえる"):
             return
         stopped = " 音の山か音量の上限で、基準の手前で止めた" if decided.limited_by else ""
+        if squeezed:
+            stopped += (
+                f" 山はリミッターで {decided.squeeze_db:.1f} dB 抑えた（その分、音量は少し下がる）"
+            )
+            held = limited_peak(pending.targets, pending.ceiling)
+            if held > pending.ceiling + 0.05:
+                stopped += f" トラックの音量で、山は {held:g} dBFS まで上がる"
+            if clips_overlap(clips):
+                # リミッターはクリップごと 重なって鳴る音の和は上限を越えうる
+                stopped += (
+                    " 重なって鳴る所は音が割れることがある AI アシスタントの check_output で"
+                    "音割れを確かめてください"
+                )
+        elif moved and any(has_limiter(clip) for clip in clips):
+            stopped += " 前に積んだリミッターを通る音なので、音量は変えた量どおりには動かない"
+        changed = f"音量を {decided.gain_db:+.1f} dB 変えた" if moved else "音量は変えていない"
         self.statusBar().showMessage(
-            f"音量を {decided.gain_db:+.1f} dB 変えた"
-            f"（測った音量 {report.loudness:.1f} LUFS）{stopped}",
+            f"{changed}（測った音量 {report.loudness:.1f} LUFS）{stopped}",
             8000,
         )
 
@@ -4616,11 +4918,18 @@ class MainWindow(QMainWindow):
         """
         names = set(self._subtitles.remembered_names()) | self._left_paths | self._ai_written
         names.update(self._assistant_export.remembered_names())
+        # パッケージの書き出し先と開いたパッケージ（#423） 様子（package_status）に残る
+        names.update(self._package.remembered_names())
         if self._path is not None:
             names.add(str(self._path))
         names.update(
             folder
-            for folder in (self._preferences.state_folder, self._preferences.export_folder)
+            for folder in (
+                self._preferences.state_folder,
+                self._preferences.export_folder,
+                self._preferences.package_folder,
+                str(package_root(self._preferences)),
+            )
             if folder
         )
         return tuple(sorted(names))
@@ -4936,7 +5245,51 @@ class MainWindow(QMainWindow):
                 protected=protected,
             ),
             replace(request.expect, keep=self._preferences.backup_generations),
+            match_bitrate=request.match_bitrate,
         )
+
+    def start_package_export(self, request: PackageRequest) -> None:
+        """AI の〔持ち出し用に書き出す…〕（#423） 画面と同じ書き方を裏で回す
+
+        書き出し先は、始めた時の作品の場所と素材で確かめ直す（:meth:`start_export` と同じ訳）
+        """
+        if self._package.running:
+            raise ToolError("持ち出し用パッケージの書き出しか展開がもう走っています")
+        project_path, export_folder = self._path, self.export_folder
+        protected = tuple(media.path for media in self._document.project.media)
+        raw = str(request.path)
+        self._playback.stop()
+        self._start_package_export(
+            self._document.project,
+            request.path,
+            PackOptions(
+                whole=request.whole, margin=request.margin, keep_metadata=request.keep_metadata
+            ),
+            expect=replace(request.expect, keep=self._preferences.backup_generations),
+            check=lambda: check_writable(
+                raw, project_path=project_path, export_folder=export_folder, protected=protected
+            ),
+            by_assistant=True,
+        )
+
+    def start_package_open(self, path: Path) -> None:
+        """AI の〔持ち出し用パッケージを開く…〕（#423） 展開し終えたら作品へ差し替える
+
+        保存していない変更があれば断る（:meth:`open_project_file` と同じ 2026-10-20 利用者の決定）
+        """
+        if self.is_modified:
+            raise ToolError(UNSAVED_REFUSAL)
+        if self._package.running:
+            raise ToolError("持ち出し用パッケージの書き出しか展開がもう走っています")
+        self._playback.stop()
+        self._start_package_open(path, by_assistant=True)
+
+    def package_status(self) -> dict[str, object]:
+        return self._package.status()
+
+    def package_waiter(self) -> Callable[[float], bool]:
+        # 窓を閉じた後に呼ばれても、閉じた係は待たずに返す（PackageJob.shutdown）
+        return self._package.wait
 
     def export_status(self) -> dict[str, object]:
         return self._assistant_export.status()
@@ -5009,6 +5362,9 @@ class MainWindow(QMainWindow):
         # AI が始めた書き出しを止めてから閉じる 走っているスレッドを持ったまま窓が壊れると落ちる
         # 書きかけは捨てる 書き出し先は前のまま残る
         self._assistant_export.shutdown()
+        # パッケージの書き出しと展開も止めてから閉じる 書きかけと展開しかけは消え、
+        # 前のファイルは残る
+        self._package.shutdown()
         # 起こしの終わりを待っている AI を放す 窓を閉じると見張りのタイマーも止まり、片付いた
         # 知らせが来ないまま待つ秒の上限まで残る
         self._subtitles.release_transcription_waiters()
@@ -5039,5 +5395,8 @@ class _PendingLoudness:
     request: CheckRequest
     #: 測り始めたときの作品 測る間に変わったら当てない
     project: Project
-    clips: tuple[Clip, ...]
+    #: そろえるクリップと、その置かれたトラック（リミッターの後に掛かる音量を見る）
+    targets: tuple[tuple[Track, Clip], ...]
     ceiling: float
+    #: リミッターで抑えてよい山の量（dB #414） 0 なら抑えない
+    squeeze: float = 0.0

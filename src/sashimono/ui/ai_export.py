@@ -32,10 +32,16 @@ from sashimono.ai.safety import pinned
 from sashimono.core.io.atomic import Expected, copy_atomic
 from sashimono.core.model import Project
 from sashimono.core.userdirs import cache_root
-from sashimono.engine.encode import ExportError, ExportSettings
+from sashimono.engine.encode import BitrateChoice, ExportError, ExportSettings
 from sashimono.engine.encode import export_project as run_export
 
 __all__ = ["AssistantExport", "scratch_folder"]
+
+#: 素材に合わせたビットレートを求める裏の処理を同時に走らせる数 応えない共有で止まった処理は
+#: 中止しても残るので、数を絞らないと書き出すたびに止まったスレッドが増える
+_ESTIMATE_SLOTS = threading.BoundedSemaphore(2)
+#: 求めている間に中止を見る間隔（秒）
+_ESTIMATE_POLL = 0.05
 
 
 def scratch_folder() -> Path:
@@ -62,10 +68,13 @@ class _Worker(QObject):
         settings: ExportSettings,
         check: Callable[[], Path],
         expect: Expected | None = None,
+        match_bitrate: bool = False,
     ) -> None:
         super().__init__()
         self._project = project
         self._settings = settings
+        #: 素材に合わせたビットレートをここ（書き出すスレッド）で求めるか 設定の値は上限
+        self._match_bitrate = match_bitrate
         self._check = check
         self._expect = expect
         self._cancel = threading.Event()
@@ -108,13 +117,58 @@ class _Worker(QObject):
             with contextlib.suppress(OSError):
                 scratch.unlink(missing_ok=True)
 
+    def _matched(self, settings: ExportSettings) -> ExportSettings | None:
+        """素材に合わせたビットレートにした設定 求められなければ上限のまま（書き出しは止めない）
+
+        求めるのはさらに別のスレッド ファイルの大きさを読むので、応えない共有の素材で止まると
+        中止しても書き出しが「書いている」のまま終わらない 待つ間も中止を見て、頼まれたら結果を
+        待たずに ``None``（中止）を返す 止まった処理が枠を埋めていれば、待たずに上限で書く
+        """
+        cap = settings.video_bitrate
+        if not self._match_bitrate or not cap:
+            return settings
+        if not _ESTIMATE_SLOTS.acquire(blocking=False):
+            return settings
+        choice = BitrateChoice(auto=True, mbps=cap // 1_000_000)
+        found: list[int] = []
+
+        def work() -> None:
+            """素材に合わせたビットレートを求める 求めるのは別のスレッド
+
+            応えない共有を読むと止まるので、待つ側が中止を見られるようにする 枠は必ず返す
+            （返さないと、次からずっと上限で書き出す）
+            """
+            try:
+                found.append(choice.for_project(self._project))
+            except (OSError, ValueError):
+                pass
+            finally:
+                _ESTIMATE_SLOTS.release()
+
+        thread = threading.Thread(target=work, name="export-bitrate", daemon=True)
+        thread.start()
+        while thread.is_alive():
+            if self._cancel.wait(_ESTIMATE_POLL):
+                return None
+        if not found:
+            return settings
+        return replace(settings, video_bitrate=found[0] * 1_000_000)
+
     def _export(self, scratch: Path) -> None:
+        """一時の場所へ書き出す 見積もりを中止したら書き出さずに中止を知らせる
+
+        一時の場所へ書くのは、途中で止めたときに本人のファイルを半端な物で上書きしないため
+        """
         #: 書き出し側からの知らせ（次の候補のエンコーダで書き直したなど #365） 終わりの文に添える
         notes: list[str] = []
+        settings = self._matched(self._settings)
+        if settings is None:
+            self.cancelled.emit()
+            return
         try:
             run_export(
                 self._project,
-                replace(self._settings, path=scratch),
+                replace(settings, path=scratch),
                 progress=self.progressed.emit,
                 should_cancel=self._cancel.is_set,
                 notice=notes.append,
@@ -198,8 +252,14 @@ class AssistantExport(QObject):
         settings: ExportSettings,
         check: Callable[[], Path],
         expect: Expected | None = None,
+        *,
+        match_bitrate: bool = False,
     ) -> None:
-        """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）"""
+        """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）
+
+        ``match_bitrate`` なら、設定のビットレートを上限に、素材に合わせた値を書き出す
+        スレッドで求める
+        """
         if self.running:
             raise ToolError("書き出しがもう走っています")
         self._state = "rendering"
@@ -210,7 +270,7 @@ class AssistantExport(QObject):
         self._message = ""
         self._started = time.monotonic()
         self._ended = 0.0
-        self._worker = _Worker(project, settings, check, expect)
+        self._worker = _Worker(project, settings, check, expect, match_bitrate)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

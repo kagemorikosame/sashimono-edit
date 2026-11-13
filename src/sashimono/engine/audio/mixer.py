@@ -31,7 +31,7 @@ from sashimono.effects.definition import EffectDefinition, registry
 from sashimono.effects.spec import TrackSpec
 from sashimono.engine.decode import AudioDecoder, ProbeError
 
-__all__ = ["AudioMixer"]
+__all__ = ["AudioMixer", "history_seconds"]
 
 #: 同時に開いておくデコーダの上限
 MAX_OPEN_DECODERS = 8
@@ -627,6 +627,22 @@ def lookback(
         if definition.audio_history is not None:
             seconds += _history_seconds(definition, effect, frame, last)
     return int(np.ceil(min(seconds, MAX_HISTORY_SECONDS) * sample_rate))
+
+
+def history_seconds(clip: Clip, rate: FrameRate, sample_rate: int) -> float:
+    """クリップのどこかで前の音を読み直す長さの最大（秒 タイムラインの時間）
+
+    持ち出し用のパッケージ（#423）が、素材を使う範囲の頭よりどれだけ前まで入れるかを決める
+    クリップの頭より前の音もリバーブやディレイが読むので、入れないと別の PC で響きが欠ける
+    値の動くエフェクトもあるので、:func:`_sampled_offsets` の所を全部見て長い方を取る
+    """
+    if not _reads_history(clip):
+        return 0.0
+    longest = max(
+        lookback(clip, offset, sample_rate, rate)
+        for offset in _sampled_offsets(clip, rate, sample_rate)
+    )
+    return longest / sample_rate
 
 
 def _sampled_offsets(clip: Clip, rate: FrameRate, sample_rate: int) -> list[int]:

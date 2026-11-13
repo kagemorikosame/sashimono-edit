@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
 
@@ -30,12 +31,14 @@ from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId, S
 from sashimono.core.reframe import ReframeStyle
 from sashimono.core.seams import SeamStyle
 from sashimono.core.search import SceneNote
+from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.core.timebase import FrameRate
 from sashimono.engine.audio.voicevox import NarrationSettings
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckRequest, CheckState
+from sashimono.engine.encode import BitrateChoice
 from sashimono.engine.vision import ScreenKind
 
 __all__ = [
@@ -45,6 +48,7 @@ __all__ = [
     "CompatReport",
     "EditorHost",
     "ExportRequest",
+    "PackageRequest",
     "SheetCanvas",
     "ToolError",
     "ViewState",
@@ -75,10 +79,29 @@ class ExportRequest:
     range_choice: str
     #: 映像のコーデック ``None`` なら自動（使えなければ次の候補へ落ちる）
     codec: str | None
-    #: 映像のビットレート（Mbps）
+    #: 映像のビットレート（Mbps） ``match_bitrate`` なら上限
     bitrate_mbps: int
     #: 許したときの書き出し先の身元（無ければ無かったこと） 置く直前に照らし、名前が現れたり
     #: 中身が変わったりしていれば置かずに断る（#327）
+    expect: Expected
+    #: 置いた素材に合わせた値を、書き出すスレッドで求めるか（#414） 素材のファイルの大きさを
+    #: 読むので、許す前の画面のスレッドで求めると、応えないネットワークの共有で画面が固まる
+    match_bitrate: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PackageRequest:
+    """AI が頼んだ持ち出し用パッケージの書き出し（#423） 選べる物は画面の窓と同じ"""
+
+    #: 確かめ済みの書き出し先（リンクを辿った後の場所）
+    path: Path
+    #: 素材をまるごと入れる（偽なら使っている範囲だけ）
+    whole: bool
+    #: 使う範囲の前後に足す余裕（秒）
+    margin: Fraction
+    #: 撮った場所などの付け足しの情報を残す
+    keep_metadata: bool
+    #: 許したときの書き出し先の身元（:attr:`ExportRequest.expect` と同じ）
     expect: Expected
 
 
@@ -468,6 +491,33 @@ class EditorHost(Protocol):
         ...
 
     @property
+    def subtitle_timing(self) -> SubtitleTiming:
+        """起こした字幕の時刻の合わせ方（#426）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.subtitle_timing`）
+
+        仕上がりの検査（#414）が字幕の時刻のずれを、本人のずらしを足した所と比べるのに使う
+        """
+        ...
+
+    @property
+    def loudness_limiter(self) -> bool:
+        """音量をそろえるとき、届かなければ山をリミッターで抑えるか（#414）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.loudness_limiter`）
+
+        山の立ち上がりを残したい作品もある AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def export_bitrate(self) -> BitrateChoice:
+        """書き出しのビットレートの既定の決め方（#414）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.export_bitrate`）
+
+        画面の書き出しの窓と同じ物 AI が ``bitrate_mbps`` を渡さなければこれで決める
+        """
+        ...
+
+    @property
     def fix_rounds(self) -> int:
         """検査で見つけた問題を AI が直して調べ直す回数の上限（#339 0 は調べるだけ）
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.ai_fix_rounds`）
@@ -735,6 +785,30 @@ class EditorHost(Protocol):
 
     def cancel_export(self) -> bool:
         """走っている書き出しを止める 止めるよう頼めたら真"""
+        ...
+
+    def start_package_export(self, request: PackageRequest) -> None:
+        """持ち出し用パッケージ（#423）の書き出しを裏で始める 画面の〔持ち出し用に書き出す…〕と
+        同じ処理を通す すぐ戻る 様子は :meth:`package_status` すでに走っていれば :class:`ToolError`
+        """
+        ...
+
+    def start_package_open(self, path: Path) -> None:
+        """持ち出し用パッケージを展開し、終わったら作品へ差し替える（画面の〔持ち出し用パッケージを
+        開く…〕と同じ） すぐ戻る 保存していない変更があれば :data:`UNSAVED_REFUSAL` で断る
+        """
+        ...
+
+    def package_status(self) -> dict[str, object]:
+        """パッケージの書き出しか展開の様子 ``state`` は ``idle``・``working``・``done``・
+        ``failed``・``cancelled`` のどれか ``message`` に入れなかった物・足りない物の一覧が入る
+        """
+        ...
+
+    def package_waiter(self) -> Callable[[float], bool]:
+        """パッケージの書き出しか展開が終わるまで、最長で引数の秒だけ待つ関数
+        （:meth:`export_waiter` と同じく AI のスレッドから呼ばれる）
+        """
         ...
 
     def remembered_names(self) -> tuple[str, ...]:

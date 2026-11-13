@@ -65,6 +65,7 @@ from sashimono.engine.audio.voicevox import NarrationSettings
 from sashimono.engine.decode import probe_media
 from tests.ai.conftest import FakeHost
 from tests.ai.test_auto_fix_tools import Work, _strip, _waveform
+from tests.ai.test_cut_fillers import filler_host
 from tests.ai.test_look_tools import (
     _EXO_IMAGE,
     _empty_host,
@@ -216,6 +217,12 @@ def _jet_cut(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     host.stub_waveform = make_waveform([(0.5, 300), (0.0, 200), (0.5, 5500)])
     media = str(work.project.media[0].id)
     return host, "jet_cut", {"media_id": media, "keep_speech": False, "smooth": True}
+
+
+def _cut_fillers(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # WRITE_EXAMPLES の作品の字幕には語の時刻が無く断られる 言いよどみの語を持つ字幕で通す
+    host = filler_host(material.video_media)
+    return host, "cut_fillers", {"media_id": str(host.document.project.media[0].id)}
 
 
 def _rename_speaker(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
@@ -415,6 +422,13 @@ def _open_project(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return _saved_host(material), "open_project", {"path": "第二稿.sme"}
 
 
+def _open_package(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    """持ち出し用パッケージを開く（#423） 偽のホストは展開しないので中身は空でよい"""
+    host = _saved_host(material)
+    (material.tmp_path / "持ち出し.smex").write_bytes(b"")
+    return host, "open_package", {"path": "持ち出し.smex"}
+
+
 def _new_project(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return _saved_host(material), "new_project", {"width": 1280, "height": 720}
 
@@ -464,6 +478,7 @@ EXAMPLES: dict[str, Example] = {
     "import_media": _import_media,
     "place_subtitles": _place_subtitles,
     "jet_cut": _jet_cut,
+    "cut_fillers": _cut_fillers,
     "smooth_cuts": _smooth_cuts,
     "rename_speaker": _rename_speaker,
     "set_volume": _mix("set_volume", lambda w: {"clip_ids": [str(w.bgm.id)], "volume_percent": 50}),
@@ -495,6 +510,7 @@ EXAMPLES: dict[str, Example] = {
     "clear_keyframes": _with_keyframes("clear_keyframes"),
     "split_subtitle": _split_subtitle,
     "open_project": _open_project,
+    "open_package": _open_package,
     "new_project": _new_project,
     "add_custom_object": _custom_object,
     "align_clip": _align,

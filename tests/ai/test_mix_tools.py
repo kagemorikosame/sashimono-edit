@@ -554,10 +554,11 @@ class TestNormalize:
         assert work.host.check_requests[-1].limits.loudness_target == -23.0
 
     def test_peaks_stop_the_gain(self, work: _Work) -> None:
-        # 壊れると、基準まで上げて音の山が 0 dBFS を超え、書き出しで音が割れる
-        _run(work.host, "normalize_loudness", wait_seconds=0)
+        # 壊れると、リミッターを使わない人の作品を基準まで上げて音の山が 0 dBFS を超え、
+        # 書き出しで音が割れる
+        _run(work.host, "normalize_loudness", wait_seconds=0, limiter=False)
         _measured(work.host, -20.0, -3.0)
-        result = _run(work.host, "normalize_loudness", wait_seconds=0)
+        result = _run(work.host, "normalize_loudness", wait_seconds=0, limiter=False)
         assert result["gain_db"] == pytest.approx(2.0)
         assert result["limited_by"] == ["peak"]
         assert result["expected_peak_dbfs"] == pytest.approx(-1.0)
