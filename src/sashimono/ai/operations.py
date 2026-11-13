@@ -13018,6 +13018,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_cut_fillers,
         sends=_WITH_FILES,
+        preview=from_arguments(),
         writes=True,
     ),
     Operation(
