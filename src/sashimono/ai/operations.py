@@ -5031,7 +5031,9 @@ def _add_text(host: EditorHost, arguments: dict[str, Any]) -> object:
         duration=duration,
     )
     host.apply_commands(commands, f"テキストを追加: {text[:12]}")
-    return {"added": text}
+    # 本文に印を付けて返す 欄の名前が text でないので、印が無いと送った本文が
+    # 送った物の記録と「最後に送った物」から抜ける（CodeRabbit の指摘 #450）
+    return {"added": masked_value(text, _TEXT_ONLY)}
 
 
 def _add_shape(host: EditorHost, arguments: dict[str, Any]) -> object:

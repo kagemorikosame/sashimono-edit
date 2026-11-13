@@ -328,6 +328,17 @@ class TestLogFromTheResult:
         assert box.get("result") == {"text": "結果に入った文"}
         assert bridge.send_log.last()[Outbound.TEXT].sample.lines == ("結果に入った文",)
 
+    def test_text_placed_by_add_text_is_logged(self, host: FakeHost) -> None:
+        # 壊れると、置いたテキストの本文は結果の added の欄で返るので text の欄だけを数える
+        # 記録から抜け、送った本文が送った物の記録と「最後に送った物」に残らない
+        # （CodeRabbit の指摘 #450）
+        bridge = EditorBridge(host)
+        bridge.auto_approve = True
+        _run(bridge, "add_text", lambda _request: SendAnswer.UNTIL_CLOSE, {"text": "置いた見出し"})
+        (entry,) = bridge.send_log.entries()
+        assert entry.kinds == (SentKind(Outbound.TEXT, 1, 6),)
+        assert bridge.send_log.last()[Outbound.TEXT].sample.lines == ("置いた見出し",)
+
     def test_a_failure_that_carries_a_place_is_logged(self, secret_host: FakeHost) -> None:
         # 壊れると、失敗の文に混ざって AI へ返った素材の場所が、送った物の記録から抜ける
         # （Sourcery の指摘 #450）
