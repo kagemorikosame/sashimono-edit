@@ -900,8 +900,12 @@ def _text_layers(
         plain_font.setStyleName("")
         plain_font.setItalic(resolved.italic())
     else:
-        emboldened = font.bold()
+        # 可変フォントの太字は太さの軸で掛ける（:func:`_embolden`）ので ``font.bold()`` は
+        # 偽のまま 太字の欄で見ないと、可変フォントの太字だけ中心へ戻さなくなる
+        emboldened = bool(values.get("bold", False))
     plain_font.setBold(False)
+    # 太さの軸も外す 残すと比べる細字まで太字の太さになり、戻す量が 0 になる
+    plain_font.unsetVariableAxis(QFont.Tag("wght"))
     plain_metrics = QFontMetricsF(plain_font)
     plain_widest = max((plain_metrics.horizontalAdvance(line) for line in lines), default=0.0)
 
@@ -1010,9 +1014,61 @@ def _text_font(values: Mapping[str, object], size: int) -> QFont:
         if style in QFontDatabase.styles(family):
             font.setStyleName(style)
         return font
-    font.setBold(bool(values.get("bold", False)))
+    # 斜体を先に掛ける 太字の太さは斜体の面で見る（斜体の面だけ太さが違う書体がある）
     font.setItalic(bool(values.get("italic", False)))
+    if bool(values.get("bold", False)):
+        _embolden(font)
     return font
+
+
+#: 太字の太さ（OpenType の wght） Qt の太字（``QFont.Weight.Bold``）と同じ値
+_BOLD_WEIGHT = 700
+
+
+def _embolden(font: QFont) -> None:
+    """``font`` を太字にする 太字は元の太さより細くならない（#419）
+
+    Windows は可変フォントの名前付きの太さを別のファミリ（「Noto Serif JP Medium」）として並べる
+    そこへ Qt の太字（太さ 700 の面を探す）を頼むと、そのファミリに 700 の面が無いので、
+    可変フォントの既定の太さ（Noto Serif JP なら ExtraLight）へ戻してから合成の太字で太らせる
+    Medium の太字が Medium より細く出て、SemiBold は 600 を太字に数えて何も変わらない
+
+    太さの軸（wght）を持つ可変フォントは、選ばれた面のまま軸を回して太くする 同じ書体の
+    Bold の面と同じ字になる 元が 700 より太い（Black）ときは、その太さのまま残す
+    書体に無い字（Bahnschrift の日本語など）は Qt が代わりの書体で描くが、軸を回した字は
+    代わりの書体でも太字の面を選ぶ（試験で見ている）
+
+    軸を持たない書体と、元の太さが軸の上限に届いている書体は、今までどおり Qt の太字に任せる
+    （太字の面を探し、無ければ合成で太らせる） 上限で軸を回しても字が変わらず、太字が消える
+    """
+    weight = QFontInfo(font).weight()
+    heaviest = _weight_axis_maximum(QRawFont.fromFont(font))
+    if heaviest is not None and weight < heaviest:
+        font.setVariableAxis(QFont.Tag("wght"), float(max(_BOLD_WEIGHT, weight)))
+    else:
+        font.setBold(True)
+
+
+def _weight_axis_maximum(raw: QRawFont) -> float | None:
+    """可変フォントの太さの軸（wght）の上限 軸を持たなければ ``None``
+
+    ``fvar`` 表の軸の並びを読む ``fvar`` を持つだけでは決めない 字の幅や大きさの軸しか
+    持たない可変フォントで軸を回すと、太さが変わらないまま太字が消える
+    """
+    if not raw.isValid():
+        return None
+    table = bytes(raw.fontTable("fvar").data())
+    if len(table) < 12:
+        return None
+    axes, _reserved, count, size = struct.unpack(">HHHH", table[4:12])
+    for index in range(count):
+        begin = axes + index * size
+        record = table[begin : begin + 16]
+        if len(record) == 16 and record[:4] == b"wght":
+            # 軸の記録は 名前・下限・既定・上限 の順 数は 16.16 の固定小数
+            top = int.from_bytes(record[12:16], "big", signed=True)
+            return top / 65536.0
+    return None
 
 
 def drawn_bold_italic(values: Mapping[str, object], bold: bool, italic: bool) -> tuple[bool, bool]:
