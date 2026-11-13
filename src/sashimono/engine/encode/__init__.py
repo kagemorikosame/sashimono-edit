@@ -4,11 +4,15 @@ from sashimono.engine.encode.choices import (
     BITRATE_RANGE_MBPS,
     CONTAINER_SUFFIXES,
     DEFAULT_BITRATE_MBPS,
+    MATCH_FLOOR_MBPS,
+    MATCH_HEADROOM,
     RANGE_ALL,
     RANGE_WORK_AREA,
+    BitrateChoice,
     build_settings,
     chosen_range,
     export_target,
+    matched_bitrate_mbps,
 )
 from sashimono.engine.encode.exporter import (
     CHAPTER_SUFFIXES,
@@ -32,6 +36,8 @@ __all__ = [
     "CONTAINER_SUFFIXES",
     "DEFAULT_BITRATE_MBPS",
     "DEFAULT_PIPELINE_DEPTH",
+    "MATCH_FLOOR_MBPS",
+    "MATCH_HEADROOM",
     "MAX_PIPELINE_DEPTH",
     "MEASURED_DECODE_MS",
     "MEASURED_EXPORT_MS",
@@ -39,6 +45,7 @@ __all__ = [
     "MEASURED_GPU_COLOR_MS",
     "RANGE_ALL",
     "RANGE_WORK_AREA",
+    "BitrateChoice",
     "ExportError",
     "ExportSettings",
     "available_video_codecs",
@@ -46,4 +53,5 @@ __all__ = [
     "chosen_range",
     "export_project",
     "export_target",
+    "matched_bitrate_mbps",
 ]

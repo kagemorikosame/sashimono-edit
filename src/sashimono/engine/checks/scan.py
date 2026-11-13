@@ -50,6 +50,8 @@ LENGTH = "length"
 WORD_CUT = "word_cut"
 #: 字幕の文言のうち、残した音に入っていない語（#420）
 SUBTITLE_WORDS = "subtitle_words"
+#: 字幕の出る・消える時刻が声からずれている行（#414）
+SUBTITLE_TIMING = "subtitle_timing"
 #: 調べる種類 並びは返す一覧の説明の順
 KINDS = (
     BLACK,
@@ -61,6 +63,7 @@ KINDS = (
     LENGTH,
     WORD_CUT,
     SUBTITLE_WORDS,
+    SUBTITLE_TIMING,
 )
 #: 絵を描かないと調べられない種類 頼まれなければ絵を描かずに済み、音だけなら何倍も速い
 PICTURE_KINDS = frozenset({BLACK, FREEZE})
@@ -68,7 +71,7 @@ PICTURE_KINDS = frozenset({BLACK, FREEZE})
 SOUND_KINDS = frozenset({SILENCE, CLIPPING, LOUDNESS})
 #: 語の時刻で調べる種類 絵も混ぜた音も要らず、タイムラインの作品からすぐ数えられる
 #: 書き出した動画には語の時刻が無いので、タイムラインだけ
-WORD_KINDS = frozenset({WORD_CUT, SUBTITLE_WORDS})
+WORD_KINDS = frozenset({WORD_CUT, SUBTITLE_WORDS, SUBTITLE_TIMING})
 
 #: 黒いコマとみなす、暗い画素の割合 FFmpeg の blackdetect の既定（pic_th 0.98）
 #: 1 にすると、隅のロゴや字幕が 1 つ載っただけの黒い画面を見落とす

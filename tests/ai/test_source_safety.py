@@ -86,6 +86,8 @@ UNDOABLE_TOOLS = frozenset(
         "delete_clips",
         "cut_range",
         "jet_cut",
+        # 言いよどみ（#414） 無音カットと同じ RippleCut を積むだけ
+        "cut_fillers",
         # つなぎ目（#332） 場面切り替えを置き、拡大率と音量フェードの欄を変えるだけ
         "smooth_cuts",
         "group_clips",

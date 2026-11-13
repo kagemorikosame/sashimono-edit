@@ -82,6 +82,11 @@ OWN_LIBRARY = {
     "image_edge",
     # 画面の解析の部品が入っているか（#407） 本人の機械の様子 reframe が返事の faces に載せる
     "vision_ready",
+    # 字幕の時刻のずらし・山をリミッターで抑えるか・書き出しのビットレートの決め方（#414）
+    # check_output・normalize_loudness・export_video が問題の値と結果と確かめの箱に載せる
+    "subtitle_timing",
+    "loudness_limiter",
+    "export_bitrate",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {
@@ -330,6 +335,9 @@ class TestEveryTextSourceGoesThroughThePort:
             "preview_frame",
             "contact_sheet",
             "preview_range",
+            # 書き出しの既定のビットレート（#414） 本人の設定と素材から決めた値が確かめの箱に載る
+            "export_video",
+            "normalize_loudness",
         ):
             operation = next(op for op in OPERATIONS if op.name == name)
             assert Outbound.APP_SETTINGS in operation.sends, name

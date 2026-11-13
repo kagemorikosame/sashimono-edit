@@ -1,0 +1,180 @@
+"""通しの確かめ（#414）で足した好みの設定 既定・保存・設定の窓・書き出しの窓"""
+
+from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from PySide6.QtWidgets import QApplication
+
+from sashimono.core.model import Project, ProjectSettings
+from sashimono.engine.encode import DEFAULT_BITRATE_MBPS, BitrateChoice
+from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.waiting import wait_until
+
+#: 変えた値（既定と違う物）
+CHANGED: dict[str, Any] = {
+    "loudness_limiter": False,
+    "ai_auto_approve": True,
+    "export_bitrate_auto": False,
+    "export_bitrate_mbps": 30,
+}
+
+
+def test_the_defaults_help_people_who_do_not_know() -> None:
+    """既定を逆にすると、知らない人が基準に届かない音・大きすぎるファイル・黙って進む編集に困る"""
+    plain = Preferences()
+    assert plain.loudness_limiter is True
+    assert plain.export_bitrate_auto is True
+    assert plain.export_bitrate_mbps == DEFAULT_BITRATE_MBPS
+    # 取り消せる編集でも黙って進むと困る人がいるので、任せるのは本人が入れたときだけ
+    assert plain.ai_auto_approve is False
+    assert plain.export_bitrate == BitrateChoice(auto=True, mbps=DEFAULT_BITRATE_MBPS)
+
+
+def test_the_choices_survive_a_restart(tmp_path: Path) -> None:
+    """保存し忘れると、変えた設定が次の起動で戻る"""
+    store = PreferenceStore(tmp_path / "preferences.json")
+    store.save(Preferences(**CHANGED))
+    loaded = store.load()
+    for name, value in CHANGED.items():
+        assert getattr(loaded, name) == value, name
+
+
+def test_broken_values_fall_back(tmp_path: Path) -> None:
+    """壊れた値で起動を止めず、その項目だけ既定へ戻す"""
+    path = tmp_path / "preferences.json"
+    path.write_text(
+        json.dumps({"export_bitrate_mbps": 0, "loudness_limiter": "いいえ"}), encoding="utf-8"
+    )
+    loaded = PreferenceStore(path).load()
+    assert loaded.export_bitrate_mbps == DEFAULT_BITRATE_MBPS
+    assert loaded.loudness_limiter is True
+
+
+@pytest.mark.parametrize("changed", [True, False])
+def test_the_settings_dialog_keeps_them(qt_application: QApplication, changed: bool) -> None:
+    """設定の窓に出し忘れると、開いて OK を押しただけで既定に戻る"""
+    from sashimono.ui.preferences_dialog import PreferencesDialog
+
+    del qt_application
+    preferences = Preferences(**CHANGED) if changed else Preferences()
+    dialog = PreferencesDialog(preferences)
+    try:
+        kept = dialog.preferences()
+        for name in CHANGED:
+            assert getattr(kept, name) == getattr(preferences, name), name
+    finally:
+        dialog.deleteLater()
+
+
+def test_the_export_window_starts_from_the_choice(qt_application: QApplication) -> None:
+    """壊れると、設定で決めたビットレートが書き出しの窓に出ず、決め打ちの 12 Mbps に戻る"""
+    from sashimono.ui.export_dialog import ExportDialog
+
+    del qt_application
+    project = Project.create(ProjectSettings())
+    dialog = ExportDialog(project, bitrate=BitrateChoice(auto=False, mbps=30))
+    try:
+        assert dialog._bitrate.value() == 30
+    finally:
+        dialog.deleteLater()
+
+
+def test_the_matched_bitrate_arrives_later(qt_application: QApplication) -> None:
+    """素材の大きさは窓のスレッドの外で読む 届いた値は欄へ入るが、人が替えた値と古い頼みは残す
+
+    窓のスレッドで読むと、応えない共有のドライブの間は窓が出ず固まる（PR #451 の CodeRabbit）
+    """
+    from sashimono.ui.export_dialog import ExportDialog
+
+    del qt_application
+    project = Project.create(ProjectSettings())
+    dialog = ExportDialog(project, bitrate=BitrateChoice(auto=True, mbps=30))
+    try:
+        # 出るまでは上限
+        assert dialog._bitrate.value() == 30
+        token = object()
+        dialog._bitrate_token = token
+        dialog._on_bitrate_found(object(), 5)
+        assert dialog._bitrate.value() == 30
+        dialog._on_bitrate_found(token, 5)
+        assert dialog._bitrate.value() == 5
+        dialog._bitrate.setValue(20)
+        dialog._on_bitrate_found(token, 7)
+        assert dialog._bitrate.value() == 20
+    finally:
+        dialog.deleteLater()
+
+
+def test_the_matched_bitrate_comes_from_the_worker(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """裏のスレッドで求めた値が、知らせを通って欄へ届く
+
+    ハンドラーだけを見ると、スレッドの起動や知らせの接続が壊れても通る
+    """
+    from sashimono.engine.encode import choices
+    from sashimono.ui.export_dialog import ExportDialog
+
+    monkeypatch.setattr(choices, "matched_bitrate_mbps", lambda *_a, **_k: 7)
+    project = Project.create(ProjectSettings())
+    dialog = ExportDialog(project, bitrate=BitrateChoice(auto=True, mbps=30))
+    try:
+        wait_until(
+            lambda: dialog._bitrate.value() == 7,
+            "素材に合わせた値",
+            step=qt_application.processEvents,
+        )
+    finally:
+        dialog.deleteLater()
+
+
+def test_a_new_scene_starts_from_the_cap(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """前のシーンの低い値のまま押すと、求め終える前に低く書き出す（CodeRabbit の指摘）"""
+    from sashimono.engine.encode import choices
+    from sashimono.ui import export_dialog
+    from sashimono.ui.export_dialog import ExportDialog
+
+    del qt_application
+
+    def unreadable(*_args: object, **_kwargs: object) -> int:
+        raise OSError("応えない共有")
+
+    monkeypatch.setattr(choices, "matched_bitrate_mbps", unreadable)
+    project = Project.create(ProjectSettings())
+    dialog = ExportDialog(project, bitrate=BitrateChoice(auto=True, mbps=30))
+    try:
+        dialog._set_bitrate(5)
+        dialog._match_bitrate(project)
+        assert dialog._bitrate.value() == 30
+        # 計算の枠が埋まっていても、上限で出してスレッドを増やさない 前の計算が枠を返すのを
+        # 待ってから 2 つとも取る（取れなかった枠があると、枠を消しても通る）
+        taken = [export_dialog._BITRATE_SLOTS.acquire(timeout=5) for _ in range(2)]
+        started: list[str] = []
+
+        def counted(*_args: object, **kwargs: object) -> threading.Thread:
+            started.append(str(kwargs.get("name")))
+            return threading.Thread(target=lambda: None)
+
+        monkeypatch.setattr(
+            export_dialog, "threading", SimpleNamespace(Thread=counted, Event=threading.Event)
+        )
+        try:
+            assert taken == [True, True]
+            dialog._set_bitrate(5)
+            dialog._match_bitrate(project)
+            assert dialog._bitrate.value() == 30
+            assert started == []
+        finally:
+            for held in taken:
+                if held:
+                    export_dialog._BITRATE_SLOTS.release()
+    finally:
+        dialog.deleteLater()

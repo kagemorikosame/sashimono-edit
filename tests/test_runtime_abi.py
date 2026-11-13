@@ -187,3 +187,61 @@ class TestInstalling:
         _extension(target, "ctranslate2", OLD)
         install_runtime(ASR_PACK, command=[sys.executable, "-c", "raise SystemExit(1)"])
         assert stale_runtime(ASR_PACK.key) == OLD
+
+
+class TestTheCompanion:
+    """AI 連携と一緒に入れる機能の印（#414 PR #451 の CodeRabbit の指摘）"""
+
+    COMPANION = FeaturePack(key="companion", label="画面", required=())
+    PACK = FeaturePack(key="main", label="本体", required=(), extra_pack=COMPANION)
+
+    def _mark_old(self, target: Path) -> None:
+        marks = {"main": python_abi(), "companion": OLD}
+        (target / ABI_MARKER).write_text(json.dumps(marks), encoding="utf-8")
+
+    def test_an_old_companion_is_not_marked_without_upgrade(self, target: Path) -> None:
+        """入れ直さない pip は前の拡張を残す 今の印を付けると読めない部品を使えると読む"""
+        self._mark_old(target)
+        command = [sys.executable, "-c", "pass"]
+        assert install_runtime(self.PACK, extra=True, command=command) == 0
+        assert stale_runtime("companion") == OLD
+
+    @pytest.mark.parametrize("flag", ["--upgrade", "-U"])
+    def test_an_upgraded_companion_is_marked(self, target: Path, flag: str) -> None:
+        """入れ直したら今の印 付けないと、入れ直した後も古いと見て読まない（短い -U も同じ）"""
+        self._mark_old(target)
+        command = [sys.executable, "-c", "pass", flag]
+        assert install_runtime(self.PACK, extra=True, command=command) == 0
+        marks = json.loads((target / ABI_MARKER).read_text(encoding="utf-8"))
+        assert marks["companion"] == python_abi()
+
+
+def test_the_first_install_shows_the_companion_files(
+    target: Path, qt_application: QApplication
+) -> None:
+    """初めて一緒に入れるときも、落とすモデルの名前と取得元を先に見せる
+
+    壊れると、何も見せないまま印の付いた導入で YuNet を落とし始める（PR #451 の CodeRabbit の指摘）
+    """
+    del target, qt_application
+    from sashimono.model_files import RemoteFile
+    from sashimono.ui.setup import SetupSection
+
+    model = RemoteFile(
+        name="companion-test-model.onnx",
+        url="https://example.com/companion-test-model.onnx",
+        sha256="0" * 64,
+        size=4096,
+        label="顔を探すモデル",
+    )
+    companion = FeaturePack(key="companion", label="画面", required=(), files=(model,))
+    pack = FeaturePack(key="main", label="本体", required=(), extra_pack=companion)
+    section = SetupSection(pack)
+    try:
+        section._extra.setChecked(False)
+        assert "顔を探すモデル" not in section._status.text()
+        section._extra.setChecked(True)
+        assert "顔を探すモデル" in section._status.text()
+        assert "example.com" in section._status.text()
+    finally:
+        section.deleteLater()

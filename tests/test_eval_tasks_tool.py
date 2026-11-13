@@ -878,6 +878,13 @@ def test_results_file_does_not_mark_the_commit_dirty(tool: ModuleType, tmp_path:
 
     results.write_text('{"a": 1}\n', encoding="utf-8")
     assert not tool.current_commit(tmp_path, results).endswith("+dirty")
+    # AI の段の結果も同じ 追跡した後に足しても書き換えと読まない
+    ai = results.with_name("ai.jsonl")
+    ai.write_text("", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-q", "-m", "ai")
+    ai.write_text('{"b": 2}\n', encoding="utf-8")
+    assert not tool.current_commit(tmp_path, results).endswith("+dirty")
     code.write_text("x = 2\n", encoding="utf-8")
     assert tool.current_commit(tmp_path, results).endswith("+dirty")
 
