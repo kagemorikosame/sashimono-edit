@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -27,6 +28,7 @@ from sashimono.core.mixing import (
     DUCK_ATTACK_MS_RANGE,
     DUCK_DEPTH_DB_RANGE,
     DUCK_RELEASE_MS_RANGE,
+    MAX_LIMITER_DB,
     DuckShape,
 )
 from sashimono.core.model import Track, TrackId
@@ -57,6 +59,8 @@ class LoudnessChoice:
 
     target: float
     ceiling: float = DEFAULT_PEAK_CEILING_DB
+    #: 届かなければ山をリミッターで抑えて上げるか（#414 初めの値は本人の設定）
+    limiter: bool = True
 
 
 class DuckDialog(QDialog):
@@ -118,7 +122,13 @@ class DuckDialog(QDialog):
 class LoudnessDialog(QDialog):
     """そろえる基準と音の山の上限を選ぶ 基準の既定は本人の設定"""
 
-    def __init__(self, target: float, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, target: float, parent: QWidget | None = None, *, limiter: bool = True
+    ) -> None:
+        """``limiter`` は〔リミッターで山を抑える〕の初めの値 本人の設定を渡す
+
+        窓で決め打つと、設定で切った人にも OK を押すだけでリミッターが積まれる
+        """
         super().__init__(parent)
         self.setWindowTitle("音量を基準にそろえる")
         form = QFormLayout(self)
@@ -143,6 +153,18 @@ class LoudnessDialog(QDialog):
         self.ceiling_box.setValue(DEFAULT_PEAK_CEILING_DB)
         self.ceiling_box.setToolTip("上げたときに音の山がこれを超えるなら、基準の手前で止めます")
         form.addRow("音の山の上限", self.ceiling_box)
+        # AI の normalize_loudness と同じ選び（#414） 窓で変えた値はその 1 回だけ
+        self.limiter_box = QCheckBox("届かなければ山をリミッターで抑えて上げる", self)
+        self.limiter_box.setChecked(limiter)
+        self.limiter_box.setToolTip(
+            "山が上限に当たって基準に届かないとき、選んだクリップの最後にリミッターを積んで山を"
+            f" {MAX_LIMITER_DB:g} dB まで抑え、基準まで上げます"
+            " 一瞬の山だけなら話し声の大きさはほぼ変わりませんが、上限を越える音が続く所は"
+            "その間も抑えるので、全体の音量が少し下がることがあります"
+            " 前に積んだリミッターがあるクリップには重ねて積みません"
+            " そろえた後に AI の check_output か書き出しで音量を確かめてください"
+        )
+        form.addRow(self.limiter_box)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self
         )
@@ -151,7 +173,11 @@ class LoudnessDialog(QDialog):
         form.addRow(buttons)
 
     def choice(self) -> LoudnessChoice:
-        return LoudnessChoice(float(self.target_box.currentData()), float(self.ceiling_box.value()))
+        return LoudnessChoice(
+            float(self.target_box.currentData()),
+            float(self.ceiling_box.value()),
+            self.limiter_box.isChecked(),
+        )
 
 
 def ask_duck(parent: QWidget, voices: Sequence[Track], shape: DuckShape) -> DuckChoice | None:
@@ -165,9 +191,9 @@ def ask_duck(parent: QWidget, voices: Sequence[Track], shape: DuckShape) -> Duck
         dialog.deleteLater()
 
 
-def ask_loudness(parent: QWidget, target: float) -> LoudnessChoice | None:
+def ask_loudness(parent: QWidget, target: float, limiter: bool = True) -> LoudnessChoice | None:
     """窓を出して選ばせる やめたら ``None``"""
-    dialog = LoudnessDialog(target, parent)
+    dialog = LoudnessDialog(target, parent, limiter=limiter)
     try:
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None

@@ -151,6 +151,10 @@ class FeaturePack:
     #: pip では入らないファイル（学習済みのモデルなど 画面の解析の顔の検出 #324）
     #: 導入のボタンで pip が終わった後に落として置く（:func:`install_runtime`）
     files: tuple[RemoteFile, ...] = ()
+    #: 追加分（``extra``）として一緒に入れる別の機能（#414 AI 連携と画面の解析）
+    #: 追加分を入れ終えたらその機能の印を付け、pip では入らないファイル（顔の検出のモデル）も
+    #: 落とす 落とさないと、包みは入ったのにその機能が「使えない」のまま残る
+    extra_pack: FeaturePack | None = None
 
     def status(self) -> PackStatus:
         return PackStatus(
@@ -1096,7 +1100,7 @@ def install_runtime(
     with writing_runtime(on_output, should_cancel) as granted:
         if not granted:
             return 1
-        return _install_runtime_locked(pack, argv, on_output, should_cancel)
+        return _install_runtime_locked(pack, argv, on_output, should_cancel, extra=extra)
 
 
 #: 導入先（配布版の ``runtime``）へ書く物を 1 本ずつにする錠 導入のボタン（字幕起こしと
@@ -1388,13 +1392,28 @@ def _install_runtime_locked(
     argv: list[str],
     on_output: Callable[[str], None] | None,
     should_cancel: Callable[[], bool] | None,
+    *,
+    extra: bool = False,
 ) -> int:
+    """導入の本体 :func:`writing_runtime` で導入先を押さえている間だけ呼ぶ
+
+    2 つの導入が同じ所へ同時に書くと、どちらが入れた中身かも、付けた印が正しいかも決められない
+    """
     target = runtime_target_dir()
+    companion = pack.extra_pack if pack is not None and extra else None
     if target is not None:
         target.mkdir(parents=True, exist_ok=True)
         # 入れる前の中身の印を書き残す（印が無い導入先だけ） 入れた後に数えると、
         # 今入れた物の印と、入れ直していない機能の古い印が混ざって決められない
         runtime_abi(target)
+    # 一緒に入れる機能が前の Python 向けのとき、--upgrade の無い pip は入っている物を残す
+    # 残ったまま今の印を付けると、読めない拡張を使えると読む（PR #451 の CodeRabbit の指摘）
+    # 自分で打った pip の短い形（-U）も同じ 見落とすと、入れ直したのに古い印が残って毎回求める
+    keeps_old = (
+        companion is not None
+        and stale_runtime(companion.key) is not None
+        and not any(word in ("--upgrade", "-U") for word in argv)
+    )
 
     own = _own_pip_arguments(argv)
     if own is not None:
@@ -1409,6 +1428,11 @@ def _install_runtime_locked(
         # pip が入れ終えてから取りに行く 先に落とすと、包みが入らなかったときに使えない物だけが
         # 残る 開発の環境（導入先が無い）でも同じ置き場へ落とす 置き場は Python の版に関係しない
         code = fetch_files(pack.files, on_output=on_output, should_cancel=should_cancel)
+    if code == 0 and companion is not None:
+        if target is not None and not keeps_old:
+            _mark_installed(target, companion.key)
+        if companion.files:
+            code = fetch_files(companion.files, on_output=on_output, should_cancel=should_cancel)
     return code
 
 

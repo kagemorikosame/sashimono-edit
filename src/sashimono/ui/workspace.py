@@ -104,7 +104,13 @@ from sashimono.engine.cache.screen_analyzer import (
     SAMPLES_PER_SCENE_CHOICES,
 )
 from sashimono.engine.checks import LOUDNESS_TARGETS
-from sashimono.engine.encode import DEFAULT_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH
+from sashimono.engine.encode import (
+    BITRATE_RANGE_MBPS,
+    DEFAULT_BITRATE_MBPS,
+    DEFAULT_PIPELINE_DEPTH,
+    MAX_PIPELINE_DEPTH,
+    BitrateChoice,
+)
 from sashimono.engine.encoders import ENCODER_PRIORITIES, PRIORITY_AUTO
 from sashimono.engine.render import DEFAULT_DECODE_THREADS, MAX_DECODE_THREADS
 from sashimono.engine.render.backdrop import FILL_BLACK, FILL_MODES, MARGIN_GRAY, MARGIN_MODES
@@ -452,6 +458,15 @@ class Preferences:
     #: 2026-10-17 に利用者が決めた 既定は入 埋めても再生には響かず、プレーヤーで章送りが
     #: できる 要らない人だけ切ればよい 書き出しの窓で替えた値もここへ覚える
     export_chapters: bool = True
+    #: 書き出しのビットレートの既定を、置いた素材に合わせるか（#414） 合わせるときも
+    #: :attr:`export_bitrate_mbps` を上限にする 通しの確かめで、12 Mbps 決め打ちの既定は
+    #: 1〜2 Mbps の素材を 7 倍の大きさにした 既定は入り 知らない人ほど、見た目の変わらない
+    #: 大きなファイルに困る
+    #: 素材より高い画質で書き出したい人（色を大きく変える・細かい図形を重ねる）は切る
+    #: 書き出しの窓の欄の初めの値と、AI の書き出しの既定がこれに従う
+    export_bitrate_auto: bool = True
+    #: 書き出しのビットレート（Mbps） 素材に合わせるときは上限、合わせないときはそのままの値
+    export_bitrate_mbps: int = DEFAULT_BITRATE_MBPS
     #: 書き出しと控えの作成で、どの作り手のエンコーダを先に試すか（#365）
     #: 既定は自動（NVIDIA → AMD → Intel → CPU の順で、この機械で書ける物） 知らない人は
     #: 速くて CPU の空く GPU を使うのが困らない側 同じビットレートなら CPU（libx264）の方が
@@ -750,6 +765,11 @@ class Preferences:
     #: クリップが黙ってばらばらになり、後で仲間を動かしたときにずれて困る 任せきりで
     #: 止まってほしくない人は切れる 切ると、ほかの編集と同じ許可の窓だけになる
     ai_ask_before_ungroup: bool = True
+    #: AI のパネルの〔変更を自動で承認〕を、入れた状態で開くか（#414） 既定は切 通しの確かめで
+    #: 1 本の編集に 41〜75 回の確かめが出たが、取り消せる編集でも黙って進むと困る人がいる
+    #: いつも任せる人は入れておけば、起動のたびに入れ直さずに済む 取り消せない操作（保存・書き出し）
+    #: と外へ送る物の確かめは、入れていても出る
+    ai_auto_approve: bool = False
     #: 削除して詰めたあと（Shift+Delete と右クリックの「削除して詰める」）、再生ヘッドを
     #: 消した所の頭（つなぎ目）へ動かす（Issue #299） 既定は入 詰めると後ろが前へ寄り、
     #: 元の位置はつなぎ目と関係の無い所を指す つなぎ目を確かめたい人が多い
@@ -763,6 +783,12 @@ class Preferences:
     #: :data:`~sashimono.engine.checks.LOUDNESS_TARGETS` 配信か放送かで答えが 9 LU も違う
     #: 既定は配信の -14 個人の作品はほとんどが配信へ出す 放送へ出す人は -23 / -24 を選ぶ
     check_loudness_target: int = -14
+    #: AI アシスタントが音量を基準へそろえる（``normalize_loudness``）とき、音の山が天井に当たって
+    #: 届かなければ、リミッターで山を抑えて基準まで上げるか（#414） 既定は入り 通しの確かめで、
+    #: 一瞬の山のせいで基準に 3.8〜6 LU 届かなかった 抑えるのは山だけで、話し声の大きさは変わらない
+    #: 山の音の立ち上がりをそのまま残したい人（音楽・効果音の作品）は切る 切ると前の動き
+    #: （山の手前で止めて、届かないことを伝える）
+    loudness_limiter: bool = True
     #: 字幕起こしで語の時刻も取るか（#420） 取ると AI が語の境目で切れ、字幕の下に残った語も
     #: 読める 実物の素材で起こす時間は素材によって 0.8〜2 倍（large-v3 と GPU）・1.1〜1.2 倍
     #: （small と CPU）だった 既定は入り 切ると起こしは速いことがあるが、切り抜きが言葉の途中で
@@ -981,6 +1007,14 @@ class Preferences:
         )
 
     @property
+    def export_bitrate(self) -> BitrateChoice:
+        """書き出しのビットレートの既定の決め方（#414）
+
+        書き出しの窓と AI の書き出しが同じ物を使う
+        """
+        return BitrateChoice(auto=self.export_bitrate_auto, mbps=self.export_bitrate_mbps)
+
+    @property
     def duck_shape(self) -> DuckShape:
         """AI アシスタントのダッキング（#329）の既定の形 AI が値を言わなければこれを使う"""
         return DuckShape(
@@ -1128,6 +1162,10 @@ class PreferenceStore:
 
     @staticmethod
     def _parse(data: dict[str, Any] | None) -> Preferences:
+        """保存した設定を読む 欄ごとに形を確かめ、外れた値は既定に戻す
+
+        手で書き換えたファイルや前の版のファイルで、起動できなくなるのを防ぐ
+        """
         if data is None:
             return Preferences()
         plain = Preferences()
@@ -1154,6 +1192,10 @@ class PreferenceStore:
             ),
             export_gpu_color=_flag(data.get("export_gpu_color"), plain.export_gpu_color),
             export_chapters=_flag(data.get("export_chapters"), plain.export_chapters),
+            export_bitrate_auto=_flag(data.get("export_bitrate_auto"), plain.export_bitrate_auto),
+            export_bitrate_mbps=_within(
+                data.get("export_bitrate_mbps"), BITRATE_RANGE_MBPS, plain.export_bitrate_mbps
+            ),
             encoder_priority=_choice(
                 data.get("encoder_priority"), ENCODER_PRIORITIES, plain.encoder_priority
             ),
@@ -1270,11 +1312,13 @@ class PreferenceStore:
             ai_ask_before_ungroup=_flag(
                 data.get("ai_ask_before_ungroup"), plain.ai_ask_before_ungroup
             ),
+            ai_auto_approve=_flag(data.get("ai_auto_approve"), plain.ai_auto_approve),
             ripple_playhead=_flag(data.get("ripple_playhead"), plain.ripple_playhead),
             ripple_layers=_flag(data.get("ripple_layers"), plain.ripple_layers),
             check_loudness_target=_loudness_target(
                 data.get("check_loudness_target"), plain.check_loudness_target
             ),
+            loudness_limiter=_flag(data.get("loudness_limiter"), plain.loudness_limiter),
             word_timestamps=_flag(data.get("word_timestamps"), plain.word_timestamps),
             subtitle_fit_voice=_flag(data.get("subtitle_fit_voice"), plain.subtitle_fit_voice),
             subtitle_start_offset_ms=_within(

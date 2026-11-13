@@ -34,10 +34,10 @@ from sashimono.core.model import Project, Scene, SceneId
 from sashimono.core.timebase import format_timecode
 from sashimono.engine.encode import (
     BITRATE_RANGE_MBPS,
-    DEFAULT_BITRATE_MBPS,
     DEFAULT_PIPELINE_DEPTH,
     RANGE_ALL,
     RANGE_WORK_AREA,
+    BitrateChoice,
     ExportError,
     ExportSettings,
     available_video_codecs,
@@ -128,8 +128,16 @@ class _ExportWorker(QObject):
             self.finished.emit(str(path))
 
 
+#: 素材に合わせるビットレートを同時に求める数の上限（どの窓からも合わせて） 応えないネットワークの
+#: 共有で止まった計算が、シーンを替えたり窓を開き直したりするたびに増えて残らないようにする
+_BITRATE_SLOTS = threading.BoundedSemaphore(2)
+
+
 class ExportDialog(QDialog):
     """書き出しの設定と実行"""
+
+    #: 素材に合わせたビットレートが出た（頼んだ印、Mbps） 読むのはスレッドの外
+    _bitrate_found = Signal(object, int)
 
     def __init__(
         self,
@@ -144,10 +152,12 @@ class ExportDialog(QDialog):
         folder: Path | None = None,
         chapters: bool = True,
         encoder_priority: str = PRIORITY_AUTO,
+        bitrate: BitrateChoice | None = None,
         separate_process: bool = False,
     ) -> None:
         """``project`` はメインを持つプロジェクト全体
 
+        ``bitrate`` はビットレートの欄の初めの値の決め方（本人の設定 #414） 省くと前からの決め打ち
         ``separate_process`` は別のプロセスで書き出すか（本人の設定 ``export_process`` #453）
 
         ``encoder_priority`` はどの作り手のエンコーダを先に試すか（本人の設定 #365）
@@ -212,8 +222,24 @@ class ExportDialog(QDialog):
 
         self._bitrate = QSpinBox(self)
         self._bitrate.setRange(*BITRATE_RANGE_MBPS)
-        self._bitrate.setValue(DEFAULT_BITRATE_MBPS)
+        choice = bitrate if bitrate is not None else BitrateChoice(auto=False)
+        self._bitrate_choice = choice
+        #: 人が欄を替えたか 替えた後に届いた素材に合わせた値で上書きしない
+        self._bitrate_touched = False
+        #: 欄を道具が書いている間 人が替えたと読まない
+        self._bitrate_writing = False
+        #: 最後に頼んだ素材に合わせる計算の印 シーンを替えた後に届いた前の結果を捨てる
+        self._bitrate_token: object | None = None
+        # 素材に合わせる値はファイルの大きさを読むので、出るまでは上限を出しておく
+        self._set_bitrate(choice.mbps)
         self._bitrate.setSuffix(" Mbps")
+        self._bitrate.valueChanged.connect(self._on_bitrate_edited)
+        self._bitrate_found.connect(self._on_bitrate_found)
+        if choice.auto:
+            # 決め打ちでない訳が分からないと、毎回違う初めの値を不具合と読む
+            self._bitrate.setToolTip(
+                f"置いた素材に合わせた値（上限 {choice.mbps} Mbps） 表示 → 設定… で決め打ちにできる"
+            )
 
         self._scene = QComboBox(self)
         self._scene.addItem("メイン", None)
@@ -291,6 +317,72 @@ class ExportDialog(QDialog):
         self._scene.currentIndexChanged.connect(self._on_scene_changed)
         self._on_scene_changed()
 
+    def _set_bitrate(self, value: int) -> None:
+        """窓の側でビットレートの欄を書き換える
+
+        本人が書き換えた印を付けないため 付くと、素材に合わせて求めた値で書き直さなくなる
+        """
+        self._bitrate_writing = True
+        try:
+            self._bitrate.setValue(value)
+        finally:
+            self._bitrate_writing = False
+
+    def _on_bitrate_edited(self) -> None:
+        """本人がビットレートを変えたら、後から求めた値で書き換えない
+
+        書き換えると本人の選んだ値が消える
+        """
+        if not self._bitrate_writing:
+            self._bitrate_touched = True
+
+    def _match_bitrate(self, project: Project) -> None:
+        """書き出す物の素材に合わせたビットレートを、スレッドの外で求める（#414）
+
+        素材のファイルの大きさを読む 応えないネットワークの共有を窓のスレッドで読むと、その間は
+        窓が出ず編集画面も固まる（PR #451 の CodeRabbit の指摘）
+        """
+        if not self._bitrate_choice.auto or self._bitrate_touched:
+            return
+        token = object()
+        self._bitrate_token = token
+        choice = self._bitrate_choice
+        # 求め終えるまでは上限を出す 前のシーンの低い値のまま押すと、そのまま低く書き出す
+        self._set_bitrate(choice.mbps)
+        if not _BITRATE_SLOTS.acquire(blocking=False):
+            # 前の計算が応えない共有で止まっている 窓を開くたびに待つスレッドを増やさず上限で出す
+            return
+
+        def work() -> None:
+            """素材の大きさを読んでビットレートを求める
+
+            応えない共有で止まっても窓が固まらないように、窓とは別のスレッドで走らせる
+            """
+            try:
+                value = choice.for_project(project)
+            except (OSError, ValueError):
+                # 求められなければ上限のまま 窓は落とさない
+                return
+            finally:
+                _BITRATE_SLOTS.release()
+            try:
+                self._bitrate_found.emit(token, value)
+            except RuntimeError:
+                # 先に窓を閉じた 届け先が無い
+                return
+
+        threading.Thread(target=work, name="sashimono-export-bitrate", daemon=True).start()
+
+    def _on_bitrate_found(self, token: object, value: int) -> None:
+        """求め終えた値を欄へ出す
+
+        前に選んでいたシーンの値と、本人が書き換えた後の値は捨てる 出すと、今の選択と合わない値で
+        書き出す
+        """
+        if token is not self._bitrate_token or self._bitrate_touched:
+            return
+        self._set_bitrate(value)
+
     def select_scene(self, scene_id: SceneId | None) -> None:
         """書き出す物を選ぶ ``None`` ならメイン 無いシーンなら何もしない"""
         index = self._scene.findData(scene_id)
@@ -324,6 +416,7 @@ class ExportDialog(QDialog):
             f"{width}x{height} / {project.settings.frame_rate} fps / {project.duration} フレーム"
         )
         self._fill_range(project)
+        self._match_bitrate(project)
         # 出力先の名前を書き換えるのは、前の既定の名前のままのときだけ 手で決めた名前は残す
         path = Path(self._path.text())
         if path.name == before:

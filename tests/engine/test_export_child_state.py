@@ -28,6 +28,7 @@ BY_RUNTIME = {
 
 #: 書き出しの窓が :class:`ExportSettings` に入れて渡す設定（子へは書き出しの設定ごと届く）
 #: ``export_process`` は子を使うかそのもの ``export_folder`` は書き出し先の既定の置き場
+#: ビットレートの 2 つは親が素材に合わせて求め、``video_bitrate`` に入れて渡す
 BY_EXPORT_SETTINGS = frozenset(
     {
         "export_pipeline_depth",
@@ -38,6 +39,8 @@ BY_EXPORT_SETTINGS = frozenset(
         "encoder_priority",
         "export_folder",
         "export_process",
+        "export_bitrate_auto",
+        "export_bitrate_mbps",
     }
 )
 
@@ -113,6 +116,7 @@ NOT_FOR_THE_CHILD = frozenset(
         "ripple_playhead",
         "ripple_layers",
         "check_loudness_target",
+        "loudness_limiter",
         "word_timestamps",
         "subtitle_fit_voice",
         "subtitle_start_offset_ms",
@@ -170,6 +174,7 @@ NOT_FOR_THE_CHILD = frozenset(
         "ai_ask_questions",
         "ai_plan_first",
         "ai_ask_before_ungroup",
+        "ai_auto_approve",
         "ai_fix_rounds",
         "ai_send_frames",
         "ai_send_text",
@@ -226,7 +231,7 @@ def test_export_settings_keep_their_fields() -> None:
     """壊れると、書き出しの設定から欄が消えたのに、渡しているつもりの一覧が残る"""
     fields = {field.name for field in dataclasses.fields(ExportSettings)}
     assert {"pipeline_depth", "decode_threads", "smooth_history", "gpu_color"} <= fields
-    assert {"chapters", "encoder_priority", "path"} <= fields
+    assert {"chapters", "encoder_priority", "path", "video_bitrate"} <= fields
 
 
 def _module_globals() -> set[tuple[str, str]]:
