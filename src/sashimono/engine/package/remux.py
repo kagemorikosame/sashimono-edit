@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import math
 import re
@@ -285,6 +286,12 @@ def _write(
             # 隙間を持てない音の道（:func:`_steady`）
             steady = [stream for stream in kept if _steady(stream, muxer)]
             quiet = {stream.index for stream in steady}
+            # 区間は頭の順に並び重ならない（spans_union） パケットごとに全部の区間を見ると、
+            # 1 時間の音（十数万パケット）と数百の区間で書き出しが長く止まる 頭の並びから探す
+            starts = [span.start for span in spans]
+
+            def hush(packet: av.Packet[Any]) -> av.Packet[Any]:
+                return _hush(packet, spans, starts, origin)
 
             # 錨 どの道も頭のパケットを入れて、道の頭の時刻（素材の原点）を元と同じに保つ
             reader.seek(0)
@@ -298,7 +305,7 @@ def _write(
                     continue
                 if index in picture_indices and not packet.is_keyframe:
                     continue
-                put(_hush(packet, spans, origin) if index in quiet else packet)
+                put(hush(packet) if index in quiet else packet)
                 anchored.add(index)
                 if len(anchored) == len(kept):
                     break
@@ -314,11 +321,13 @@ def _write(
                     set(),
                     origin,
                     whole,
-                    lambda packet: put(_hush(packet, spans, origin)),
+                    lambda packet: put(hush(packet)),
                     cancelled,
                 )
             rest = [stream for stream in kept if stream not in steady]
-            for span in spans:
+            # 残りが無いのに読むと、demux は空の指定を「全部の道」と読み、写さない道（時刻つきの
+            # データの道など）まで書き手へ渡して落ちる
+            for span in spans if rest else ():
                 _copy_span(reader, rest, guide, picture_indices, origin, span, put, cancelled)
             for encoder in encoders.values():
                 encoder.finish(writer)
@@ -363,13 +372,16 @@ def _steady(stream: av.stream.Stream, muxer: str) -> bool:
 _PCM_BYTES = {name: int(re.sub(r"\D", "", name) or 8) // 8 for name in _PCM_SILENCE}
 
 
-def _hush(packet: av.Packet[Any], spans: list[Span], origin: Fraction) -> av.Packet[Any]:
+def _hush(
+    packet: av.Packet[Any], spans: list[Span], starts: list[Fraction], origin: Fraction
+) -> av.Packet[Any]:
     """区間の外にある PCM の標本を無音に置き換える（パケットの中でも標本ごと）
 
     続けて写すと区間の間の音も入る 使っていない所の声や会話を持ち出すと、範囲だけを入れると
     約束したパッケージから、渡した人の知らない音が漏れる 区間に掛かるパケットも丸ごと残すと、
     区間の終わりの直後の言葉が入る 長さと時刻はそのまま（ずらさない）
     区間には書き出しの余裕（:attr:`PackageOptions.margin`）が足してあるので、ここで足さない
+    ``spans`` は頭の順に並び重ならない ``starts`` はその頭の並び
     """
     shown = _seconds(packet)
     codec = packet.stream.codec_context
@@ -382,7 +394,12 @@ def _hush(packet: av.Packet[Any], spans: list[Span], origin: Fraction) -> av.Pac
     count = len(data) // width
     fill = _PCM_SILENCE[name]
     kept = bytearray([fill]) * len(data)
-    for span in spans:
+    head = shown - origin
+    end = head + Fraction(count, rate)
+    # パケットの頭より前に始まる最後の区間から、パケットの終わりより前に始まる区間までを見る
+    for span in spans[max(0, bisect.bisect_right(starts, head) - 1) :]:
+        if span.start > end:
+            break
         # 標本 i は shown + i / rate に鳴る 区間に入る標本の番号の範囲を求めて元の音を戻す
         first = max(0, math.ceil((origin + span.start - shown) * rate))
         last = min(count, math.floor((origin + span.end - shown) * rate) + 1)
@@ -714,12 +731,18 @@ def _x264_format(name: str) -> str | None:
     deep = bits > 8
     wide = fmt.chroma_width(16) == 16
     tall = fmt.chroma_height(16) == 16
+    half_wide = fmt.chroma_width(16) == 8
+    half_tall = fmt.chroma_height(16) == 8
+    # 色差の間引きが x264 の 3 つ（4:4:4・4:2:2・4:2:0）と同じ物だけ寄せる 4:4:0・4:1:1 などを
+    # 寄せると色差を捨てるが、確かめの差は元も寄せた形にしてから測るので、捨てた分が差に出ない
     if wide and tall:
         chroma = "444"
-    elif tall:
+    elif half_wide and tall:
         chroma = "422"
-    else:
+    elif half_wide and half_tall:
         chroma = "420"
+    else:
+        return None
     return f"yuv{chroma}p" + ("10le" if deep else "")
 
 

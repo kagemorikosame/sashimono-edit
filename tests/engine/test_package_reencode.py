@@ -112,6 +112,9 @@ def test_an_identical_picture_is_told_as_the_same() -> None:
         ("gbrp10le", False),
         ("yuv422p12le", False),
         ("gray10le", False),
+        # 色差の間引きが x264 に無い形 寄せると色差を捨てるのに確かめの差に出ない
+        ("yuv440p", False),
+        ("yuv411p", False),
     ],
 )
 def test_only_formats_kept_as_they_are_are_offered(pixel_format: str, expected: bool) -> None:
