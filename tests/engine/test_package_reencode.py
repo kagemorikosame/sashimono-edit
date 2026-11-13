@@ -231,6 +231,29 @@ class TestReencode:
             )
             assert float(abs(old.read_seconds(Fraction(2), Fraction(1, 2))).max()) > 0.1
 
+    def test_the_whole_media_is_checked_in_the_middle_and_near_the_end(
+        self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """全体を入れる区間（10 億秒）のまま測ると、真ん中も終わりも最後の絵どうしを比べる"""
+        from sashimono.engine.package import remux
+
+        source = _editing(media_dir, "prores.mov")
+        moments: list[Fraction] = []
+        original = remux._frame_at
+
+        def spy(path: Path, index: int, moment: Fraction, cancelled: object) -> object:
+            moments.append(moment)
+            return original(path, index, moment, cancelled)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(remux, "_frame_at", spy)
+        report = reencode_media(
+            source, tmp_path / "x.mov", [Span(Fraction(0), Fraction(10**9))], muxer="mov"
+        )
+        assert report is not None
+        length = probe_media(source).duration
+        # 頭・真ん中・終わり近くの 3 か所を、素材の中で比べる
+        assert sorted(set(moments)) == [Fraction(0), length / 2, length * 9 / 10]
+
     def test_transparent_pictures_are_left_as_they_are(
         self, media_dir: Path, tmp_path: Path
     ) -> None:

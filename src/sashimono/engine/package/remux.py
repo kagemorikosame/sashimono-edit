@@ -31,6 +31,7 @@ import av
 import av.error
 import numpy as np
 
+from sashimono.core.model import MediaItem
 from sashimono.engine.decode.audio import AudioDecoder
 from sashimono.engine.decode.probe import ProbeError, media_origin, moving_pictures, probe_media
 from sashimono.engine.decode.rational import as_fraction
@@ -963,6 +964,25 @@ def _frame_at(
         return shown
 
 
+def _picture_end(item: MediaItem, index: int) -> Fraction:
+    """映像の道の終わり（秒 素材の頭から） 分からなければ素材全体の長さ"""
+    for stream in item.video_streams:
+        if stream.index == index and stream.end_time is not None:
+            return stream.end_time
+    return item.duration
+
+
+def _within(spans: list[Span], end: Fraction) -> list[Span]:
+    """差を測る所を決める区間 素材の終わりより後ろを切る（書く区間は変えない）
+
+    全体を入れるときの区間は素材より長い（10 億秒） そのまま測る所を決めると、真ん中も終わりも
+    素材の後ろを指して最後の絵どうしを比べ、途中の崩れに気付けない
+    """
+    if end <= 0:
+        return spans
+    return [Span(span.start, min(span.end, end)) for span in spans if span.start < end] or spans
+
+
 def _close_to_source(
     source: Path,
     target: Path,
@@ -999,6 +1019,10 @@ def _close_to_source(
             pixel_format = new.pixel_format
         elif (old.codec, old.pixel_format) != (new.codec, new.pixel_format):
             return None
+        elif not _same_pictures(source, target, old.index, spans, cancelled):
+            # 写しただけの映像の道も、キーフレームが区間の頭より後ろにあると頭の絵が欠ける
+            # 写す側（_same_as_source）と同じ確かめを通さないと、欠けたまま「し直した」と知らせる
+            return None
     worst = math.inf
     try:
         origin = Fraction(0)
@@ -1011,6 +1035,7 @@ def _close_to_source(
                 ):
                     # 区間の中の絵の時刻が 1 つでも違えば、作品の時刻が別の絵を指す・絵が抜ける
                     return None
+            for span in _within(spans, _picture_end(before, index)):
                 for point in _PSNR_POINTS:
                     moment = origin + span.start + (span.end - span.start) * point
                     shown = _frame_at(source, index, moment, cancelled)
