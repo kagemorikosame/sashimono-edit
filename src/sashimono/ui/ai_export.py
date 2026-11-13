@@ -33,7 +33,9 @@ from sashimono.core.io.atomic import Expected, copy_atomic
 from sashimono.core.model import Project
 from sashimono.core.userdirs import cache_root
 from sashimono.engine.encode import BitrateChoice, ExportError, ExportSettings
-from sashimono.engine.encode import export_project as run_export
+
+# 試験が差し替える名前は前のまま（書き出しの偽物を ``run_export`` へ当てる）
+from sashimono.engine.encode.export_job import export_anywhere as run_export
 
 __all__ = ["AssistantExport", "scratch_folder"]
 
@@ -69,12 +71,15 @@ class _Worker(QObject):
         check: Callable[[], Path],
         expect: Expected | None = None,
         match_bitrate: bool = False,
+        *,
+        separate_process: bool = False,
     ) -> None:
         super().__init__()
         self._project = project
         self._settings = settings
         #: 素材に合わせたビットレートをここ（書き出すスレッド）で求めるか 設定の値は上限
         self._match_bitrate = match_bitrate
+        self._separate_process = separate_process
         self._check = check
         self._expect = expect
         self._cancel = threading.Event()
@@ -169,6 +174,7 @@ class _Worker(QObject):
             run_export(
                 self._project,
                 replace(settings, path=scratch),
+                separate_process=self._separate_process,
                 progress=self.progressed.emit,
                 should_cancel=self._cancel.is_set,
                 notice=notes.append,
@@ -254,11 +260,13 @@ class AssistantExport(QObject):
         expect: Expected | None = None,
         *,
         match_bitrate: bool = False,
+        separate_process: bool = False,
     ) -> None:
         """書き出しを始める ``check`` は書き出し先を確かめ直す関数（終わったときに呼ぶ）
 
         ``match_bitrate`` なら、設定のビットレートを上限に、素材に合わせた値を書き出す
-        スレッドで求める
+        スレッドで求める ``separate_process`` は別のプロセスで書き出すか
+        （本人の設定 ``export_process`` #453）
         """
         if self.running:
             raise ToolError("書き出しがもう走っています")
@@ -270,7 +278,9 @@ class AssistantExport(QObject):
         self._message = ""
         self._started = time.monotonic()
         self._ended = 0.0
-        self._worker = _Worker(project, settings, check, expect, match_bitrate)
+        self._worker = _Worker(
+            project, settings, check, expect, match_bitrate, separate_process=separate_process
+        )
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

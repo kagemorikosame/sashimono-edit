@@ -82,7 +82,11 @@ class TestEachWriterHasItsOwnScratchFile:
         target = tmp_path / "preferences.json"
         write_atomic(target, "1")
         write_atomic(target, "2")
-        (first, _), (second, _) = scratch_names
+        # 前の試験が残した裏のスレッド（素材のサムネイルの控えなど）も Path.replace を通るので、
+        # この行き先の物だけを見る 全部を数えると、裏の書き込みが重なった回だけ落ちる
+        mine = [scratch for scratch, goal in scratch_names if goal == target.name]
+        assert len(mine) == 2
+        first, second = mine
         assert first != second
         for name in (first, second):
             match = _SCRATCH.fullmatch(name)

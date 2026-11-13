@@ -4,7 +4,7 @@
 打たれていない長さを見る 止まりが :attr:`StallWatch.threshold_ms` を超えたら、その場で
 全スレッドの Python の呼び出しの並び（:func:`sys._current_frames`）を写し、動き出した
 ところで、止まりの長さと、その間に走ったごみ集め（:data:`gc.callbacks`）の時間を添えて
-1 行ずつ書く
+1 行ずつ書く そのときのメモリ（作業セットとコミット）も添える
 
 止まった**最中に**写すのが要点 画面のスレッドのタイマーだけで測ると、遅れに気付くのは
 動き出した後で、そのときにはもう止めていた物が呼び出しの並びに残っていない
@@ -33,6 +33,7 @@ from types import FrameType
 from typing import Any
 
 from sashimono.core.userdirs import state_root
+from sashimono.memory_usage import MemoryUsage, process_memory
 
 __all__ = [
     "DEFAULT_THRESHOLD_MS",
@@ -100,6 +101,22 @@ class _Stall:
     samples: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _where(filename: str) -> str:
+    """呼び出しの並びに書くファイルの名前 本体の物は ``sashimono/ui/inspector/panel.py`` のように
+    置き場ごと
+
+    名前だけにすると、``ui/inspector/panel.py`` と ``ui/chat/panel.py`` のように同じ名前の
+    ファイルが見分けられず、記録を数える道具（``tools/stall_report.py``）が原因を取り違える
+    頭に ``sashimono/`` を付けるのは、本体の頭の ``app.py`` を標準の同じ名前の物と分けるため
+    外の部品（Qt や標準の物）は名前だけ 置き場まで書くと、本人の名前の入ったパスが残る
+    """
+    parts = Path(filename).parts
+    if "sashimono" in parts[:-1]:
+        last = len(parts) - 1 - parts[-2::-1].index("sashimono") - 1
+        return "/".join(parts[last:])
+    return Path(filename).name
+
+
 class StallWatch:
     """画面のスレッドの止まりを見張る
 
@@ -114,8 +131,10 @@ class StallWatch:
         threshold_ms: float = DEFAULT_THRESHOLD_MS,
         clock: Callable[[], float] = time.perf_counter,
         frames: Callable[[], Mapping[int, FrameType]] = sys._current_frames,
+        memory: Callable[[], MemoryUsage | None] = process_memory,
     ) -> None:
         self.path = path if path is not None else default_log_path()
+        self._memory = memory
         self.threshold_ms = threshold_ms
         self._clock = clock
         self._frames = frames
@@ -201,7 +220,7 @@ class StallWatch:
                 # 見張り自身の並びは毎回同じで、読む人の邪魔になる
                 continue
             lines = [
-                f"{Path(entry.filename).name}:{entry.lineno} {entry.name}"
+                f"{_where(entry.filename)}:{entry.lineno} {entry.name}"
                 for entry in traceback.extract_stack(frame, limit=STACK_DEPTH)
             ]
             # 名前で引く 同じ名前のスレッド（取り消して頼み直した読み込みの係など）が
@@ -218,13 +237,21 @@ class StallWatch:
             for finished, generation, length in history
             if stall.began <= finished <= ended
         ]
-        record = {
+        record: dict[str, Any] = {
             "time": datetime.now().isoformat(timespec="milliseconds"),
             "stall_ms": round((ended - stall.began) * 1000, 1),
             "threshold_ms": self.threshold_ms,
             "gc": pauses,
             "samples": stall.samples,
         }
+        # 止まりのたびのメモリ 記録を並べると、操作を続ける間に増え続けているか
+        # （ごみ集めを手で回す設定の副作用 #455）が読める
+        memory = self._memory()
+        if memory is not None:
+            record["memory_mb"] = {
+                "resident": round(memory.resident_mb, 1),
+                "private": None if memory.private_mb is None else round(memory.private_mb, 1),
+            }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.exists() and self.path.stat().st_size > MAX_LOG_BYTES:

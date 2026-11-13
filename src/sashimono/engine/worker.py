@@ -69,6 +69,9 @@ POLL_S = 0.1
 #: 子が進み具合を送る最短の間隔（秒） 1 コマごとに送ると、管の読み書きが変換より重くなる
 PROGRESS_INTERVAL_S = 0.1
 
+#: 子へ「途中の値を送る口を渡す」と伝える引数の名前 ``job`` の引数と重ならない名前にする
+_PUBLISH = "__sashimono_publish__"
+
 #: 起こした子を、閉じるときにまとめて止めるために覚えておく
 _LIVE: weakref.WeakSet[BaseProcess] = weakref.WeakSet()
 _LIVE_LOCK = threading.Lock()
@@ -111,13 +114,20 @@ def run_in_process[T](
     *,
     progress: Callable[[float], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    partial: Callable[[Any], None] | None = None,
     name: str = "sashimono-worker",
     start_timeout_s: float = START_TIMEOUT_S,
 ) -> T | None:
     """``job(progress=..., should_cancel=..., **kwargs)`` を別のプロセスで走らせて結果を返す
 
     やめたときは ``None`` 呼ぶ側のスレッドはほとんど眠って待つ（GIL を手放す）
+    ``partial`` を渡すと、``job`` は ``publish=`` も受け取る 子が ``publish(値)`` で送った
+    途中の値（pickle できる物）が、呼ぶ側のスレッドで ``partial(値)`` として届く
+    場面の解析で、読み終えた所までの並びを AI へ先に渡すのに使う（#321 #453）
+    送る間隔は ``job`` の側で決める 管の読み書きは仕事より重くなりうる
     """
+    if partial is not None:
+        kwargs = {**kwargs, _PUBLISH: True}
     context = _context()
     ends: list[_Channel] = []
     try:
@@ -143,7 +153,7 @@ def run_in_process[T](
     with _LIVE_LOCK:
         _LIVE.add(process)
     try:
-        return _wait(process, news_out, stop_in, progress, should_cancel, start_timeout_s)
+        return _wait(process, news_out, stop_in, progress, should_cancel, start_timeout_s, partial)
     finally:
         if process.is_alive():
             process.terminate()
@@ -161,6 +171,7 @@ def _wait[T](
     progress: Callable[[float], None] | None,
     should_cancel: Callable[[], bool] | None,
     start_timeout_s: float = START_TIMEOUT_S,
+    partial: Callable[[Any], None] | None = None,
 ) -> T | None:
     started = False
     stopping_since: float | None = None
@@ -206,6 +217,10 @@ def _wait[T](
         elif kind == "progress":
             if progress is not None:
                 progress(float(message[1]))
+        elif kind == "partial":
+            # やめると言った後に届いた途中の値は渡さない 呼ぶ側はもう結果を捨てている
+            if partial is not None and stopping_since is None:
+                partial(message[1])
         elif kind == "done":
             return None if stopping_since is not None else message[1]
         elif kind == "failed":
@@ -265,9 +280,12 @@ def _child_main(
         sent_at = now
         send(("progress", value))
 
+    extra: dict[str, Any] = {}
+    if kwargs.pop(_PUBLISH, False):
+        extra["publish"] = lambda value: send(("partial", value))
     send(("ready",))
     try:
-        result = job(progress=report, should_cancel=cancelled.is_set, **kwargs)
+        result = job(progress=report, should_cancel=cancelled.is_set, **kwargs, **extra)
     except BaseException as exc:  # 子の例外は親へ文で渡す 例外そのものは pickle できないことがある
         send(("failed", f"{type(exc).__name__}: {exc}"))
         return
@@ -298,6 +316,7 @@ def probe_job(
     fail: bool = False,
     wait_s: float = 0.0,
     crash: bool = False,
+    publish: Callable[[object], None] | None = None,
 ) -> str | None:
     """子が起きて仕事を受け、知らせを返せるかを確かめる小さな仕事
 
@@ -311,6 +330,9 @@ def probe_job(
         os._exit(3)
     for step in range(1, steps + 1):
         progress(step / steps)
+        if publish is not None:
+            # 途中の値の口（``partial``）を確かめる 進み具合と同じ数だけ送る
+            publish(f"{value} {step}")
     if fail:
         raise RuntimeError("頼まれた失敗")
     deadline = time.monotonic() + wait_s
