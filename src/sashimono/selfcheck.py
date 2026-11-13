@@ -90,6 +90,9 @@ def run_self_check() -> list[CheckResult]:
         ("同梱の絵（アイコン・ボタンの印）", _bundled_files, False),
         ("追加機能の導入（pip）", _pip, False),
         (WORKER_CHECK_NAME, _worker, False),
+        # 合否に混ぜない 子で GL を作れない機械（リモート接続・仮想の画面）では、書き出しは
+        # 自分でスレッドへ戻って書ける ここで分かるのは、戻る道を通る機械かどうか
+        (WORKER_EXPORT_CHECK_NAME, _worker_export, True),
         (UPDATE_CHECK_NAME, _update, False),
         # 最後に置く ほかの項目が Qt・FFmpeg・Lua の DLL を読み終えてから数えないと、
         # まだ読んでいない部品の分を見逃す
@@ -481,6 +484,49 @@ def _worker() -> str:
     if answer != "子が答えた" or not seen:
         raise RuntimeError(f"子から答えが返らなかった（{answer!r} 進み具合 {len(seen)} 回）")
     return f"{answer}（進み具合 {len(seen)} 回）"
+
+
+#: 別のプロセスで書き出す項目の名前（#453）
+WORKER_EXPORT_CHECK_NAME = "別のプロセスで書き出す"
+
+
+def _worker_export() -> str:
+    """書き出しの子が、この exe の中で GL を作って書き出せるか
+
+    子は自分で ``QGuiApplication`` と GL を作る 配る zip で Qt の画面の部品（platforms の
+    プラグイン）を子が見つけられないと、書き出しのたびにスレッドへ戻る（遅いが書ける）
+    """
+    import av
+
+    from sashimono.core.model import Project
+    from sashimono.engine.encode import ExportSettings
+    from sashimono.engine.encode.export_job import AviUtlRuntime, ExportOutcome, export_job
+    from sashimono.engine.worker import run_in_process
+
+    project = _sample_project()
+    assert isinstance(project, Project)
+    with tempfile.TemporaryDirectory(prefix="sashimono-check-") as folder:
+        target = Path(folder) / JAPANESE_FOLDER / "子の書き出し.mp4"
+        target.parent.mkdir()
+        outcome = run_in_process(
+            export_job,
+            {
+                "project": project,
+                "settings": ExportSettings(path=target, video_codec=CPU_CODEC),
+                "runtime": AviUtlRuntime.capture(),
+            },
+        )
+        if not isinstance(outcome, ExportOutcome):
+            raise RuntimeError(f"子から結果が返らなかった（{outcome!r}）")
+        # 子は書き出しの失敗を例外にせず結果で返す（互換性の記録を一緒に返すため）
+        # 見ないと、書けなかった子を通ったと数え、無いファイルを開いて訳の分からない文で落ちる
+        if outcome.error is not None:
+            raise RuntimeError(f"子が書き出せなかった: {outcome.error}")
+        with av.open(outcome.path) as container:
+            frames = sum(1 for _ in container.decode(video=0))
+    if frames != project.duration:
+        raise RuntimeError(f"子が書き出した動画が {frames} コマ（{project.duration} コマのはず）")
+    return f"子が {CPU_CODEC} で書き出して {frames} コマ読み戻せた"
 
 
 #: 自動更新の項目の名前 配る zip を組み立てる道具が、この項目が通ったかを見る
