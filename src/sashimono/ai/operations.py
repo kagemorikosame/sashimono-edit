@@ -11613,6 +11613,8 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         handler=_relink_media,
         sends=_WITH_FILES,
+        # 作品を書き換えるので結果からは作れない 読み込み（import_media）と同じく引数から作る
+        preview=from_arguments(),
         name_keys=frozenset({"name"}),
         writes=True,
     ),
