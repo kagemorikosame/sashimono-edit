@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from sashimono.core.commands import AddClip, Command, Document, TrimClip
-from sashimono.core.commands.insert import place_media
+from sashimono.core.commands.insert import place_media, place_media_spans
 from sashimono.core.commands.speed import ChangeSpeed
 from sashimono.core.io.serialize import load_project, project_from_dict, project_to_dict
 from sashimono.core.io.serialize import save_project as save
@@ -143,6 +143,27 @@ class TestRefusal:
         # 絵は 5 秒 音は 10.5〜15 秒 どちらも 5〜20 秒の中
         reach.execute(TrimClip(clip.id, tail_delta=-10))
 
+    @pytest.mark.parametrize(
+        ("kind", "allowed"), [(TrackKind.VIDEO, True), (TrackKind.AUDIO, False)]
+    )
+    def test_a_held_picture_can_be_stretched_unless_it_plays_sound(
+        self, kind: TrackKind, allowed: bool
+    ) -> None:
+        """止めた絵しか読まないクリップを延ばすのは範囲の中 音を鳴らすクリップは音が先へ読み進む"""
+        document, clip = _document((PackedSpan(Fraction(5), Fraction(6)),))
+        held = replace(clip, source_in=Fraction(5), hold_at=Fraction(5), duration=30)
+        track = Track(kind=kind, name="1", clips=(held,))
+        project = replace(
+            document.project, timeline=replace(document.project.timeline, tracks=(track,))
+        )
+        stretched = Document(project)
+        # 30 コマから 60 コマへ 読むのは絵なら 5 秒の 1 枚、音なら 5〜7 秒
+        if allowed:
+            stretched.execute(TrimClip(clip.id, tail_delta=30))
+        else:
+            with pytest.raises(ValueError, match="外を読む"):
+                stretched.execute(TrimClip(clip.id, tail_delta=30))
+
     def test_a_clip_already_outside_does_not_block_other_edits(self) -> None:
         """前の本体で外へ伸ばしたクリップがあるだけで、ほかの編集が全部断られると困る"""
         document, clip = _document()
@@ -186,6 +207,19 @@ class TestPlacing:
             assert clip.source_in == Fraction(30)
             # 切り捨てるので、丸めて区間の外へ 1 コマ出ない
             assert clip.source_out(RATE) <= Fraction(81, 2)
+
+    def test_a_span_asked_up_to_the_range_end_stays_inside(self) -> None:
+        """範囲と同じ区間を頼んで近い方へ丸めると 1 コマ外へ出て、範囲の中なのに断られる"""
+        end = Fraction(301, 50)  # 6.02 秒 30 fps で 30.6 コマぶん
+        document, _clip = _document((PackedSpan(Fraction(5), end),))
+        item = document.project.media[0]
+        commands = place_media_spans(document.project, item, [(Fraction(5), end)], at_frame=300)
+        with document.checkpoint("置く"):
+            for command in commands:
+                document.execute(command)
+        placed = [c.clip for c in commands if isinstance(c, AddClip) and c.clip.media_id == item.id]
+        assert placed
+        assert all(clip.source_out(RATE) <= end for clip in placed)
 
 
 class TestSaving:

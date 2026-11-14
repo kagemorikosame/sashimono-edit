@@ -22,6 +22,7 @@ from sashimono.core.model import (
     Project,
     Stroke,
     Timeline,
+    Track,
 )
 from sashimono.core.packed import read_window
 from sashimono.effects import registry
@@ -78,12 +79,12 @@ def _timelines(project: Project) -> Iterator[Timeline]:
         yield scene.timeline
 
 
-def _clips(project: Project) -> Iterator[tuple[Timeline, Clip]]:
-    """作品のクリップすべてと、その時間軸"""
+def _clips(project: Project) -> Iterator[tuple[Timeline, Track, Clip]]:
+    """作品のクリップすべてと、その時間軸とトラック"""
     for timeline in _timelines(project):
         for track in timeline.tracks:
             for clip in track.clips:
-                yield timeline, clip
+                yield timeline, track, clip
 
 
 def _all_effects(project: Project) -> Iterator[Effect]:
@@ -101,7 +102,7 @@ def _all_effects(project: Project) -> Iterator[Effect]:
 
 def _sources(project: Project) -> Iterator[GeneratedSource]:
     """作品の生成物（テキスト・図形など）すべて"""
-    for _timeline, clip in _clips(project):
+    for _timeline, _track, clip in _clips(project):
         if clip.source is not None:
             yield clip.source
 
@@ -132,7 +133,7 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
     """
     by_id = {item.id: item for item in project.media}
     found: dict[MediaId, list[Span] | None] = {}
-    for timeline, clip in _clips(project):
+    for timeline, track, clip in _clips(project):
         if clip.media_id is None or clip.media_id not in by_id:
             continue
         item = by_id[clip.media_id]
@@ -143,7 +144,11 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
         # 音の読む所の和を入れる（#449 の Codex の指摘） 数え方は開いた先で範囲の外を断る確かめ
         # （#445）と 1 つにする ずれると、入れていない所を読む編集が断られずに通る
         start, end = read_window(
-            clip, timeline, history=history_seconds, sample_rate=project.settings.sample_rate
+            clip,
+            timeline,
+            sounds=project.plays_sound(track, clip),
+            history=history_seconds,
+            sample_rate=project.settings.sample_rate,
         )
         start = max(Fraction(0), start - margin)
         end = end + margin

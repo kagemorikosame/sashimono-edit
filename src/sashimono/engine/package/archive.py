@@ -505,6 +505,15 @@ def _packed_spans(item: MediaItem, spans: list[Span]) -> tuple[PackedSpan, ...]:
             start, end = max(span.start, earlier.start), min(span.end, earlier.end)
             if start <= end:
                 found.append(PackedSpan(start, end))
+    if not found:
+        # 空のままにすると「範囲の無い素材（全体がある）」と読まれ、開いた先で範囲の外の編集が
+        # 通る 前の範囲の外を読むクリップを残したまま持ち出し直したときに起きる
+        name = item.display_name or Path(item.path).name
+        raise PackageError(
+            f"「{name}」の使う区間が、前の持ち出し用パッケージに"
+            "入っている範囲と重なりません 範囲の外を使うクリップを直すか、元の素材へ付け替えてから"
+            "書き出してください"
+        )
     return tuple(found)
 
 
@@ -893,8 +902,9 @@ def open_package(
                     + "、".join(folders[:10])
                 )
             project_path = work / f"{_safe_folder_name(project.name)}{SUFFIX}"
-            # 置き換えた後の場所で書く（展開した素材を指す） 書くのは仮のフォルダの中
-            save_project(project, project_path)
+            # 置き換えた後の場所で書く（展開した素材を指す） 書くのは仮のフォルダの中だが、
+            # 相対の場所は動かした先から数える（名前を変えて別の PC へ移しても素材を見つける）
+            save_project(project, project_path, relative_to=folder)
             work.rename(folder)
         except BaseException:
             shutil.rmtree(work, ignore_errors=True)

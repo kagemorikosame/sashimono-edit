@@ -1099,7 +1099,12 @@ def _scene_from_json(raw: object) -> Scene:
 
 
 def save_project(
-    project: Project, path: Path, *, expect: Expected | None = None, relative: bool = True
+    project: Project,
+    path: Path,
+    *,
+    expect: Expected | None = None,
+    relative: bool = True,
+    relative_to: Path | None = None,
 ) -> None:
     """プロジェクトをファイルへ書き出す
 
@@ -1109,10 +1114,13 @@ def save_project(
     （AI の保存が、許した後に書く先が変わっていないかを照らす #327）
     ``relative`` が真なら素材の相対の場所も書く（#447） 作品と関係の無い場所へ書く物
     （自動の退避）は偽 退避のフォルダから数えた場所は、開き直したときに別の物を指しうる
+    relative_to は相対の場所を数えるフォルダ 省けば書く先のフォルダ 仮のフォルダへ書いて
+    から動かす物（パッケージの展開）は動かした先を渡す 仮のフォルダから数えると
+    ../作品/media/… になり、展開したフォルダの名前を変えると素材を見失う
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    base = path.parent.resolve() if relative else None
+    base = (relative_to or path.parent).resolve() if relative else None
     write_atomic(path, json_text(project_to_dict(project, base=base)), durable=True, expect=expect)
 
 

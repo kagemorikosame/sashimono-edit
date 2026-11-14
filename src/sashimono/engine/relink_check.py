@@ -52,6 +52,16 @@ def _compare(item: MediaItem, path: Path) -> tuple[bool, str | None]:
     # デコーダは見つからない番号を頭の道へ置き換えるので、黙って別の音が鳴る
     if [s.index for s in found.video_streams] != [s.index for s in item.video_streams]:
         reasons.append("映像の道の番号が作品の覚えている物と違います")
+    else:
+        # 付け替えても作品は覚えている大きさのまま描く 縦の映像を横の枠へ描くと引き伸ばされる
+        for new, old in zip(found.video_streams, item.video_streams, strict=True):
+            if (new.width, new.height, new.rotation) != (old.width, old.height, old.rotation):
+                reasons.append(
+                    f"映像の大きさか向きが違います（作品では {old.width}x{old.height} "
+                    f"回転 {old.rotation} 度、選んだ物は {new.width}x{new.height} "
+                    f"回転 {new.rotation} 度）"
+                )
+                break
     if [s.index for s in found.audio_streams] != [s.index for s in item.audio_streams]:
         reasons.append("音声の道の番号が作品の覚えている物と違います")
     return True, " ".join(reasons) or None

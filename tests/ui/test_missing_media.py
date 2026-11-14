@@ -146,6 +146,17 @@ def test_other_stream_numbers_are_questioned(sample_av: SampleMedia) -> None:
     assert reason is not None and "音声の道の番号" in reason
 
 
+def test_a_picture_of_another_shape_is_questioned(sample_av: SampleMedia) -> None:
+    """作品は覚えている大きさのまま描くので、縦の映像へ付け替えると横の枠へ引き伸ばされる"""
+    item = probe_media(sample_av.path)
+    video = tuple(
+        replace(stream, width=stream.height, height=stream.width) for stream in item.video_streams
+    )
+    reason = differs(replace(item, video_streams=video), sample_av.path)
+    assert reason is not None and "大きさか向き" in reason
+    assert differs(item, sample_av.path) is None
+
+
 def test_an_unreadable_file_is_refused_even_when_forced(
     window: MainWindow, moved: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -31,6 +31,7 @@ def read_window(
     clip: Clip,
     timeline: Timeline,
     *,
+    sounds: bool = True,
     history: HistoryReader | None = None,
     sample_rate: int = 48000,
 ) -> tuple[Fraction, Fraction]:
@@ -38,6 +39,8 @@ def read_window(
 
     絵を止める時刻（``hold_at``）が頭より前なら、そこも読む 音は頭から長さの分を読み続ける
     前の音を読むエフェクト（リバーブ・ディレイ）は頭より前も読む（``history``）
+    ``sounds`` はクリップが音を鳴らすか（:meth:`Project.plays_sound`）
+    鳴らさなければ止めた絵の後ろは読まない
     パッケージの書き出しが入れる範囲 :func:`~sashimono.engine.package.plan.media_spans` と同じ数え方
     ずれると、展開した先でディレイを長くしても断られず、響きの頭が無音になる
     """
@@ -49,9 +52,14 @@ def read_window(
             start = max(Fraction(0), start - lookback * clip.speed)
     # 前の音は頭（source_in）から数える hold_at は絵だけを止めるので、そこから引くと
     # 止めた絵より前の要らない音まで読むことになり、入っている範囲の中の編集まで断る
+    end = clip.source_out(timeline.rate)
     if clip.hold_at is not None:
         start = min(start, clip.hold_at)
-    return start, clip.source_out(timeline.rate)
+        if not sounds:
+            # 音を鳴らさない（sounds が偽）クリップは止めた絵より後ろを読まない 終わりまで数えると、
+            # 範囲だけの静止した絵を延ばすのも断る 鳴らすクリップは音が止めた後も読み進む
+            end = min(end, clip.hold_at)
+    return start, end
 
 
 def outside_packed(
@@ -69,7 +77,11 @@ def outside_packed(
                 if item is None:
                     continue
                 start, end = read_window(
-                    clip, timeline, history=history, sample_rate=project.settings.sample_rate
+                    clip,
+                    timeline,
+                    sounds=project.plays_sound(track, clip),
+                    history=history,
+                    sample_rate=project.settings.sample_rate,
                 )
                 if not item.covers(start, end):
                     found[clip.id] = (item, start, end)

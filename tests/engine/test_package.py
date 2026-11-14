@@ -370,8 +370,14 @@ class TestPlan:
         """絵を止めても音は長さの分だけ読み続ける 止めた時刻で切ると持ち出した先で音が欠ける"""
         item = probe_media(_video(media_dir))
         clip = replace(_clip(item, 0, 90, Fraction(1)), hold_at=Fraction(3, 2))
-        found = media_spans(_project([item], [clip]), Fraction(0))[item.id]
+        project = _project([item], [clip])
+        sounding = Track(kind=TrackKind.AUDIO, name="音声 1", clips=(clip,))
+        project = replace(project, timeline=replace(project.timeline, tracks=(sounding,)))
+        found = media_spans(project, Fraction(0))[item.id]
         assert found is not None and found[0].start == 1 and found[-1].end >= 3
+        # 音を鳴らさない映像のトラックでは、止めた絵より後ろは要らない
+        quiet = media_spans(_project([item], [clip]), Fraction(0))[item.id]
+        assert quiet is not None and quiet[-1].end == Fraction(3, 2)
 
     def test_fonts_and_scripts_are_listed(self, media_dir: Path) -> None:
         """書体と配布物のスクリプトは入れない 一覧に出ないと、開いた人が何が足りないかを知れない"""
@@ -433,6 +439,36 @@ class TestRoundTrip:
                 if name.endswith((".sme", ".json")):
                     assert str(item.path.parent) not in zipped.read(name).decode("utf-8")
             assert all(info.compress_type == zipfile.ZIP_STORED for info in zipped.infolist())
+
+    def test_spans_outside_the_earlier_range_are_refused(self) -> None:
+        """重なりが無いのに空の範囲で書くと、全体がある素材と読まれて範囲の外の編集が通る"""
+        item = MediaItem(
+            path=Path("D:/展開/media/0001.mp4"),
+            duration=Fraction(60),
+            packed=(PackedSpan(Fraction(10), Fraction(20)),),
+        )
+        with pytest.raises(PackageError, match="重なりません"):
+            archive._packed_spans(item, [Span(Fraction(30), Fraction(40))])
+        assert archive._packed_spans(item, [Span(Fraction(15), Fraction(25))]) == (
+            PackedSpan(Fraction(15), Fraction(20)),
+        )
+
+    def test_a_renamed_folder_still_finds_its_media(self, media_dir: Path, tmp_path: Path) -> None:
+        """仮のフォルダから相対の場所を数えると ../作品/media/… になり、名前を変えると見失う"""
+        item = probe_media(_video(media_dir))
+        package = tmp_path / f"p{PACKAGE_SUFFIX}"
+        write_package(
+            _project([item], [_clip(item, 0, 30, Fraction(1))]),
+            package,
+            PackOptions(),
+            scratch=tmp_path / "s",
+        )
+        opened = open_package(package, tmp_path / "opened")
+        renamed = opened.folder.with_name("名前を変えた")
+        opened.folder.rename(renamed)
+        again = load_project(renamed / opened.project_path.name)
+        assert again.media[0].path.is_file()
+        assert again.media[0].path.is_relative_to(renamed.resolve())
 
     def test_an_unused_media_does_not_block_opening(self, media_dir: Path, tmp_path: Path) -> None:
         """素材一覧に使っていない素材があるだけで開けないと、書き出せたのに渡した先で開けない"""
