@@ -175,6 +175,12 @@ class TestReencode:
         for old, new in zip(_frames(source, moments), _frames(target, moments), strict=True):
             assert old.pts == new.pts
             assert frame_psnr(old, new) >= REENCODE_LEAST_PSNR
+            # 範囲と色の行列の印も元のまま（範囲の「決まっていない」は YUV ではテレビの範囲）
+            assert (new.color_range or 1, new.colorspace) == (old.color_range or 1, old.colorspace)
+        # 前後の絵を使って縮めている 解いた絵の I の型を残すと全部がキーフレームになる
+        with av.open(str(target)) as reader:
+            keys = [packet.is_keyframe for packet in reader.demux(reader.streams.video[0])]
+        assert keys.count(False) > keys.count(True)
         # 色の深さと色差の間引きは元のまま（10bit 4:2:2 を 8bit 4:2:0 に落とさない）
         depth = {"prores.mov": "yuv422p10le", "dnxhr.mov": "yuv422p", "raw.mov": "yuv422p"}
         assert probe_media(target).video_streams[0].pixel_format == depth[name]

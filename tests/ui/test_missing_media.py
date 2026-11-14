@@ -157,6 +157,14 @@ def test_a_picture_of_another_shape_is_questioned(sample_av: SampleMedia) -> Non
     assert differs(item, sample_av.path) is None
 
 
+def test_a_still_picture_and_a_short_movie_are_questioned(sample_av: SampleMedia) -> None:
+    """長さの差は許す幅に収まっても、作品は静止画の長さ（0）を残すので動画が最初の絵で止まる"""
+    item = probe_media(sample_av.path)
+    still = replace(item, duration=Fraction(0), audio_streams=())
+    reason = differs(still, sample_av.path)
+    assert reason is not None and "静止画と動画" in reason
+
+
 def test_an_unreadable_file_is_refused_even_when_forced(
     window: MainWindow, moved: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -188,6 +196,19 @@ def test_a_packed_media_can_be_relinked_from_the_menu(
     assert dialog is not None and dialog.isVisible()
     assert dialog._list.count() == 1
     assert "範囲だけ" in dialog._summary.text()
+
+
+def test_packed_seconds_are_rounded_inward(
+    window: MainWindow, sample_av: SampleMedia, tmp_path: Path
+) -> None:
+    """四捨五入すると 1/30 秒の頭が 0.033 になり、AI がそのまま使うと範囲の外として断られる"""
+    span = PackedSpan(Fraction(1, 30), Fraction(2, 3))
+    item = replace(probe_media(sample_av.path), packed=(span,))
+    window._adopt_opened(
+        Project.create(media=(item,), name="範囲だけ"), tmp_path / "展開.sme", notice=False
+    )
+    [row] = call_tool(window, "list_media", {})["media"]
+    assert row["packed_seconds"] == [[0.034, 0.666]]
 
 
 def test_an_old_list_does_not_stay_after_opening_another_project(

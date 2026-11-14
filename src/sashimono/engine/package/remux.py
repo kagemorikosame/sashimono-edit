@@ -237,7 +237,7 @@ def _write(
             encoders: dict[int, _Encoder] = {}
             for stream in kept:
                 if stream.index in reencode:
-                    encoder = _Encoder.open(writer, stream)
+                    encoder = _Encoder.open(writer, stream, _first_picture(source, stream.index))
                     if encoder is None:
                         return False
                     encoders[stream.index] = encoder
@@ -747,6 +747,43 @@ def _x264_format(name: str) -> str | None:
     return f"yuv{chroma}p" + ("10le" if deep else "")
 
 
+#: 範囲の印のテレビの範囲（FFmpeg の AVCOL_RANGE_MPEG）
+_TV_RANGE = 1
+
+
+def _copy_colors(encoder: Any, frame: Any) -> None:
+    """``encoder`` の決まっていない色の印を ``frame`` から写す
+
+    ProRes は範囲（テレビの範囲）を道でなく絵ごとに持つ 書かずに開くと、開いた先の読み手が
+    範囲を推し直して色が浅く・濃くずれる（試験の素材で RGB の PSNR が 36 dB に落ちた）
+    """
+    for name in ("color_range", "colorspace", "color_primaries", "color_trc"):
+        if not getattr(encoder, name, None) and getattr(frame, name, None):
+            with contextlib.suppress(AttributeError, ValueError, TypeError):
+                setattr(encoder, name, getattr(frame, name))
+
+
+def _color_marks(frame: Any) -> tuple[int, int]:
+    """絵の範囲と色の行列の印 範囲の「決まっていない」はテレビの範囲に数える
+
+    YUV の読み手は範囲が無ければテレビの範囲で読む x264 はテレビの範囲を流れに書かないので、
+    そのまま比べると、元が「テレビ」と書いた ProRes を同じ色で写しても違うと見る
+    """
+    return int(frame.color_range) or _TV_RANGE, int(frame.colorspace)
+
+
+def _first_picture(path: Path, index: int) -> Any | None:
+    """``index`` の映像の道の最初の絵 読めなければ ``None``（色の印は道の値だけで開く）"""
+    try:
+        with av.open(str(path)) as reader:
+            stream = reader.streams[index]
+            for frame in reader.decode(stream):
+                return frame
+    except (av.error.FFmpegError, OSError, IndexError):
+        return None
+    return None
+
+
 class _Encoder:
     """映像の道 1 本を解いて H.264 にし直す 時刻（PTS）は元の道の時間の単位のまま渡す"""
 
@@ -761,8 +798,11 @@ class _Encoder:
         self.wrote_bytes = 0
 
     @classmethod
-    def open(cls, writer: Any, source: Any) -> _Encoder | None:
-        """書き手に符号の道を足す 寄せられない画素の形なら ``None``"""
+    def open(cls, writer: Any, source: Any, first: Any | None = None) -> _Encoder | None:
+        """書き手に符号の道を足す 寄せられない画素の形なら ``None``
+
+        ``first`` は元の道の最初の絵 道に書いていない色の印をここから取る
+        """
         context = source.codec_context
         pixel_format = _x264_format(str(context.pix_fmt or ""))
         if pixel_format is None or not context.width or not context.height:
@@ -792,6 +832,10 @@ class _Encoder:
         encoder.color_trc = context.color_trc
         encoder.colorspace = context.colorspace
         encoder.color_range = context.color_range
+        # 最初の絵を符号にする時を待って印を取ると、先に音の錨を書いたときに書き手がその前に
+        # 符号の作り手を開いて頭書きを書き、印が入らない 開く前に別に読んだ最初の絵から取る
+        if first is not None:
+            _copy_colors(encoder, first)
         return cls(stream, source, pixel_format)
 
     def push(self, packet: Any, writer: Any) -> None:
@@ -809,22 +853,17 @@ class _Encoder:
         self._last_pts = frame.pts
         picture = frame.reformat(format=self._pixel_format)
         picture.pts = frame.pts
+        # ProRes などの絵はどれも I として解ける 型を残すと x264 が全部を I で符号にし、
+        # 前後の絵を使った縮めが効かない（大きさの確かめは全部 I でも通ることがある）
+        picture.pict_type = av.video.frame.PictureType.NONE
         picture.time_base = self._source.time_base
         for out in self.stream.encode(picture):
             self.wrote_bytes += out.size
             writer.mux(out)
 
     def _take_colors(self, frame: Any) -> None:
-        """道に書いていない色の印を、最初の絵から取る（符号の作り手は最初の絵で開く）
-
-        ProRes は範囲（テレビの範囲）を道でなく絵ごとに持つ 書かずに開くと、開いた先の読み手が
-        範囲を推し直して色が浅く・濃くずれる（試験の素材で RGB の PSNR が 36 dB に落ちた）
-        """
-        encoder = self.stream.codec_context
-        for name in ("color_range", "colorspace", "color_primaries", "color_trc"):
-            if not getattr(encoder, name, None) and getattr(frame, name, None):
-                with contextlib.suppress(AttributeError, ValueError, TypeError):
-                    setattr(encoder, name, getattr(frame, name))
+        """道に書いていない色の印を、最初の絵から取る（符号の作り手は最初の絵で開く）"""
+        _copy_colors(self.stream.codec_context, frame)
 
     def finish(self, writer: Any) -> None:
         """解き手と符号の作り手に残った物を出し切る"""
@@ -1043,6 +1082,9 @@ def _close_to_source(
                     if shown is None and made is None:
                         continue
                     if shown is None or made is None or shown.pts != made.pts:
+                        return None
+                    # 画素が近くても範囲と色の行列の印が違えば、開いた先の読み手が別の色に直す
+                    if _color_marks(shown) != _color_marks(made):
                         return None
                     worst = min(worst, frame_psnr(shown, made))
     except (av.error.FFmpegError, OSError, ValueError):

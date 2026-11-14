@@ -147,6 +147,7 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
             clip,
             timeline,
             sounds=project.plays_sound(track, clip),
+            draws=project.draws_picture(track, clip),
             history=history_seconds,
             sample_rate=project.settings.sample_rate,
         )

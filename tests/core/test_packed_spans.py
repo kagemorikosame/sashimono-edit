@@ -120,22 +120,49 @@ class TestRefusal:
             document.execute(_Slip(clip.id, Fraction(30)))
         document.execute(_Slip(clip.id, Fraction(15)))
 
-    def test_sound_read_before_the_head_is_checked_too(self) -> None:
+    @pytest.mark.parametrize(
+        ("kind", "refused"), [(TrackKind.AUDIO, True), (TrackKind.VIDEO, False)]
+    )
+    def test_sound_read_before_the_head_is_checked_too(
+        self, kind: TrackKind, refused: bool
+    ) -> None:
         """リバーブやディレイは頭より前の音も読む 書き出しはそこも入れるので、確かめも同じに数える
-        数えないと、展開した先でずらしても断られず、響きの頭が無音になる"""
+        数えないと、展開した先でずらしても断られず、響きの頭が無音になる
+        映像トラックの動画は音を鳴らさないので、前の音も読まない"""
         document, clip = _document()
-        reach = Document(document.project, sound_history=lambda _c, _r, _s: 1.5)
-        # 頭は 11 秒 読むのは 9.5 秒から（入っているのは 10 秒から）
-        with pytest.raises(ValueError, match="外を読む"):
+        track = document.project.timeline.tracks[0]
+        project = replace(
+            document.project,
+            timeline=replace(document.project.timeline, tracks=(replace(track, kind=kind),)),
+        )
+        reach = Document(project, sound_history=lambda _c, _r, _s: 1.5)
+        # 頭は 11 秒 鳴らすなら読むのは 9.5 秒から（入っているのは 10 秒から）
+        if refused:
+            with pytest.raises(ValueError, match="外を読む"):
+                reach.execute(_Slip(clip.id, Fraction(11)))
+        else:
             reach.execute(_Slip(clip.id, Fraction(11)))
         # 頭より前を読まないクリップは同じずらし方で通る
-        document.execute(_Slip(clip.id, Fraction(11)))
+        Document(project).execute(_Slip(clip.id, Fraction(11)))
+
+    def test_a_sound_clip_ignores_the_held_picture(self) -> None:
+        """hold_at は絵だけに効く 音声トラックのクリップで止める時刻まで広げると、範囲の中で
+        読む音まで断る"""
+        document, clip = _document()
+        held = replace(clip, hold_at=Fraction(5))
+        track = Track(kind=TrackKind.AUDIO, name="音声 1", clips=(held,))
+        project = replace(
+            document.project, timeline=replace(document.project.timeline, tracks=(track,))
+        )
+        # 読むのは 12〜15 秒の音だけ 5 秒の絵は描かない
+        Document(project).execute(TrimClip(clip.id, tail_delta=-10))
 
     def test_sound_history_counts_from_the_head_not_the_held_picture(self) -> None:
         """止める絵（hold_at）は絵だけ 前の音をそこから引くと、範囲の中の編集まで断る"""
         document, clip = _document((PackedSpan(Fraction(5), Fraction(20)),))
-        held = replace(clip, hold_at=Fraction(5))
-        track = document.project.timeline.tracks[0].with_clips((held,))
+        # 混合トラックで音も鳴らすクリップ 絵は止めた所を、音は頭から読む
+        held = replace(clip, hold_at=Fraction(5), audio_stream=1)
+        track = Track(kind=TrackKind.MIXED, name="混合 1", clips=(held,))
         project = replace(
             document.project, timeline=replace(document.project.timeline, tracks=(track,))
         )

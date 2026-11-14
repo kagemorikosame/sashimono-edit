@@ -1239,11 +1239,12 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
             # フォルダは 1 件ごとに待つので、全部を確かめると一覧の返事が止まる
             "missing": not Path(item.path).is_file(),
             # 持ち出し用パッケージで範囲だけを入れた素材の、入っている区間（秒 #445）
-            # 外を読む編集は断られるので、AI は先にここで読める所を知る
+            # 外を読む編集は断られるので、AI は先にここで読める所を知る 頭は切り上げ、終わりは
+            # 切り捨てて内側に丸める 四捨五入だと 1/30 秒の頭が 0.033 になり、そのまま使うと断られる
             **(
                 {
                     "packed_seconds": [
-                        [round(float(span.start), 3), round(float(span.end), 3)]
+                        [math.ceil(span.start * 1000) / 1000, math.floor(span.end * 1000) / 1000]
                         for span in item.packed
                     ]
                 }

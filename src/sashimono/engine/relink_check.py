@@ -33,7 +33,15 @@ def _compare(item: MediaItem, path: Path) -> tuple[bool, str | None]:
     except (ProbeError, OSError) as exc:
         return False, f"{UNREADABLE}（{exc}）"
     reasons = []
-    if abs(found.duration - item.duration) > LENGTH_TOLERANCE:
+    # 静止画と短い動画は長さの差が許す幅に収まる 付け替えは作品の覚えている長さ（0）を残すので、
+    # 選んだ動画も静止画として扱われ、最初の絵しか映らない
+    if found.is_still != item.is_still:
+        reasons.append(
+            "静止画と動画が違います（作品では "
+            f"{'静止画' if item.is_still else '動画'}、選んだ物は "
+            f"{'静止画' if found.is_still else '動画'}）"
+        )
+    elif abs(found.duration - item.duration) > LENGTH_TOLERANCE:
         reasons.append(
             f"長さが違います（作品では {float(item.duration):.1f} 秒、"
             f"選んだ物は {float(found.duration):.1f} 秒）"

@@ -362,9 +362,15 @@ class TestPlan:
         item = probe_media(_video(media_dir))
         clip = _clip(item, 0, 30, Fraction(5))
         reverb = Effect(kind="audio_reverb", params={"decay": AnimatedValue(static=2.0)})
-        project = _project([item], [replace(clip, effects=(reverb,))])
+        reverbed = replace(clip, effects=(reverb,))
+        sounding = Track(kind=TrackKind.AUDIO, name="音声 1", clips=(reverbed,))
+        project = _project([item], [])
+        project = replace(project, timeline=replace(project.timeline, tracks=(sounding,)))
         found = media_spans(project, Fraction(0))[item.id]
         assert found is not None and found[0].start <= 3
+        # 映像トラックの動画は音を鳴らさないので、前の音も要らない
+        quiet = media_spans(_project([item], [reverbed]), Fraction(0))[item.id]
+        assert quiet is not None and quiet[0].start == 5
 
     def test_a_held_picture_still_keeps_its_sound(self, media_dir: Path) -> None:
         """絵を止めても音は長さの分だけ読み続ける 止めた時刻で切ると持ち出した先で音が欠ける"""
