@@ -230,6 +230,9 @@ LEDGER: tuple[Entry, ...] = (
         "open_package",
         safety=Safety.IRREVERSIBLE,
     ),
+    # 見つからない素材の探し直し（#447） 人は窓でファイルを選び、AI は場所を渡す 違う素材に
+    # 見えたときは、人には窓で尋ね、AI には訳を返して force で頼み直させる
+    same("メニュー/ファイル/見つからない素材を探し直す…", "relink_media"),
     hidden("メニュー/ファイル/バックアップのフォルダを開く", _OUTSIDE),
     same(
         "メニュー/ファイル/プロジェクト設定…",

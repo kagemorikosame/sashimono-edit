@@ -98,6 +98,8 @@ NOT_FOR_THE_CHILD = frozenset(
         "playhead_snap_work_area",
         "playhead_snap_markers",
         "theme",
+        # 作品を開くときに素材を探す順 子は場所を決め終えた作品をそのまま受け取る
+        "media_relative_first",
         # 編集の時に作品へ書き込む物 書き込んだ結果は作品ごと子へ渡る
         "match_video",
         "preset_with_text",

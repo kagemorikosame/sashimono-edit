@@ -334,6 +334,7 @@ from sashimono.core.reframe import (
     REFRAME_SMOOTH_MS_RANGE,
     ReframeError,
 )
+from sashimono.core.relink import RelinkMedia, missing_media
 from sashimono.core.seams import (
     SEAM_AUDIO_FADE_MS_RANGE,
     SEAM_CROSSFADE,
@@ -492,6 +493,7 @@ from sashimono.engine.highlights import LOUD as HIGHLIGHT_LOUD
 from sashimono.engine.highlights import MOTION as HIGHLIGHT_MOTION
 from sashimono.engine.highlights import SIGNALS as HIGHLIGHT_SIGNALS
 from sashimono.engine.package.archive import PACKAGE_SUFFIX, RIGHTS_NOTE
+from sashimono.engine.package.plan import REENCODE_NOTE, editing_media
 from sashimono.engine.reframe import (
     FaceSummary,
     GatheredFaces,
@@ -503,6 +505,7 @@ from sashimono.engine.reframe import (
     plan_reframe,
     tracked_media,
 )
+from sashimono.engine.relink_check import plan_relink
 from sashimono.engine.scenes import DEFAULT_MIN_SCENE, DEFAULT_THRESHOLD, SceneSignal
 from sashimono.engine.vision import ScreenKind, ScreenReport, ocr_of
 
@@ -1214,8 +1217,9 @@ def _work_area(project: Project) -> dict[str, Any] | None:
 def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
     wanted = str(arguments.get("contains") or "")
-    rows = [
-        {
+
+    def row(item: MediaItem) -> dict[str, Any]:
+        return {
             "media_id": str(item.id),
             "name": item.name,
             "path": str(item.path),
@@ -1230,10 +1234,27 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
                 str(number): len(item.transcript_for(stream.index) or ())
                 for number, stream in enumerate(item.audio_streams, start=1)
             },
+            # 素材のファイルが無い（別の PC へ移した作品 #447） 絵は映らず音は無音になる
+            # relink_media で付け替えられる 確かめは返すページの分だけ（_RowsOf） 切れた共有の
+            # フォルダは 1 件ごとに待つので、全部を確かめると一覧の返事が止まる
+            "missing": not Path(item.path).is_file(),
+            # 持ち出し用パッケージで範囲だけを入れた素材の、入っている区間（秒 #445）
+            # 外を読む編集は断られるので、AI は先にここで読める所を知る 頭は切り上げ、終わりは
+            # 切り捨てて内側に丸める 四捨五入だと 1/30 秒の頭が 0.033 になり、そのまま使うと断られる
+            **(
+                {
+                    "packed_seconds": [
+                        [math.ceil(span.start * 1000) / 1000, math.floor(span.end * 1000) / 1000]
+                        for span in item.packed
+                    ]
+                }
+                if item.packed
+                else {}
+            ),
         }
-        for item in project.media
-        if not wanted or wanted in item.name
-    ]
+
+    matched = [item for item in project.media if not wanted or wanted in item.name]
+    rows = _RowsOf(matched, row)
     return _paged(rows, arguments, name="media")
 
 
@@ -4835,6 +4856,44 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
 
     host.apply_commands(commands, f"素材を読み込み: {len(paths)} 件")
     return {"imported": added}
+
+
+def _relink_media(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """見つからない素材のファイルを付け替える（画面の〔見つからない素材を探し直す…〕と同じ #447）"""
+    project = host.document.project
+    item = _require_media(project, str(arguments.get("media_id", "")))
+    raw = arguments.get("path")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolError("path に付け替える先のファイルの場所を渡してください")
+    chosen = Path(raw)
+    if not chosen.is_file():
+        raise ToolError(f"ファイルがありません: {chosen}")
+    force = _package_flag(arguments, "force")
+    search = arguments.get("search_others", True)
+    if not isinstance(search, bool):
+        raise ToolError("search_others は true か false で渡してください")
+    plan = plan_relink(project, item.id, chosen, search=search)
+    if not plan.readable:
+        # 読めないファイルは force でも付け替えない 付け替えても絵も音も出ず、映らない理由が
+        # 「見つからない」から「読めない」へ変わるだけで、人は何が起きたか分からない
+        raise ToolError(f"選んだファイルは付け替えられません: {plan.concern}")
+    if plan.concern is not None and not force:
+        # 画面の窓は人に尋ねる所 AI は黙って付け替えず、訳を返して人に確かめさせる
+        raise ToolError(
+            f"選んだファイルは作品の覚えている素材と違うようです: {plan.concern}"
+            " クリップの時刻が別の絵を指すことがあるので付け替えていません ユーザーに確かめて、"
+            "それでもよければ force を true にして頼み直してください"
+        )
+    by_id = {media.id: media for media in project.media}
+    host.apply_commands([RelinkMedia(plan.changes)], f"素材を付け替える: {item.name}")
+    return {
+        "relinked": [
+            {"media_id": str(media_id), "name": by_id[media_id].name, "path": str(place)}
+            for media_id, place in plan.changes
+        ],
+        "skipped": [{"name": name, "reason": reason} for name, reason in plan.skipped],
+        "still_missing": len(missing_media(host.document.project)),
+    }
 
 
 def _add_track(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -9126,10 +9185,21 @@ def _open_project(host: EditorHost, arguments: dict[str, Any], consent: Consent)
     # 別の場所を指す（実行の前の照らし合わせで同じと確かめてある）
     path = Path(consent.target)
     host.open_project_file(path)
+    lost = len(missing_media(host.document.project))
     return {
         "opened": str(path),
         "name": host.document.project.name,
         "note": "この指示の中では、開いた作品をもう編集しません 続きは次の指示で頼んでください",
+        # 人が〔開く…〕で開いたときは窓で知らせる所（#447） AI には数で知らせる
+        **(
+            {
+                "missing_media": lost,
+                "missing_note": "ファイルが見つからない素材があります list_media の missing で"
+                "どれかを見て、次の指示で relink_media で付け替えられます",
+            }
+            if lost
+            else {}
+        ),
     }
 
 
@@ -9173,6 +9243,7 @@ def _package_plan(host: EditorHost, arguments: dict[str, Any]) -> _PackagePlan:
     _wait_seconds(arguments)
     whole = _package_flag(arguments, "whole")
     keep = _package_flag(arguments, "keep_metadata")
+    reencode = _package_flag(arguments, "reencode")
     margin = arguments.get("margin_seconds", _PACKAGE_MARGIN_DEFAULT)
     low, high = _PACKAGE_MARGIN_RANGE
     if isinstance(margin, bool) or not isinstance(margin, int) or not low <= margin <= high:
@@ -9185,7 +9256,15 @@ def _package_plan(host: EditorHost, arguments: dict[str, Any]) -> _PackagePlan:
         + ("全体を入れます" if whole else f"使っている範囲だけ（前後 {margin} 秒）を入れます"),
         "撮った場所などの付け足しの情報を"
         + ("残します" if keep else "取り除きます（回転と色の情報は残ります）"),
-        "画質と音質は元のまま 書体と AviUtl のスクリプトは入れません",
+        (
+            "編集用の大きな形式の素材を H.264 にし直します: "
+            + ("、".join(editing_media(host.document.project)) or "（対象の素材はありません）")
+            + "\n"
+            + REENCODE_NOTE
+            if reencode
+            else "画質と音質は元のまま"
+        ),
+        "書体と AviUtl のスクリプトは入れません",
         RIGHTS_NOTE,
         _replacing(path, "ファイル"),
     ]
@@ -9195,6 +9274,7 @@ def _package_plan(host: EditorHost, arguments: dict[str, Any]) -> _PackagePlan:
         margin=Fraction(margin),
         keep_metadata=keep,
         expect=expect_now(path),
+        reencode=reencode,
     )
     _refuse_elsewhere()
     return _PackagePlan(request=request, detail="\n".join(part for part in parts if part))
@@ -10538,7 +10618,12 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="list_media",
-        description="メディアプールの素材を一覧する media_id はここで得る" + PAGING_NOTE,
+        description=(
+            "メディアプールの素材を一覧する media_id はここで得る missing が true の素材は"
+            "ファイルが見つからない（relink_media で付け替える） packed_seconds がある素材は"
+            "持ち出し用パッケージで入っている区間だけがあり、外を読む編集は断られる"
+        )
+        + PAGING_NOTE,
         schema=_schema({"contains": _string("名前に含む言葉で絞る"), **_paging()}),
         handler=_list_media,
         sends=_WITH_FILES,
@@ -11504,6 +11589,34 @@ OPERATIONS: tuple[Operation, ...] = (
         sends=_WITH_FILES,
         preview=from_arguments(),
         name_keys=frozenset({"imported"}),
+        writes=True,
+    ),
+    Operation(
+        name="relink_media",
+        description=(
+            "ファイルが見つからない素材（list_media の missing）を、別の場所のファイルへ付け替える"
+            "（画面の〔見つからない素材を探し直す…〕と同じ） 取り消し 1 回で戻る 既定では、同じ"
+            "フォルダか同じ並びのフォルダにある残りの見つからない素材も名前で見つけてまとめて"
+            "付け替える 長さや道の数が違うファイルは付け替えずに訳を返す"
+        ),
+        schema=_schema(
+            {
+                "media_id": _string("付け替える素材の media_id（list_media で得る）"),
+                "path": _string("付け替える先のファイルの場所"),
+                "search_others": _boolean(
+                    "残りの見つからない素材も同じフォルダで探す（既定 true）"
+                ),
+                "force": _boolean(
+                    "長さや道の数が違っても付け替える（既定 false ユーザーが確かめたときだけ）"
+                ),
+            },
+            ["media_id", "path"],
+        ),
+        handler=_relink_media,
+        sends=_WITH_FILES,
+        # 作品を書き換えるので結果からは作れない 読み込み（import_media）と同じく引数から作る
+        preview=from_arguments(),
+        name_keys=frozenset({"name"}),
         writes=True,
     ),
     Operation(
@@ -13638,10 +13751,11 @@ OPERATIONS: tuple[Operation, ...] = (
             + PACKAGE_SUFFIX
             + "）にまとめて、素材の無い別の PC でも"
             "開いて編集・書き出しできるようにする（画面の〔持ち出し用に書き出す…〕と同じ）"
-            " 毎回ユーザーに確かめる 画質と音質は元のまま（再エンコードしない） 既定は使っている"
-            "範囲だけを入れ、撮った場所などの付け足しの情報を取り除く 書体と AviUtl のスクリプトは"
-            "入れない 書き出しは裏で進み、すぐ戻る 様子は package_status で読む 書けるのは今の"
-            "作品のフォルダと、書き出しの窓で前に選んだフォルダの中だけ"
+            " 毎回ユーザーに確かめる 既定は画質と音質が元のまま（再エンコードしない）"
+            " 既定は使っている範囲だけを入れ、撮った場所などの付け足しの情報を取り除く"
+            " 書体と AviUtl のスクリプトは入れない 書き出しは裏で進み、すぐ戻る"
+            " 様子は package_status で読む 書けるのは今の作品のフォルダと、"
+            "書き出しの窓で前に選んだフォルダの中だけ"
         ),
         schema=_schema(
             {
@@ -13659,6 +13773,11 @@ OPERATIONS: tuple[Operation, ...] = (
                 ),
                 "keep_metadata": _boolean(
                     "撮った場所・機器の名前などを残す（既定 false は取り除く 回転と色は残る）"
+                ),
+                "reencode": _boolean(
+                    "ProRes・DNxHR・無圧縮などの編集用の大きな形式の映像を H.264 にし直して小さく"
+                    "する（既定 false 画質がわずかに変わるので、ユーザーが小さくしたいと言った"
+                    "ときだけ true にする）"
                 ),
                 "wait_seconds": _number(
                     f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"

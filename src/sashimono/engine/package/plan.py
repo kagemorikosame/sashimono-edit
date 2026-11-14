@@ -22,17 +22,29 @@ from sashimono.core.model import (
     Project,
     Stroke,
     Timeline,
+    Track,
 )
+from sashimono.core.packed import read_window
 from sashimono.effects import registry
 from sashimono.effects.sources import source_registry
 from sashimono.effects.spec import FileSpec, FontSpec
 from sashimono.effects.strokes import STROKE
 from sashimono.engine.audio.mixer import history_seconds
 from sashimono.engine.decode.probe import STILL_SUFFIXES
-from sashimono.engine.package.remux import Span, spans_union
+from sashimono.engine.package.remux import (
+    EDITING_CODECS,
+    REENCODE_CRF,
+    REENCODE_LEAST_PSNR,
+    Span,
+    reencodable,
+    spans_union,
+)
 
 __all__ = [
+    "EDITING_NAMES",
+    "REENCODE_NOTE",
     "Usage",
+    "editing_media",
     "file_fields",
     "file_paths",
     "folder_kinds",
@@ -67,12 +79,12 @@ def _timelines(project: Project) -> Iterator[Timeline]:
         yield scene.timeline
 
 
-def _clips(project: Project) -> Iterator[tuple[Timeline, Clip]]:
-    """作品のクリップすべてと、その時間軸"""
+def _clips(project: Project) -> Iterator[tuple[Timeline, Track, Clip]]:
+    """作品のクリップすべてと、その時間軸とトラック"""
     for timeline in _timelines(project):
         for track in timeline.tracks:
             for clip in track.clips:
-                yield timeline, clip
+                yield timeline, track, clip
 
 
 def _all_effects(project: Project) -> Iterator[Effect]:
@@ -90,7 +102,7 @@ def _all_effects(project: Project) -> Iterator[Effect]:
 
 def _sources(project: Project) -> Iterator[GeneratedSource]:
     """作品の生成物（テキスト・図形など）すべて"""
-    for _timeline, clip in _clips(project):
+    for _timeline, _track, clip in _clips(project):
         if clip.source is not None:
             yield clip.source
 
@@ -121,24 +133,24 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
     """
     by_id = {item.id: item for item in project.media}
     found: dict[MediaId, list[Span] | None] = {}
-    for timeline, clip in _clips(project):
+    for timeline, track, clip in _clips(project):
         if clip.media_id is None or clip.media_id not in by_id:
             continue
         item = by_id[clip.media_id]
         if _is_still(item):
             found[item.id] = None
             continue
-        rate = timeline.rate
-        start = clip.source_in
-        end = clip.source_out(rate)
-        if clip.hold_at is not None:
-            # 止めるのは絵だけで、音は source_in から長さの分を読み続ける（AudioMixer）
-            # 絵の読む所（止める時刻まで）と音の読む所の和を入れる 終わりを止める時刻へ縮めると、
-            # 音を鳴らすクリップの止めた後の音が持ち出した先で欠ける（#449 の Codex の指摘）
-            start = min(start, clip.hold_at)
-        sample_rate = project.settings.sample_rate
-        lookback = Fraction(history_seconds(clip, rate, sample_rate)).limit_denominator(sample_rate)
-        start -= lookback * clip.speed
+        # 止めるのは絵だけで、音は source_in から長さの分を読み続ける（AudioMixer） 絵の読む所と
+        # 音の読む所の和を入れる（#449 の Codex の指摘） 数え方は開いた先で範囲の外を断る確かめ
+        # （#445）と 1 つにする ずれると、入れていない所を読む編集が断られずに通る
+        start, end = read_window(
+            clip,
+            timeline,
+            sounds=project.plays_sound(track, clip),
+            draws=project.draws_picture(track, clip),
+            history=history_seconds,
+            sample_rate=project.settings.sample_rate,
+        )
         start = max(Fraction(0), start - margin)
         end = end + margin
         if item.duration > 0:
@@ -153,6 +165,54 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
     return {
         key: (spans_union(spans) if spans is not None else None) for key, spans in found.items()
     }
+
+
+#: 編集用の大きな形式の呼び名（窓と知らせに出す） 無い物は符号の名前のまま出す
+EDITING_NAMES = {
+    "prores": "ProRes",
+    "dnxhd": "DNxHD・DNxHR",
+    "rawvideo": "無圧縮",
+    "v210": "無圧縮 10bit",
+    "v410": "無圧縮 10bit 4:4:4",
+    "cfhd": "CineForm",
+    "huffyuv": "HuffYUV",
+    "ffvhuff": "HuffYUV",
+    "utvideo": "Ut Video",
+    "magicyuv": "MagicYUV",
+}
+
+
+#: 符号にし直すと何が変わるか（窓と AI の確かめの箱に出す #446）
+#: 大きさと差は、ffmpeg で作った 1080p の試験の素材（3 秒）で測った値（PR に記す）
+REENCODE_NOTE = (
+    f"映像だけを H.264（CRF {REENCODE_CRF}）にし直します 色の深さと色差の間引き（10bit 4:2:2 など）"
+    "と時刻は元のまま、音は元のまま入れます\n"
+    "画質は元と完全には同じになりません 元との差は PSNR 50〜55 dB ほど（目では見分けにくい程度）"
+    f"で、{REENCODE_LEAST_PSNR:.0f} dB に届かない素材と、小さくならない素材は元のまま入れます\n"
+    "大きさの目安は ProRes 422 HQ・DNxHR HQ で元の 1.5〜4 割、無圧縮で数 % です"
+    "（絵の細かさで大きく変わります） 符号にし直す分、書き出しに時間が掛かります"
+)
+
+
+def editing_media(project: Project) -> tuple[str, ...]:
+    """使っている素材のうち編集用の大きな形式の物（``名前（ProRes）`` の形 #446）
+
+    素材の情報（取り込んだときに読んだ符号の名前）で見る 書き出しの窓を開くたびに
+    素材を開き直すと、数十本の素材で窓が出るまで待たされる
+    """
+    used = media_spans(project, Fraction(0))
+    found: list[str] = []
+    for item in project.media:
+        if item.id not in used:
+            continue
+        # し直せない素材は並べない 並べると、選んでも元のまま入って「小さくなる」と読んだ人の
+        # 見込みが外れる 編集用の映像が 2 本ある素材は、片方がし直せない形（透明を持つ
+        # ProRes 4444・RGB・12bit 以上）でも、し直す側（reencode_media）が 2 本と数えて断る
+        streams = [stream for stream in item.video_streams if stream.codec in EDITING_CODECS]
+        if len(streams) == 1 and reencodable(streams[0].pixel_format):
+            codec = streams[0].codec
+            found.append(f"{item.name}（{EDITING_NAMES.get(codec, codec)}）")
+    return tuple(found)
 
 
 def _is_still(item: MediaItem) -> bool:

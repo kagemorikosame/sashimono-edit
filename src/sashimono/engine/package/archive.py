@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -40,7 +41,7 @@ from sashimono.core.io.serialize import (
     project_to_dict,
     save_project,
 )
-from sashimono.core.model import MediaId, MediaItem, Project
+from sashimono.core.model import MediaId, MediaItem, PackedSpan, Project
 from sashimono.engine.package.plan import (
     Usage,
     file_fields,
@@ -49,7 +50,15 @@ from sashimono.engine.package.plan import (
     unknown_kinds,
     usage,
 )
-from sashimono.engine.package.remux import Cancelled, Span, cut_media, output_format
+from sashimono.engine.package.remux import (
+    Cancelled,
+    Reencoded,
+    Span,
+    cut_media,
+    editing_codec,
+    output_format,
+    reencode_media,
+)
 from sashimono.engine.package.scrub import scrub_image, scrubbable
 
 __all__ = [
@@ -77,7 +86,9 @@ PACKAGE_FORMAT = "sashimono-package"
 #: 前の本体でも読める足し方（項目を足すだけ）なら ``minimum`` は上げずに版だけ上げ、
 #: 前の本体が読み違える変え方をしたときだけ ``minimum`` も上げる 読む側は ``minimum`` が
 #: 自分の版より大きいときだけ断る
-PACKAGE_VERSION = 1
+#: 2 で符号にし直した素材の印（項目の ``reencoded`` #446）を足した 前の本体は知らない項目を
+#: 読まずに開ける（素材は普通の H.264 の動画）ので ``minimum`` は 1 のまま
+PACKAGE_VERSION = 2
 #: 読むのに要る版の下限（今の形を読むのに要るのは 1）
 PACKAGE_MINIMUM = 1
 #: 素材の権利の断り 書き出しの窓と AI の確かめの箱の両方に出す
@@ -130,6 +141,9 @@ class PackOptions:
     margin: Fraction = Fraction(1)
     #: 撮った場所などの付け足しの情報を残す（既定は取り除く 人へ渡す物なので）
     keep_metadata: bool = False
+    #: 編集用の大きな形式（ProRes・DNxHR・無圧縮など）の映像を H.264 へ符号にし直して入れる（#446）
+    #: 品質を保つ約束（#423）から外れるので既定にしない 元との差（PSNR）は結果に出す
+    reencode: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +166,10 @@ class PackResult:
     missing_files: tuple[str, ...]
     #: 素材一覧にあってもタイムラインで使っていないので入れなかった素材（元の名前）
     unused_media: tuple[str, ...] = ()
+    #: 符号にし直して入れた素材（元の名前と結果 #446）
+    reencoded: tuple[tuple[str, Reencoded], ...] = ()
+    #: 符号にし直すのを選んだのに、できずにそのまま入れた編集用の形式の素材（元の名前）
+    not_reencoded: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +206,8 @@ class _Entry:
     whole: bool = True
     metadata_removed: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+    #: 符号にし直したときの結果（#446）
+    reencoded: Reencoded | None = None
 
 
 def _media_name(number: int, source: Path, suffix: str | None = None) -> str:
@@ -335,6 +355,7 @@ def write_package(
 
     metadata_kept: list[str] = []
     whole_instead: list[str] = []
+    not_reencoded: list[str] = []
     done = 0
 
     def fill(handle: BinaryIO) -> None:
@@ -347,16 +368,43 @@ def write_package(
                 if cancelled():
                     raise Cancelled
                 progress(done / total, f"{entry.original} を入れています")
-                _put_entry(zipped, entry, options, scratch, cancelled, metadata_kept, whole_instead)
+                _put_entry(
+                    zipped,
+                    entry,
+                    options,
+                    scratch,
+                    cancelled,
+                    metadata_kept,
+                    whole_instead,
+                    not_reencoded,
+                )
                 done += entry.weight
             # 中の名前は書いてから決まる（切り出すと入れ物が変わり、拡張子が変わることがある）
             names = {entry.media_id: entry.name for entry in entries if entry.media_id is not None}
             # 中の場所は番号だけなので、表示の名前が空の素材は元のファイルの名前を残す
             # 残さないと、開いた先の素材一覧とクリップに 0001.mp4 と出て、どの素材か分からない
+            # 範囲だけを入れた素材には、入っている区間を持たせる（#445） 開いた先で範囲の外を
+            # 読む編集を、理由を言って断るため（持たせないと黙って錨の絵か何も無い所が出る）
+            ranges = {
+                entry.media_id: _packed_spans(by_id[entry.media_id], entry.spans)
+                for entry in entries
+                if entry.media_id is not None and entry.spans is not None and not entry.whole
+            }
+            changed = {
+                entry.media_id: entry.reencoded
+                for entry in entries
+                if entry.media_id is not None and entry.reencoded is not None
+            }
             named = replace(
                 project,
                 media=tuple(
-                    replace(item, display_name=item.display_name or Path(item.path).name)
+                    replace(
+                        _reencoded_streams(item, changed.get(item.id)),
+                        display_name=item.display_name or Path(item.path).name,
+                        # まるごと入れた素材は元の区間のまま（展開した作品をもう 1 度持ち出すと、
+                        # 元のファイルにも区間の中しか無い）
+                        packed=ranges.get(item.id, item.packed),
+                    )
                     for item in project.media
                 ),
             )
@@ -399,6 +447,10 @@ def write_package(
             for item in project.media
             if item.id not in found.spans
         ),
+        reencoded=tuple(
+            (entry.original, entry.reencoded) for entry in entries if entry.reencoded is not None
+        ),
+        not_reencoded=tuple(not_reencoded),
     )
 
 
@@ -439,6 +491,49 @@ def _unused_place(item: MediaItem) -> Path:
     return Path(UNUSED_PREFIX) / name
 
 
+def _packed_spans(item: MediaItem, spans: list[Span]) -> tuple[PackedSpan, ...]:
+    """切り出した区間を、作品の素材に持たせる形にする
+
+    展開した作品をもう 1 度持ち出したときは、元のファイルにも前の区間しか無い 余裕を足した
+    区間が前の区間の外へはみ出した所は無いので、前の区間と重なる所だけにする
+    """
+    if not item.packed:
+        return tuple(PackedSpan(span.start, span.end) for span in spans)
+    found = []
+    for span in spans:
+        for earlier in item.packed:
+            start, end = max(span.start, earlier.start), min(span.end, earlier.end)
+            if start <= end:
+                found.append(PackedSpan(start, end))
+    if not found:
+        # 空のままにすると「範囲の無い素材（全体がある）」と読まれ、開いた先で範囲の外の編集が
+        # 通る 前の範囲の外を読むクリップを残したまま持ち出し直したときに起きる
+        name = item.display_name or Path(item.path).name
+        raise PackageError(
+            f"「{name}」の使う区間が、前の持ち出し用パッケージに"
+            "入っている範囲と重なりません 範囲の外を使うクリップを直すか、元の素材へ付け替えてから"
+            "書き出してください"
+        )
+    return tuple(found)
+
+
+def _reencoded_streams(item: MediaItem, report: Reencoded | None) -> MediaItem:
+    """符号にし直した素材の映像の情報を、新しい符号と画素の形に書き直す
+
+    書き直さないと、開いた先で素材の情報が ProRes のままになり、控えを作るかの判断や
+    素材の情報の表示が中身と食い違う
+    """
+    if report is None:
+        return item
+    streams = tuple(
+        replace(stream, codec=report.to, pixel_format=report.pixel_format or stream.pixel_format)
+        if stream.codec == report.codec
+        else stream
+        for stream in item.video_streams
+    )
+    return replace(item, video_streams=streams)
+
+
 def _put_entry(
     zipped: zipfile.ZipFile,
     entry: _Entry,
@@ -447,9 +542,15 @@ def _put_entry(
     cancelled: Callable[[], bool],
     metadata_kept: list[str],
     whole_instead: list[str],
+    not_reencoded: list[str] | None = None,
 ) -> None:
-    """1 つを入れる 素材は切り出すか、取り除くか、そのまま写す"""
+    """1 つを入れる 素材は符号にし直すか、切り出すか、取り除くか、そのまま写す"""
     source = entry.source
+    if entry.role == "media" and options.reencode and editing_codec(source) is not None:
+        if _put_reencoded(zipped, entry, options, scratch, cancelled):
+            return
+        if not_reencoded is not None:
+            not_reencoded.append(entry.original)
     if entry.role == "media" and (entry.spans is not None or not options.keep_metadata):
         if _put_cut(zipped, entry, options, scratch, cancelled):
             return
@@ -509,6 +610,43 @@ def _put_cut(
             cut.unlink(missing_ok=True)
 
 
+def _put_reencoded(
+    zipped: zipfile.ZipFile,
+    entry: _Entry,
+    options: PackOptions,
+    scratch: Path,
+    cancelled: Callable[[], bool],
+) -> bool:
+    """編集用の形式の映像を符号にし直して入れる（#446） できなければ偽（写す側へ戻す）"""
+    # MXF（DNxHD に多い）は切り出しの入れ物を持たないので mov で書く 原点と道が元と違えば
+    # 確かめで落ちて写す側へ戻る
+    muxer, extension = output_format(entry.source) or ("mov", ".mov")
+    spans = entry.spans if entry.spans is not None else [Span(Fraction(0), Fraction(10**9))]
+    scratch.mkdir(parents=True, exist_ok=True)
+    made = scratch / f"{uuid.uuid4().hex}{extension}"
+    try:
+        report = reencode_media(
+            entry.source,
+            made,
+            spans,
+            muxer=muxer,
+            keep_metadata=options.keep_metadata,
+            cancelled=cancelled,
+        )
+        if report is None:
+            return False
+        entry.name = f"{entry.name.split('.', 1)[0]}{extension}"
+        entry.whole = entry.spans is None
+        entry.metadata_removed = not options.keep_metadata
+        entry.reencoded = report
+        with made.open("rb") as reader:
+            _put_stream(zipped, entry, reader, made.stat().st_size, cancelled)
+        return True
+    finally:
+        with contextlib.suppress(OSError):
+            made.unlink(missing_ok=True)
+
+
 def _put_bytes(zipped: zipfile.ZipFile, entry: _Entry, data: bytes) -> None:
     """中身をそのまま入れ、大きさと SHA-256 を記す"""
     entry.size = len(data)
@@ -565,6 +703,24 @@ def _manifest(
                 "sha256": entry.sha256,
                 "whole": entry.whole,
                 "metadata_removed": entry.metadata_removed,
+                **(
+                    {
+                        "reencoded": {
+                            "from": entry.reencoded.codec,
+                            "to": entry.reencoded.to,
+                            "pixel_format": entry.reencoded.pixel_format,
+                            # 元と同じ絵は差が無限大 JSON は無限大を書けない（標準の外の
+                            # Infinity になり、ほかの道具で読めない）ので null にする
+                            "psnr_db": (
+                                round(entry.reencoded.psnr, 2)
+                                if math.isfinite(entry.reencoded.psnr)
+                                else None
+                            ),
+                        }
+                    }
+                    if entry.reencoded is not None
+                    else {}
+                ),
                 **({"media_id": entry.media_id} if entry.media_id is not None else {}),
                 **(
                     {
@@ -746,8 +902,9 @@ def open_package(
                     + "、".join(folders[:10])
                 )
             project_path = work / f"{_safe_folder_name(project.name)}{SUFFIX}"
-            # 置き換えた後の場所で書く（展開した素材を指す） 書くのは仮のフォルダの中
-            save_project(project, project_path)
+            # 置き換えた後の場所で書く（展開した素材を指す） 書くのは仮のフォルダの中だが、
+            # 相対の場所は動かした先から数える（名前を変えて別の PC へ移しても素材を見つける）
+            save_project(project, project_path, relative_to=folder)
             work.rename(folder)
         except BaseException:
             shutil.rmtree(work, ignore_errors=True)

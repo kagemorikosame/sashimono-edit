@@ -17,9 +17,12 @@
 
 from __future__ import annotations
 
+import bisect
 import contextlib
+import math
+import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -28,16 +31,24 @@ import av
 import av.error
 import numpy as np
 
+from sashimono.core.model import MediaItem
 from sashimono.engine.decode.audio import AudioDecoder
 from sashimono.engine.decode.probe import ProbeError, media_origin, moving_pictures, probe_media
 from sashimono.engine.decode.rational import as_fraction
 from sashimono.engine.decode.video import VideoDecoder
 
 __all__ = [
+    "EDITING_CODECS",
+    "REENCODE_CRF",
+    "REENCODE_LEAST_PSNR",
     "Cancelled",
+    "Reencoded",
     "Span",
     "cut_media",
+    "editing_codec",
+    "frame_psnr",
     "output_format",
+    "reencode_media",
     "spans_union",
 ]
 
@@ -200,11 +211,19 @@ def _write(
     muxer: str,
     keep_metadata: bool,
     cancelled: Callable[[], bool],
+    reencode: frozenset[int] = frozenset(),
+    sizes: list[tuple[int, int]] | None = None,
 ) -> bool:
-    """使う区間のパケットを写して書く 書けなければ偽"""
+    """使う区間のパケットを写して書く 書けなければ偽
+
+    ``reencode`` の番号の映像の道だけは、写さずに解いて H.264 にし直す（#446 :class:`_Encoder`）
+    音とほかの映像の道は写す
+    """
     with av.open(str(source)) as reader:
         kept = _kept_streams(reader)
         if kept is None:
+            return False
+        if not reencode <= {stream.index for stream in kept}:
             return False
         if keep_metadata and len(kept) < len(reader.streams):
             # 付け足しの情報を残すと選んだのに、後ろの道（位置の記録など）を落とすと選んだ意味が
@@ -215,8 +234,16 @@ def _write(
         guide = video[0] if video else kept[0]
         with av.open(str(target), "w", format=muxer) as writer:
             mapping: dict[int, av.stream.Stream] = {}
+            encoders: dict[int, _Encoder] = {}
             for stream in kept:
-                copy = writer.add_stream_from_template(stream)
+                if stream.index in reencode:
+                    encoder = _Encoder.open(writer, stream, _first_picture(source, stream.index))
+                    if encoder is None:
+                        return False
+                    encoders[stream.index] = encoder
+                    copy = encoder.stream
+                else:
+                    copy = writer.add_stream_from_template(stream)
                 if keep_metadata:
                     copy.metadata.update(stream.metadata)
                 elif "language" in stream.metadata:
@@ -251,8 +278,21 @@ def _write(
                         return
                     last_dts[index] = packet.dts
                 written[index].add(stamp)
+                if index in encoders:
+                    encoders[index].push(packet, writer)
+                    return
                 packet.stream = mapping[index]
                 writer.mux(packet)
+
+            # 隙間を持てない音の道（:func:`_steady`）
+            steady = [stream for stream in kept if _steady(stream, muxer)]
+            quiet = {stream.index for stream in steady}
+            # 区間は頭の順に並び重ならない（spans_union） パケットごとに全部の区間を見ると、
+            # 1 時間の音（十数万パケット）と数百の区間で書き出しが長く止まる 頭の並びから探す
+            starts = [span.start for span in spans]
+
+            def hush(packet: av.Packet[Any]) -> av.Packet[Any]:
+                return _hush(packet, spans, starts, origin)
 
             # 錨 どの道も頭のパケットを入れて、道の頭の時刻（素材の原点）を元と同じに保つ
             reader.seek(0)
@@ -266,14 +306,115 @@ def _write(
                     continue
                 if index in picture_indices and not packet.is_keyframe:
                     continue
-                put(packet)
+                put(hush(packet) if index in quiet else packet)
                 anchored.add(index)
                 if len(anchored) == len(kept):
                     break
 
-            for span in spans:
-                _copy_span(reader, kept, guide, picture_indices, origin, span, put, cancelled)
+            # 隙間を持てない音の道は、頭から最後の区間の終わりまで続けて写す 区間の外は無音に
+            # 置き換える（時刻は保ったまま、使っていない所の声や会話を持ち出さない）
+            if steady and spans:
+                whole = Span(Fraction(0), max(span.end for span in spans))
+                _copy_span(
+                    reader,
+                    steady,
+                    steady[0],
+                    set(),
+                    origin,
+                    whole,
+                    lambda packet: put(hush(packet)),
+                    cancelled,
+                )
+            rest = [stream for stream in kept if stream not in steady]
+            # 残りが無いのに読むと、demux は空の指定を「全部の道」と読み、写さない道（時刻つきの
+            # データの道など）まで書き手へ渡して落ちる
+            for span in spans if rest else ():
+                _copy_span(reader, rest, guide, picture_indices, origin, span, put, cancelled)
+            for encoder in encoders.values():
+                encoder.finish(writer)
+                if sizes is not None:
+                    sizes.append((encoder.read_bytes, encoder.wrote_bytes))
     return True
+
+
+#: 無音を作れる PCM の形と、無音の 1 バイト 符号つきの整数と小数は 0 が無音 符号なしの
+#: 8bit は真ん中 a-law と μ-law は 0 を表す値（0 を入れると最大の音になる）
+_PCM_SILENCE = {
+    **{
+        f"pcm_{kind}": 0
+        for kind in (
+            "s16le", "s16be", "s24le", "s24be", "s32le", "s32be", "s64le", "s64be",
+            "f16le", "f24le", "f32le", "f32be", "f64le", "f64be", "s8",
+        )
+    },
+    "pcm_u8": 0x80,
+    "pcm_alaw": 0xD5,
+    "pcm_mulaw": 0xFF,
+}  # fmt: skip
+
+
+def _steady(stream: av.stream.Stream, muxer: str) -> bool:
+    """区間の間の空きを書けない道か
+
+    mov と mp4 の書き手は PCM の音を 1 標本ずつの決まった長さで並べ、パケットの時刻を書かない
+    空きを空けて渡すと詰めて書くので、2 つ目の区間からの音が前へずれる（ProRes の .mov は
+    たいてい PCM の音を持つ） 空けずに続けて写し、区間の外は無音にする（:func:`_hush`）
+    無音を作れない形（見出しを持つ pcm_dvd など）は空けて写し、確かめに落ちて全体を入れる
+    """
+    return (
+        stream.type == "audio"
+        and muxer in ("mov", "mp4")
+        and str(stream.codec_context.name) in _PCM_SILENCE
+    )
+
+
+#: PCM の形ごとの 1 標本のバイト数 名前の数字（s16 なら 16 ビット）から読む 数字を持たない
+#: a-law と μ-law は 8 ビット
+_PCM_BYTES = {name: int(re.sub(r"\D", "", name) or 8) // 8 for name in _PCM_SILENCE}
+
+
+def _hush(
+    packet: av.Packet[Any], spans: list[Span], starts: list[Fraction], origin: Fraction
+) -> av.Packet[Any]:
+    """区間の外にある PCM の標本を無音に置き換える（パケットの中でも標本ごと）
+
+    続けて写すと区間の間の音も入る 使っていない所の声や会話を持ち出すと、範囲だけを入れると
+    約束したパッケージから、渡した人の知らない音が漏れる 区間に掛かるパケットも丸ごと残すと、
+    区間の終わりの直後の言葉が入る 長さと時刻はそのまま（ずらさない）
+    区間には書き出しの余裕（:attr:`PackageOptions.margin`）が足してあるので、ここで足さない
+    ``spans`` は頭の順に並び重ならない ``starts`` はその頭の並び
+    """
+    shown = _seconds(packet)
+    codec = packet.stream.codec_context
+    name = str(codec.name)
+    rate = int(codec.sample_rate or 0)
+    width = _PCM_BYTES[name] * int(codec.channels or 0)
+    if shown is None or rate <= 0 or width <= 0:
+        return packet
+    data = bytes(packet)
+    count = len(data) // width
+    fill = _PCM_SILENCE[name]
+    kept = bytearray([fill]) * len(data)
+    head = shown - origin
+    end = head + Fraction(count, rate)
+    # パケットの頭より前に始まる最後の区間から、パケットの終わりより前に始まる区間までを見る
+    for span in spans[max(0, bisect.bisect_right(starts, head) - 1) :]:
+        if span.start > end:
+            break
+        # 標本 i は shown + i / rate に鳴る 区間に入る標本の番号の範囲を求めて元の音を戻す
+        first = max(0, math.ceil((origin + span.start - shown) * rate))
+        last = min(count, math.floor((origin + span.end - shown) * rate) + 1)
+        if first < last:
+            kept[first * width : last * width] = data[first * width : last * width]
+    if kept == data:
+        return packet
+    quiet = av.Packet(bytes(kept))
+    quiet.pts = packet.pts
+    quiet.dts = packet.dts
+    quiet.duration = packet.duration
+    quiet.time_base = packet.time_base
+    quiet.stream = packet.stream
+    return quiet
 
 
 def _copy_span(
@@ -485,3 +626,475 @@ def _same_sound(
         if original.decode_error is not None or copied.decode_error is not None:
             return False
     return True
+
+
+# --- 編集用の大きな形式を符号にし直す（#446） --------------------------------------
+#
+# ProRes・DNxHR・無圧縮は 1 枚ずつ絵を持つので、使う範囲だけでも数十 GB になりうる
+# 持ち出し用パッケージは品質を保つ約束（#423）なので既定にはせず、選んだときだけ H.264 へ
+# 符号にし直す 時刻（PTS）と道の番号は元のまま保ち、作品を 1 か所も書き換えずに済ませる
+# 書き終えたら元との差（PSNR）を測り、:data:`REENCODE_LEAST_PSNR` に届かなければ捨てて
+# 写す側へ戻す
+
+#: 編集用の大きな形式（FFmpeg のデコーダの名前） どれも 1 枚ずつ絵を持つ（前後の絵に頼らない）
+#: ffv1 は可逆の圧縮でもう十分小さいので入れない
+EDITING_CODECS = frozenset(
+    {
+        "prores",
+        "dnxhd",
+        "rawvideo",
+        "v210",
+        "v410",
+        "cfhd",
+        "huffyuv",
+        "ffvhuff",
+        "utvideo",
+        "magicyuv",
+    }
+)
+
+#: 符号にし直すときの x264 の画質（CRF 小さいほど元に近い） 18 で「見て分からない」と
+#: 言われることが多いが、色を直す・拡大するなど後で絵をいじると差が出やすいので、余裕を取って 12
+REENCODE_CRF = 12
+
+#: 元との差がこれより大きい（PSNR が低い）ときは使わずに写す側へ戻す（dB）
+#: 40 dB を下回ると、動きの多い所や暗い所で目に見える崩れが出始める
+REENCODE_LEAST_PSNR = 40.0
+
+#: 符号にし直した映像が元のこの割合より小さくならなければ使わない
+_REENCODE_WORTH = Fraction(4, 5)
+
+#: キーフレームの間隔（秒） 長いとクリップの頭へ跳ぶたびに前のキーフレームから解き直す
+_REENCODE_GOP = 2
+
+#: x264 が受け取れる画素の形 これ以外はここへ寄せる（深さと色差の間引きは保つ）
+_X264_FORMATS = frozenset(
+    {"yuv420p", "yuv422p", "yuv444p", "yuv420p10le", "yuv422p10le", "yuv444p10le", "gray"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Reencoded:
+    """符号にし直した結果 窓と目録が知らせる"""
+
+    #: 元の符号の名前（``prores`` など）
+    codec: str
+    #: 新しい符号の名前（``h264``）
+    to: str
+    #: 新しい画素の形（作品の素材の情報に書き直す）
+    pixel_format: str
+    #: 使う区間で測った元との差のうち一番大きい所（PSNR dB）
+    psnr: float
+    #: 映像の元の大きさと、符号にし直した大きさ（使う区間の分 バイト）
+    before: int = 0
+    after: int = 0
+
+
+def editing_codec(source: Path) -> str | None:
+    """``source`` の映像が編集用の大きな形式なら、その符号の名前"""
+    try:
+        with av.open(str(source)) as container:
+            for stream in moving_pictures(container):
+                name = stream.codec_context.name
+                if name in EDITING_CODECS:
+                    return str(name)
+    except (av.error.FFmpegError, OSError):
+        return None
+    return None
+
+
+def reencodable(pixel_format: str | None) -> bool:
+    """その画素の形の映像を H.264 にし直せるか（窓に対象として並べるかの判断 #446）"""
+    return pixel_format is not None and _x264_format(pixel_format) is not None
+
+
+def _x264_format(name: str) -> str | None:
+    """元の画素の形に一番近い、x264 が受け取れる形 寄せられない形は ``None``
+
+    透明の道を持つ形（ProRes 4444 など）と RGB の形は寄せない 透明が消える・色の変換で
+    わずかに色が変わるのを黙って入れるより、写して大きいままにする
+    """
+    if name in _X264_FORMATS:
+        return name
+    try:
+        fmt = av.VideoFormat(name)
+    except (ValueError, av.error.FFmpegError):
+        return None
+    if fmt.is_rgb or fmt.has_palette or fmt.is_bayer or len(fmt.components) in (2, 4):
+        return None
+    bits = max(component.bits for component in fmt.components)
+    if bits > 10:
+        # x264 は 10bit まで 12bit 以上を 10bit へ落とすと、確かめの差も落とした形で測るので、
+        # 深さを失ったことが差に出ない 写して大きいままにする
+        return None
+    if len(fmt.components) == 1:
+        return "gray" if bits == 8 else None
+    deep = bits > 8
+    wide = fmt.chroma_width(16) == 16
+    tall = fmt.chroma_height(16) == 16
+    half_wide = fmt.chroma_width(16) == 8
+    half_tall = fmt.chroma_height(16) == 8
+    # 色差の間引きが x264 の 3 つ（4:4:4・4:2:2・4:2:0）と同じ物だけ寄せる 4:4:0・4:1:1 などを
+    # 寄せると色差を捨てるが、確かめの差は元も寄せた形にしてから測るので、捨てた分が差に出ない
+    if wide and tall:
+        chroma = "444"
+    elif half_wide and tall:
+        chroma = "422"
+    elif half_wide and half_tall:
+        chroma = "420"
+    else:
+        return None
+    return f"yuv{chroma}p" + ("10le" if deep else "")
+
+
+#: 範囲の印のテレビの範囲（FFmpeg の AVCOL_RANGE_MPEG）
+_TV_RANGE = 1
+
+
+def _copy_colors(encoder: Any, frame: Any) -> None:
+    """``encoder`` の決まっていない色の印を ``frame`` から写す
+
+    ProRes は範囲（テレビの範囲）を道でなく絵ごとに持つ 書かずに開くと、開いた先の読み手が
+    範囲を推し直して色が浅く・濃くずれる（試験の素材で RGB の PSNR が 36 dB に落ちた）
+    """
+    for name in ("color_range", "colorspace", "color_primaries", "color_trc"):
+        if not getattr(encoder, name, None) and getattr(frame, name, None):
+            with contextlib.suppress(AttributeError, ValueError, TypeError):
+                setattr(encoder, name, getattr(frame, name))
+
+
+def _color_marks(frame: Any) -> tuple[int, int]:
+    """絵の範囲と色の行列の印 範囲の「決まっていない」はテレビの範囲に数える
+
+    YUV の読み手は範囲が無ければテレビの範囲で読む x264 はテレビの範囲を流れに書かないので、
+    そのまま比べると、元が「テレビ」と書いた ProRes を同じ色で写しても違うと見る
+    """
+    return int(frame.color_range) or _TV_RANGE, int(frame.colorspace)
+
+
+def _first_picture(path: Path, index: int) -> Any | None:
+    """``index`` の映像の道の最初の絵 読めなければ ``None``（色の印は道の値だけで開く）"""
+    try:
+        with av.open(str(path)) as reader:
+            stream = reader.streams[index]
+            for frame in reader.decode(stream):
+                return frame
+    except (av.error.FFmpegError, OSError, IndexError):
+        return None
+    return None
+
+
+class _Encoder:
+    """映像の道 1 本を解いて H.264 にし直す 時刻（PTS）は元の道の時間の単位のまま渡す"""
+
+    def __init__(self, stream: Any, source: Any, pixel_format: str) -> None:
+        self.stream = stream
+        self._source = source
+        self._pixel_format = pixel_format
+        self._last_pts: int | None = None
+        #: 解いた元のパケットと、書いた新しいパケットの大きさの和（バイト） 小さくならなければ
+        #: 符号にし直す意味が無いので、呼ぶ側が写す側へ戻す
+        self.read_bytes = 0
+        self.wrote_bytes = 0
+
+    @classmethod
+    def open(cls, writer: Any, source: Any, first: Any | None = None) -> _Encoder | None:
+        """書き手に符号の道を足す 寄せられない画素の形なら ``None``
+
+        ``first`` は元の道の最初の絵 道に書いていない色の印をここから取る
+        """
+        context = source.codec_context
+        pixel_format = _x264_format(str(context.pix_fmt or ""))
+        if pixel_format is None or not context.width or not context.height:
+            return None
+        rate = source.average_rate or source.guessed_rate
+        stream = writer.add_stream(
+            "libx264",
+            rate=rate,
+            options={
+                "crf": str(REENCODE_CRF),
+                "preset": "medium",
+                # B フレームを使わない 使うと mov の書き手が頭に編集の表を足し、道の頭の時刻
+                # （素材の原点）が元とずれる 原点がずれると作品の時刻が全部別の絵を指す
+                "bf": "0",
+            },
+        )
+        stream.time_base = source.time_base
+        encoder = stream.codec_context
+        encoder.width = context.width
+        encoder.height = context.height
+        encoder.pix_fmt = pixel_format
+        encoder.time_base = source.time_base
+        encoder.gop_size = max(1, int(float(rate or 30) * _REENCODE_GOP))
+        encoder.max_b_frames = 0
+        # 色の印は元のまま HDR や BT.2020 の素材が、開いた先で Rec.709 として褪せて出ないように
+        encoder.color_primaries = context.color_primaries
+        encoder.color_trc = context.color_trc
+        encoder.colorspace = context.colorspace
+        encoder.color_range = context.color_range
+        # 最初の絵を符号にする時を待って印を取ると、先に音の錨を書いたときに書き手がその前に
+        # 符号の作り手を開いて頭書きを書き、印が入らない 開く前に別に読んだ最初の絵から取る
+        if first is not None:
+            _copy_colors(encoder, first)
+        return cls(stream, source, pixel_format)
+
+    def push(self, packet: Any, writer: Any) -> None:
+        """パケットを解き、出てきた絵を符号にして書く"""
+        self.read_bytes += packet.size
+        for frame in self._source.decode(packet):
+            self._encode(frame, writer)
+
+    def _encode(self, frame: Any, writer: Any) -> None:
+        if frame.pts is None or (self._last_pts is not None and frame.pts <= self._last_pts):
+            # 時刻の無い絵と、前に書いた時刻以前の絵は書かない 書き手は時刻が戻ると断る
+            return
+        if self._last_pts is None:
+            self._take_colors(frame)
+        self._last_pts = frame.pts
+        picture = frame.reformat(format=self._pixel_format)
+        picture.pts = frame.pts
+        # ProRes などの絵はどれも I として解ける 型を残すと x264 が全部を I で符号にし、
+        # 前後の絵を使った縮めが効かない（大きさの確かめは全部 I でも通ることがある）
+        picture.pict_type = av.video.frame.PictureType.NONE
+        picture.time_base = self._source.time_base
+        for out in self.stream.encode(picture):
+            self.wrote_bytes += out.size
+            writer.mux(out)
+
+    def _take_colors(self, frame: Any) -> None:
+        """道に書いていない色の印を、最初の絵から取る（符号の作り手は最初の絵で開く）"""
+        _copy_colors(self.stream.codec_context, frame)
+
+    def finish(self, writer: Any) -> None:
+        """解き手と符号の作り手に残った物を出し切る"""
+        with contextlib.suppress(av.error.FFmpegError):
+            for frame in self._source.decode(None):
+                self._encode(frame, writer)
+        for out in self.stream.encode(None):
+            self.wrote_bytes += out.size
+            writer.mux(out)
+
+
+def reencode_media(
+    source: Path,
+    target: Path,
+    spans: Sequence[Span],
+    *,
+    muxer: str,
+    keep_metadata: bool = False,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> Reencoded | None:
+    """``source`` の ``spans`` の区間を、編集用の形式の映像だけ H.264 にし直して書く
+
+    元との差が :data:`REENCODE_LEAST_PSNR` に届かない・時刻や道が元と違う・書けないときは
+    ``target`` を消して ``None``（呼ぶ側が写す側へ戻す） 止められたら :class:`Cancelled`
+    """
+    merged = spans_union(spans)
+    try:
+        with av.open(str(source)) as container:
+            chosen = {
+                stream.index: str(stream.codec_context.name)
+                for stream in moving_pictures(container)
+                if stream.codec_context.name in EDITING_CODECS
+            }
+    except (av.error.FFmpegError, OSError):
+        return None
+    if len(chosen) != 1:
+        # 知らせと目録（:class:`Reencoded`）は符号と画素の形を 1 つずつしか持たない 2 本を
+        # し直すと、2 本目の素材の情報が元の符号のまま残り、中身の H.264 と食い違う
+        # 編集用の形式の映像を 2 本持つ素材はまれなので、元のまま入れる
+        return None
+    try:
+        sizes: list[tuple[int, int]] = []
+        written = _write(
+            source, target, merged, muxer, keep_metadata, cancelled, frozenset(chosen), sizes
+        )
+        before = sum(read for read, _wrote in sizes)
+        after = sum(wrote for _read, wrote in sizes)
+        # 小さくならない（細かい模様や雑音の多い絵は H.264 でも縮まない）なら、画質を落とすだけ
+        # なので使わない
+        smaller = written and after < before * _REENCODE_WORTH
+        report = _close_to_source(source, target, merged, chosen, cancelled) if smaller else None
+        if report is not None:
+            report = replace(report, before=before, after=after)
+    except Cancelled:
+        with contextlib.suppress(OSError):
+            target.unlink(missing_ok=True)
+        raise
+    except (av.error.FFmpegError, OSError, ValueError, ProbeError):
+        report = None
+    if report is None:
+        with contextlib.suppress(OSError):
+            target.unlink(missing_ok=True)
+    return report
+
+
+#: 区間の中で差を測る所（区間の長さの割合） 頭だけだと、時刻が 1 枚ずれていても気付けない
+_PSNR_POINTS = (Fraction(0), Fraction(1, 2), Fraction(9, 10))
+
+
+def frame_psnr(old: Any, new: Any) -> float:
+    """2 枚の絵の差（PSNR dB） 同じなら無限大
+
+    YUV の面ごとに素材の深さのまま比べ、画素の数で重みを付けて平均する（FFmpeg の ``psnr``
+    の average と同じ数え方） RGB へ直してから比べると、色の変換の丸めと色差の広げ方で差が
+    何倍にも見え（試験の素材で YUV 53 dB が RGB 36 dB）、符号そのものの差が分からない
+    """
+    if (old.width, old.height) != (new.width, new.height):
+        return 0.0
+    if old.format.name != new.format.name:
+        # 詰め方だけが違う形（無圧縮の uyvy422 と yuv422p など）は、新しい形へ並べ直して比べる
+        old = old.reformat(format=new.format.name)
+    deep = max(component.bits for component in old.format.components) > 8
+    kind = np.uint16 if deep else np.uint8
+    peak = float((1 << max(component.bits for component in old.format.components)) - 1)
+    squared = 0.0
+    count = 0
+    for one, two in zip(old.planes, new.planes, strict=True):
+        size = np.dtype(kind).itemsize
+        a = np.frombuffer(one, kind).reshape(one.height, one.line_size // size)[:, : one.width]
+        b = np.frombuffer(two, kind).reshape(two.height, two.line_size // size)[:, : two.width]
+        squared += float(np.sum((a.astype(np.float64) - b.astype(np.float64)) ** 2))
+        count += a.size
+    if squared == 0 or count == 0:
+        return math.inf
+    return 10 * math.log10(peak * peak / (squared / count))
+
+
+def _stamps(
+    path: Path, index: int, origin: Fraction, span: Span, cancelled: Callable[[], bool]
+) -> list[int]:
+    """区間の中の絵の時刻（道の時間の単位） パケットだけを読む（解かないので速い）"""
+    found: list[int] = []
+    with av.open(str(path)) as reader:
+        stream = reader.streams[index]
+        base = as_fraction(stream.time_base)
+        reader.seek(max(0, int((origin + span.start) / base)), stream=stream, backward=True)
+        for packet in reader.demux(stream):
+            if cancelled():
+                raise Cancelled
+            if packet.pts is None:
+                continue
+            seconds = packet.pts * base
+            if seconds > origin + span.end:
+                break
+            if seconds >= origin + span.start:
+                found.append(packet.pts)
+    return sorted(found)
+
+
+def _frame_at(
+    path: Path, index: int, moment: Fraction, cancelled: Callable[[], bool]
+) -> Any | None:
+    """``moment``（道の頭からでなく入れ物の時刻の秒）に映る絵 その時刻以前で最後の絵"""
+    with av.open(str(path)) as reader:
+        stream = reader.streams[index]
+        base = as_fraction(stream.time_base)
+        reader.seek(max(0, int(moment / base)), stream=stream, backward=True)
+        shown = None
+        for frame in reader.decode(stream):
+            if cancelled():
+                raise Cancelled
+            if frame.pts is None:
+                continue
+            if frame.pts * base > moment:
+                break
+            shown = frame
+        return shown
+
+
+def _picture_end(item: MediaItem, index: int) -> Fraction:
+    """映像の道の終わり（秒 素材の頭から） 分からなければ素材全体の長さ"""
+    for stream in item.video_streams:
+        if stream.index == index and stream.end_time is not None:
+            return stream.end_time
+    return item.duration
+
+
+def _within(spans: list[Span], end: Fraction) -> list[Span]:
+    """差を測る所を決める区間 素材の終わりより後ろを切る（書く区間は変えない）
+
+    全体を入れるときの区間は素材より長い（10 億秒） そのまま測る所を決めると、真ん中も終わりも
+    素材の後ろを指して最後の絵どうしを比べ、途中の崩れに気付けない
+    """
+    if end <= 0:
+        return spans
+    return [Span(span.start, min(span.end, end)) for span in spans if span.start < end] or spans
+
+
+def _close_to_source(
+    source: Path,
+    target: Path,
+    spans: list[Span],
+    chosen: dict[int, str],
+    cancelled: Callable[[], bool],
+) -> Reencoded | None:
+    """符号にし直した素材が、使う区間で元とほぼ同じ絵を同じ時刻に出すか 出すなら結果"""
+    try:
+        before = probe_media(source)
+        after = probe_media(target)
+        with av.open(str(source)) as a, av.open(str(target)) as b:
+            if media_origin(a) != media_origin(b):
+                return None
+    except (ProbeError, av.error.FFmpegError, OSError):
+        return None
+    if [s.index for s in before.video_streams] != [s.index for s in after.video_streams]:
+        return None
+    if [(s.index, s.codec, s.channels) for s in before.audio_streams] != [
+        (s.index, s.codec, s.channels) for s in after.audio_streams
+    ]:
+        return None
+    pixel_format = ""
+    for old, new in zip(before.video_streams, after.video_streams, strict=True):
+        if (old.rotation, old.color_transfer, old.color_primaries, old.width, old.height) != (
+            new.rotation,
+            new.color_transfer,
+            new.color_primaries,
+            new.width,
+            new.height,
+        ):
+            return None
+        if old.index in chosen:
+            pixel_format = new.pixel_format
+        elif (old.codec, old.pixel_format) != (new.codec, new.pixel_format):
+            return None
+        elif not _same_pictures(source, target, old.index, spans, cancelled):
+            # 写しただけの映像の道も、キーフレームが区間の頭より後ろにあると頭の絵が欠ける
+            # 写す側（_same_as_source）と同じ確かめを通さないと、欠けたまま「し直した」と知らせる
+            return None
+    worst = math.inf
+    try:
+        origin = Fraction(0)
+        with av.open(str(source)) as reader:
+            origin = media_origin(reader)
+        for index in chosen:
+            for span in spans:
+                if _stamps(source, index, origin, span, cancelled) != _stamps(
+                    target, index, origin, span, cancelled
+                ):
+                    # 区間の中の絵の時刻が 1 つでも違えば、作品の時刻が別の絵を指す・絵が抜ける
+                    return None
+            for span in _within(spans, _picture_end(before, index)):
+                for point in _PSNR_POINTS:
+                    moment = origin + span.start + (span.end - span.start) * point
+                    shown = _frame_at(source, index, moment, cancelled)
+                    made = _frame_at(target, index, moment, cancelled)
+                    if shown is None and made is None:
+                        continue
+                    if shown is None or made is None or shown.pts != made.pts:
+                        return None
+                    # 画素が近くても範囲と色の行列の印が違えば、開いた先の読み手が別の色に直す
+                    if _color_marks(shown) != _color_marks(made):
+                        return None
+                    worst = min(worst, frame_psnr(shown, made))
+    except (av.error.FFmpegError, OSError, ValueError):
+        return None
+    if worst < REENCODE_LEAST_PSNR:
+        return None
+    for audio in before.audio_streams:
+        if not _same_sound(
+            source, target, audio.index, audio.sample_rate, audio.channels, spans, cancelled
+        ):
+            return None
+    first = next(iter(chosen.values()))
+    return Reencoded(codec=first, to="h264", pixel_format=pixel_format, psnr=worst)

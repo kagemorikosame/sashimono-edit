@@ -183,6 +183,7 @@ from sashimono.core.model import (
     heard_stream,
 )
 from sashimono.core.reframe import CENTER, ReframeError, ReframeStyle
+from sashimono.core.relink import RelinkMedia, missing_media, moved_media
 from sashimono.core.seams import (
     SEAM_NONE,
     SeamStyle,
@@ -197,6 +198,7 @@ from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
+from sashimono.engine.audio.mixer import history_seconds
 from sashimono.engine.audio.speech import (
     SpeechError,
     WaveformPendingError,
@@ -229,6 +231,7 @@ from sashimono.engine.package.archive import (
     write_package,
 )
 from sashimono.engine.package.archive import open_package as unpack_package
+from sashimono.engine.package.plan import editing_media
 from sashimono.engine.reframe import (
     FACES_CENTER,
     FACES_OFF,
@@ -240,6 +243,7 @@ from sashimono.engine.reframe import (
     plan_reframe,
     tracked_media,
 )
+from sashimono.engine.relink_check import plan_relink
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from sashimono.engine.render.backdrop import fill_backdrop
 from sashimono.engine.vision import OCR_RAPID, RAPIDOCR_PACK, VISION_PACK, ScreenKind
@@ -269,6 +273,7 @@ from sashimono.ui.library_save import UndoNotice, undo_offers
 from sashimono.ui.library_view import set_library_options
 from sashimono.ui.media_pool import MediaPoolWidget
 from sashimono.ui.media_search import MediaSearchDialog
+from sashimono.ui.missing_media import MissingMediaDialog
 from sashimono.ui.mix_dialogs import ask_duck, ask_loudness
 from sashimono.ui.narration_dialog import ask_narration
 from sashimono.ui.package_dialog import (
@@ -514,7 +519,12 @@ class MainWindow(QMainWindow):
         #: 最初の空のプロジェクトを作る前に読む 起動した直後のプロジェクトも、新規作成と
         #: 同じくレイヤーの方式の好み（:attr:`Preferences.new_project_layers`）に従わせるため
         self._preferences = PreferenceStore().load()
-        self._document = Document(project if project is not None else self._blank_project())
+        self._document = Document(
+            project if project is not None else self._blank_project(), sound_history=history_seconds
+        )
+        #: 前に画面へ映した作品 素材の場所が変わった（付け替え・その取り消しとやり直し #447）かを
+        #: 見比べる 画面・AI・取り消しのどの道で変わっても、映す所の 1 か所で頼み直すため
+        self._shown_root = self._document.project
         #: 再生ヘッドのフレームを数えているレート 変わったら数え直す（:meth:`_retime_playhead`）
         self._playhead_rate = self._document.project.rate
         self._path: Path | None = path
@@ -903,6 +913,8 @@ class MainWindow(QMainWindow):
         # 持ち出し用パッケージ（#423）の書き出しと展開 数十 GB になりうるので裏で回し、右端に
         # 進み具合と〔止める〕を出す 人の窓と AI の道具が同じ 1 本を使う
         self._package = PackageJob(self)
+        #: 見つからない素材の窓（#447） 待たずに出すので、閉じても次に開くまで持っておく
+        self._missing_dialog: MissingMediaDialog | None = None
         #: 展開を始めたときの作品の世代（:attr:`Document.generation`）
         self._package_from = 0
         self._package_indicator = ProgressIndicator(self, cancel_text="止める")
@@ -952,6 +964,7 @@ class MainWindow(QMainWindow):
         self._add(file_menu, "新規", QKeySequence.StandardKey.New, self.new_project)
         self._add(file_menu, "開く…", QKeySequence.StandardKey.Open, self.open_project)
         self._add(file_menu, "持ち出し用パッケージを開く…", QKeySequence(), self.open_package)
+        self._add(file_menu, "見つからない素材を探し直す…", QKeySequence(), self.show_missing_media)
         self._add(file_menu, "保存", QKeySequence.StandardKey.Save, self.save_project)
         self._add(file_menu, "名前を付けて保存…", QKeySequence("Ctrl+Shift+S"), self.save_as)
         self._add(
@@ -1827,6 +1840,7 @@ class MainWindow(QMainWindow):
         # 置いたあとに自分で下げてもらうのでは遅い
         self._apply_auto_quality()
         self._reanalyze_returned(root)
+        self._reload_moved_media(root)
         self._update_history_actions()
         self._update_title()
         self.project_changed.emit(project)
@@ -2916,7 +2930,9 @@ class MainWindow(QMainWindow):
         if not name:
             return
         try:
-            project = load_project(Path(name))
+            project = load_project(
+                Path(name), relative_first=self._preferences.media_relative_first
+            )
         except ProjectFileError as exc:
             QMessageBox.warning(self, "開けない", str(exc))
             return
@@ -2924,10 +2940,12 @@ class MainWindow(QMainWindow):
             return
         self._adopt_opened(project, Path(name))
 
-    def _adopt_opened(self, project: Project, path: Path) -> None:
+    def _adopt_opened(self, project: Project, path: Path, *, notice: bool = True) -> None:
         """開いた作品へ差し替える 画面の〔開く…〕と AI の open_project（#349）が通る所
 
         AI の指示の段を開いていれば開いたまま差し替える（:meth:`_adopt_new` と同じ訳）
+        ``notice`` が真なら、見つからない素材があれば窓で知らせる（#447） AI が開いたときは
+        道具の結果で知らせ、持ち出し用パッケージは使っていない素材をわざと入れないので出さない
         """
         self._playback.stop()
         previous = self._document.project
@@ -2942,6 +2960,78 @@ class MainWindow(QMainWindow):
             self._request_analysis(media)
         self._request_all_proxies()
         self._freeze_long_lived()
+        if notice:
+            self.show_missing_media(only_if_missing=True)
+
+    def show_missing_media(self, *, only_if_missing: bool = False) -> None:
+        """〔見つからない素材を探し直す…〕 見つからない素材の窓を出す（待たずに出す #447）
+
+        ``only_if_missing`` なら、見つからない素材が無いときは何も出さない（開いたときの知らせ）
+        メニューから出したときは、持ち出し用パッケージの範囲だけが入った素材も並べる（#445
+        範囲の外を使うには元の素材へ付け替えるしかなく、ファイルはあるので見つからない素材に入らない）
+        """
+        project = self._document.project
+        lost = missing_media(project)
+        packed = [item for item in project.media if item.packed]
+        if not lost and (only_if_missing or not packed):
+            if self._missing_dialog is not None:
+                # 前の作品の一覧を残さない 残ると、選んでも今の作品に無い素材で何も起きない
+                self._missing_dialog.refresh()
+                self._missing_dialog.hide()
+            if not only_if_missing:
+                QMessageBox.information(
+                    self, "見つからない素材", "素材のファイルはどれも見つかっています"
+                )
+            return
+        if self._missing_dialog is None:
+            self._missing_dialog = MissingMediaDialog(
+                lambda: self._document.project, self._relink_from_dialog, self
+            )
+        self._missing_dialog.refresh()
+        self._missing_dialog.show()
+        self._missing_dialog.raise_()
+
+    def _relink_from_dialog(self, media_id: MediaId, chosen: Path) -> str:
+        """窓で選んだファイルへ付け替える 同じフォルダの残りもまとめて 知らせの文を返す"""
+        plan = plan_relink(self._document.project, media_id, chosen)
+        if not plan.readable:
+            # 読めないファイルは尋ねずに断る 付け替えても絵も音も出ない
+            return f"付け替えませんでした {plan.concern}"
+        if plan.concern is not None:
+            answer = QMessageBox.question(
+                self._missing_dialog or self,
+                "見つからない素材",
+                f"選んだファイルは作品の覚えている素材と違うようです\n{plan.concern}\n\n"
+                "それでも付け替えますか（クリップの時刻が別の絵を指すことがあります）",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return "付け替えませんでした"
+        if not self.execute(RelinkMedia(plan.changes)):
+            return "付け替えられませんでした"
+        text = f"{len(plan.changes)} 本を付け替えました"
+        if plan.skipped:
+            text += "\n同じ名前でも違う素材に見えたので付け替えなかった物: " + "、".join(
+                f"{name}（{reason}）" for name, reason in plan.skipped
+            )
+        return text
+
+    def _reload_moved_media(self, root: Project) -> None:
+        """場所が変わった素材の波形・縮小画像・控えを捨てて頼み直す（付け替え #447）
+
+        係は素材の ID で結果を持ち、同じ ID の結果があれば頼まれても何もしない 捨てずに頼むと
+        前のファイルの波形と縮小画像が残る 作りかけの控えも捨てないと、前のファイルの変換が
+        終わるまで新しい物を受け付けない 取り消しとやり直しでも場所は変わるので、ここで見る
+        """
+        moved = moved_media(self._shown_root, root)
+        self._shown_root = root
+        for media in root.media:
+            if media.id in moved:
+                self._analyzer.forget(media.id)
+                self._screen.forget(media.id)
+                self._proxies.forget(media.id)
+                self._proxy_asked.discard(media.id)
+                self._request_analysis(media)
+                self._request_proxy(media)
 
     def save_project(self) -> bool:
         """保存する 保存できたら真 名前がまだ無ければ尋ねる"""
@@ -3516,7 +3606,12 @@ class MainWindow(QMainWindow):
             self._path.parent if self._path is not None else (self.export_folder or Path.home())
         )
         stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", project.name).strip(" .") or "作品"
-        dialog = PackageExportDialog(self._preferences, folder / f"{stem}{PACKAGE_SUFFIX}", self)
+        dialog = PackageExportDialog(
+            self._preferences,
+            folder / f"{stem}{PACKAGE_SUFFIX}",
+            self,
+            editing=editing_media(project),
+        )
         try:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -3667,7 +3762,7 @@ class MainWindow(QMainWindow):
         if not self._claim(opened.project_path, ask=not job.by_assistant):
             job.note(f"展開しました（{opened.folder}）が、別の窓で開いているので開いていません")
             return
-        self._adopt_opened(opened.project, opened.project_path)
+        self._adopt_opened(opened.project, opened.project_path, notice=False)
         lacking = opened_summary(opened)
         job.note(f"開きました: {opened.project_path}" + (f"\n{lacking}" if lacking else ""))
         if lacking and not job.by_assistant:
@@ -4016,7 +4111,7 @@ class MainWindow(QMainWindow):
         if self.is_modified:
             raise ToolError(UNSAVED_REFUSAL)
         try:
-            project = load_project(path)
+            project = load_project(path, relative_first=self._preferences.media_relative_first)
         except ProjectFileError as exc:
             raise ToolError(f"開けませんでした: {exc}") from exc
         if not self._claim(path, ask=False):
@@ -4024,7 +4119,7 @@ class MainWindow(QMainWindow):
                 "この作品は別の Sashimono の窓で開いています 両方で保存すると後の方だけが残るので、"
                 "開くなら人が〔開く…〕の窓で決めてください"
             )
-        self._adopt_opened(project, path)
+        self._adopt_opened(project, path, notice=False)
 
     def start_new_project(
         self, *, resolution: tuple[int, int] | None, frame_rate: FrameRate | None
@@ -5286,7 +5381,10 @@ class MainWindow(QMainWindow):
             self._document.project,
             request.path,
             PackOptions(
-                whole=request.whole, margin=request.margin, keep_metadata=request.keep_metadata
+                whole=request.whole,
+                margin=request.margin,
+                keep_metadata=request.keep_metadata,
+                reencode=request.reencode,
             ),
             expect=replace(request.expect, keep=self._preferences.backup_generations),
             check=lambda: check_writable(
