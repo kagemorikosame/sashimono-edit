@@ -27,6 +27,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
@@ -46,10 +47,14 @@ from sashimono.ai.operations import (
 from sashimono.ai.outbound import (
     ASKED,
     Outbound,
+    Preview,
+    PreviewSource,
     SendAnswer,
     SendChoice,
     SendRequest,
+    build_samples,
     file_secrets,
+    from_result,
     hide_text,
     redact,
     secret_pairs,
@@ -58,6 +63,7 @@ from sashimono.ai.outbound import (
 )
 from sashimono.ai.plan import WorkPlan, plan_for
 from sashimono.ai.safety import Consent
+from sashimono.ai.send_log import SendLog
 from sashimono.core.commands.history import REPLACED_REFUSAL
 
 __all__ = ["Approval", "BudgetRequest", "EditorBridge", "Question"]
@@ -97,6 +103,66 @@ class _Work:
     done: threading.Event = field(default_factory=threading.Event)
     result: object = None
     error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CallGrant:
+    """道具の呼び出し 1 回に限った送る許し（#425）"""
+
+    #: この呼び出しに限って送ってよい物 呼び出しごとに尋ねる人の「今回は送る」と、
+    #: 下見のために先に動かす間に使う
+    kinds: frozenset[Outbound] = frozenset()
+    #: 下見のために先に動かしている間か 送るかが決まるまで、絵を送った数に数えない
+    previewing: bool = False
+
+
+#: 今の呼び出しの許し :meth:`EditorBridge.invoke` が呼び出しの文脈に立て、
+#: :meth:`EditorBridge.call` が画面のスレッドの仕事へ持ち込む
+#: 立っていなければ ``None``（呼び出しの外 許しは無い）
+_CALL: ContextVar[_CallGrant | None] = ContextVar("send_grant", default=None)
+#: 呼び出しの外の許し 何も足さない
+_NO_GRANT = _CallGrant()
+
+
+def _current() -> _CallGrant:
+    """今の呼び出しの許し 呼び出しの外なら何も足さない許し"""
+    return _CALL.get() or _NO_GRANT
+
+
+def _grant(kinds: frozenset[Outbound], *, previewing: bool = False) -> None:
+    """この呼び出しの許しを置き換える :meth:`EditorBridge.invoke` が立てた文脈の中だけで呼ぶ"""
+    _CALL.set(_CallGrant(kinds, previewing))
+
+
+def _under(grant: _CallGrant, work: Callable[[], object]) -> object:
+    """画面のスレッドで、呼び出しの許しを立てて仕事をする"""
+    token = _CALL.set(grant)
+    try:
+        return work()
+    finally:
+        _CALL.reset(token)
+
+
+@dataclass(slots=True)
+class _Held:
+    """下見のために先に動かした道具の結果（#425） 送ると答えるまで外へは返さない"""
+
+    value: object = None
+    #: 道具が失敗した訳 返すときに投げ直す
+    error: ToolError | None = None
+
+    @property
+    def shown(self) -> object:
+        """下見を作る元 失敗したなら訳の文（AI へ返るのはその文なので）"""
+        return str(self.error) if self.error is not None else self.value
+
+    def release(self, usage: UsageMeter) -> object:
+        """送ると答えたので返す 絵はここで送った数に数える"""
+        if self.error is not None:
+            raise self.error
+        if isinstance(self.value, ImageResult):
+            usage.record_image()
+        return self.value
 
 
 @dataclass(slots=True)
@@ -243,8 +309,14 @@ class EditorBridge:
         *,
         auto_approve: bool = False,
         usage: UsageMeter | None = None,
+        send_log: SendLog | None = None,
     ) -> None:
         self._host = host
+        #: 送った物の記録と、最後に送った物の下見（#425） 画面は設定の置き場へ残す物を渡す
+        #: 渡さなければ覚えない物（試験・CLI）
+        self.send_log = send_log if send_log is not None else SendLog()
+        #: 道具の呼び出しごとに尋ねるか（設定 #425） 偽なら種類ごとにアプリを閉じるまで 1 回
+        self.ask_each_call = False
         #: 開いている作品の計画（#340） 文書は作品を開き直しても同じ物なので、作ったときに
         #: 引いておけば AI のスレッドから編集画面を通さずに止めたかを見られる
         self.plan: WorkPlan = plan_for(host.document)
@@ -292,11 +364,34 @@ class EditorBridge:
         self._sending: SendRequest | None = None
         #: これまでに見た素材・作品の名前と場所（伏せる文字 → 印） :meth:`_learn_names` が足す
         self._known_names: dict[str, str] = {}
+        #: 名前の表の錠 足すのは画面のスレッド、記録の下見を作るのは AI のスレッド
+        self._names_lock = threading.Lock()
 
     # --- AI スレッドから ---
 
     def invoke(self, operation: Operation, arguments: dict[str, Any]) -> object:
         """ツールを 1 つ実行する 確認が要るものは、許可を待ってから動かす
+
+        AI へ返す結果に同意の要る物が入っていれば、送った物の記録に残す（#425）
+        """
+        # 呼び出しごとの許しは、この呼び出しの文脈だけに持つ 道具は並んで呼ばれる
+        # （server が呼び出しごとに別のスレッドで invoke する） ブリッジに 1 つだけ持つと、
+        # 下見のために立てた許しが、返事を待つ間に呼ばれた別の道具にも効き、尋ねていない本文を送る
+        token = _CALL.set(_CallGrant())
+        try:
+            result = self._invoke(operation, arguments)
+            self._log_sent(operation, result)
+            return result
+        except ToolError as error:
+            # 断りや失敗の文も AI へ返る 文に混ざった名前や場所も送った物として数える
+            # （件数が 0 の物は残らないので、名前の無いただの断りは記録に載らない）
+            self._log_sent(operation, str(error))
+            raise
+        finally:
+            _CALL.reset(token)
+
+    def _invoke(self, operation: Operation, arguments: dict[str, Any]) -> object:
+        """:meth:`invoke` の中身
 
         外へ送る物の同意（#342）は、許可より先に取る 送らないと決まった道具の許可を
         尋ねても、許した後に断るだけになる
@@ -320,7 +415,14 @@ class EditorBridge:
             self._refuse_after_fix_limit(operation)
         if operation.edits:
             self._refuse_after_reopen(operation)
-        self._agree_to_send(operation)
+        held = self._agree_to_send(operation, arguments)
+        if held is not None:
+            # 下見のために先に動かした結果 送ると答えたので、そのまま返す 動かし直すと、
+            # 下見で見せた物と別の物（間に変わった字幕・描き直した絵）を送りうる
+            # 答えた後に中断が来ていたら返さない 止めた人の所へ結果が届き、送った記録にも載る
+            if self._cancel.is_set():
+                raise ToolError("中断されました")
+            return held.release(self.usage)
         if operation.asks:
             # 質問は編集を変えないので許可は挟まない 「変更を自動で承認」でも聞く
             # （承認は操作の許可で、質問はどの操作をするかを決める物 別物として扱う）
@@ -498,7 +600,10 @@ class EditorBridge:
         if self._cancel.is_set():
             raise ToolError("中断されました")
 
-        item = _Work(run=work)
+        # この呼び出しの許し（:data:`_CALL`）を画面のスレッドへ持ち込む 画面のスレッドの文脈は
+        # 呼び出しをまたいで 1 つなので、持ち込まないと許しが見えず、持ち込んだまま残すと次の
+        # 仕事に漏れる 仕事の間だけ立てる
+        item = _Work(run=partial(_under, _current(), work))
         self._work.put(item)
         timeout = CALL_TIMEOUT if self.call_timeout is None else self.call_timeout
         if not item.done.wait(timeout):
@@ -579,7 +684,7 @@ class EditorBridge:
 
     def may_send(self, kind: Outbound) -> bool:
         """今それを外へ送ってよいか 確かめの窓の答え（アプリを閉じるまで）が設定より先"""
-        if not kind.asked:
+        if not kind.asked or kind in _current().kinds:
             return True
         with self._sends_lock:
             answered = self._session_sends.get(kind)
@@ -601,44 +706,109 @@ class EditorBridge:
                 if before.get(kind) != choices.get(kind):
                     self._session_sends.pop(kind, None)
 
-    def _agree_to_send(self, operation: Operation) -> None:
+    def _agree_to_send(self, operation: Operation, arguments: dict[str, Any]) -> _Held | None:
         """道具の結果に入りうる物のうち、同意の要る物を確かめる 断られたら道具を動かさない
 
         素材の名前と場所は断られても動かす 結果の中を伏せ字にする（:meth:`_run`）
+        確かめの窓には送る物の下見を出す（#425） 下見を結果から作る道具
+        （:attr:`Operation.preview`）は、ここで先に動かして結果を保留する 送ると答えたら
+        保留した結果を返し（:class:`_Held`）、断ったら捨てる 外へ出るのは答えた後だけ
+        """
+        pending = self._pending_sends(operation)
+        # 尋ねない物の中に断った絵か文があれば、尋ねる前に断る 先に断らないと、名前と場所だけを
+        # 尋ねる間に下見のための道具（文字の読み取りなど）を動かし、待たせた後で結局断る
+        # （CodeRabbit の指摘 #450）
+        self._refuse_unsent(operation, waiting=frozenset(pending))
+        if not pending:
+            return None
+        preview = operation.preview
+        if preview is None:
+            # Operation の作りで弾いてある ここへ来たら、下見を出さずに尋ねるより止める
+            raise ToolError(f"{operation.name} は送る物の下見を作れないので実行しません")
+        held: _Held | None = None
+        if preview.source is PreviewSource.RESULT:
+            held = self._hold(operation, arguments, frozenset(pending))
+            shown: object = held.shown
+        else:
+            # 引数の中の名前を伏せた後の形を見せるため、今の作品の名前を表に入れておく
+            self.call(self._learn_names)
+            shown = arguments
+            reader = preview.reader
+            if reader is not None:
+                try:
+                    shown = self.call(partial(reader, self._host, arguments))
+                except ToolError:
+                    # 読めない（字幕が無い・ID が違う）なら道具も同じ訳で断る 下見は引数で出す
+                    shown = arguments
+        samples = build_samples(
+            pending,
+            shown,
+            preview,
+            pairs=self._name_pairs(),
+            name_keys=operation.name_keys,
+        )
+        request = SendRequest(
+            tool=operation.name,
+            kinds=tuple(pending),
+            samples=samples,
+            each_call=self.ask_each_call,
+        )
+        self._send_requests.put(request)
+        if self._cancel.is_set():
+            # 積んだ後に確かめる（:meth:`ask` と同じ） 積む前の中断を見落とすと 10 分待つ
+            request.give_up("中断されました")
+        if not request.done.wait(SEND_TIMEOUT):
+            request.give_up("送ってよいかの返事がありませんでした")
+        if request.answer is None:
+            _grant(frozenset())
+            # 答えていないので覚えない 次に送るときにまた尋ねる
+            raise ToolError(
+                f"{request.reason} 送っていません 推測で進めず、ここで作業を止めてください"
+            )
+        allowed = request.answer is not SendAnswer.DENY
+        # 下見のために立てた許しは、答えで置き換える 送らないと答えた物を、この呼び出しの
+        # 残り（伏せ字にして動かし直す道）で送らないように
+        _grant(frozenset(pending) if allowed else frozenset())
+        with self._sends_lock:
+            for kind in pending:
+                if not allowed:
+                    self._session_sends[kind] = False
+                elif not self.ask_each_call:
+                    self._session_sends[kind] = True
+        self._refuse_unsent(operation)
+        # 名前と場所だけを断ったときは、保留した結果を捨てて伏せ字の道で動かし直す
+        # 保留した結果は名前を伏せずに作ったので、そのまま返すと断った名前が外へ出る
+        return held if allowed else None
+
+    def _pending_sends(self, operation: Operation) -> list[Outbound]:
+        """これから尋ねる物 設定で決めた物と、アプリを閉じるまで答えた物は尋ねない
+
+        呼び出しごとに尋ねる設定（:attr:`ask_each_call`）では「送る」と答えた物も尋ね直す
+        「送らない」と答えた物は、どちらの設定でもアプリを閉じるまで尋ねない（何度も断らせない）
         """
         pending: list[Outbound] = []
-        for kind in ASKED:
-            if kind not in operation.sends or kind in operation.hidden or self.may_send(kind):
+        for kind in operation.asked_kinds:
+            choice = self.send_choices.get(kind, SendChoice.ASK)
+            if choice is not SendChoice.ASK:
                 continue
             with self._sends_lock:
-                answered = kind in self._session_sends
-            if answered or self.send_choices.get(kind) is SendChoice.DENY:
+                answered = self._session_sends.get(kind)
+            if answered is False or (answered is True and not self.ask_each_call):
                 continue
             pending.append(kind)
-        if pending:
-            request = SendRequest(tool=operation.name, kinds=tuple(pending))
-            self._send_requests.put(request)
-            if self._cancel.is_set():
-                # 積んだ後に確かめる（:meth:`ask` と同じ） 積む前の中断を見落とすと 10 分待つ
-                request.give_up("中断されました")
-            if not request.done.wait(SEND_TIMEOUT):
-                request.give_up("送ってよいかの返事がありませんでした")
-            if request.answer is None:
-                # 答えていないので覚えない 次に送るときにまた尋ねる
-                raise ToolError(
-                    f"{request.reason} 送っていません 推測で進めず、ここで作業を止めてください"
-                )
-            allowed = request.answer is not SendAnswer.DENY
-            with self._sends_lock:
-                for kind in pending:
-                    self._session_sends[kind] = allowed
+        return pending
+
+    def _refuse_unsent(
+        self, operation: Operation, waiting: frozenset[Outbound] = frozenset()
+    ) -> None:
+        """送ってよいと言われていない絵と文を返す道具を断る 名前と場所は伏せて通す
+
+        ``waiting`` はこれから尋ねる物 答えを聞く前なので、まだ許していなくても断らない
+        """
         refused = [
             kind
-            for kind in ASKED
-            if kind in operation.sends
-            and kind is not Outbound.FILES
-            and kind not in operation.hidden
-            and not self.may_send(kind)
+            for kind in operation.asked_kinds
+            if kind is not Outbound.FILES and kind not in waiting and not self.may_send(kind)
         ]
         if refused:
             names = "・".join(kind.label for kind in refused)
@@ -647,6 +817,49 @@ class EditorBridge:
                 "使えません この道具を使わずに進めるか、要るならユーザーに 表示 → 設定… の"
                 "「AI へ送る物」で変えてもらうよう伝えてください 同じ道具を何度も呼ばないでください"
             )
+
+    def _hold(
+        self, operation: Operation, arguments: dict[str, Any], pending: frozenset[Outbound]
+    ) -> _Held:
+        """下見のために道具を先に動かし、結果を保留する（読み取りだけの道具 #425）
+
+        尋ねている物を送ってよい扱いにして動かす 断る前提で動かすと、伏せ字や断りの結果に
+        なり、送ると答えたときに見せた下見と送る物が食い違う 外へはまだ何も返さない
+        道具が失敗したら、その訳の文を保留する 訳の文にも名前や本文が混ざりうる
+        """
+        _grant(pending, previewing=True)
+        try:
+            return _Held(value=self._execute(operation, arguments))
+        except ToolError as error:
+            return _Held(error=error)
+        finally:
+            _grant(pending)
+
+    def _log_sent(self, operation: Operation, result: object) -> None:
+        """AI へ返す結果に入った、同意の要る物の件数を記録に残す（#425）
+
+        名前と場所を断った人の結果は伏せ字にしてあるので、名前と場所は数えない
+        記録は引数から下見を作る道具でも、実際に返した結果から作る 引数は AI が書いた物で、
+        外へ出るのは結果の方 引数で数えると、保存の道具が返す場所などが記録から抜ける
+        """
+        # 伏せて送る物（hidden）も、許してあれば伏せずに送るので数える
+        kinds = [kind for kind in ASKED if kind in operation.sends and self.may_send(kind)]
+        if not kinds:
+            return
+        keys = operation.preview.text_keys if operation.preview is not None else None
+        samples = build_samples(
+            kinds,
+            result,
+            Preview(PreviewSource.RESULT, keys) if keys is not None else from_result(),
+            pairs=self._name_pairs(),
+            name_keys=operation.name_keys,
+        )
+        self.send_log.add(operation.name, samples)
+
+    def _name_pairs(self) -> list[tuple[str, str]]:
+        """覚えた名前の表 どのスレッドからでも読める（画面のスレッドで足す物の写し）"""
+        with self._names_lock:
+            return secret_pairs(dict(self._known_names))
 
     def _run(self, operation: Operation, work: Callable[[], object]) -> object:
         """道具を動かし、外へ送ってよい形にして返す 編集画面のスレッドで呼ぶ
@@ -703,7 +916,9 @@ class EditorBridge:
                 # 絵は伏せられない 宣言せずに絵を返す道具は、同意を取らずに送ることになる
                 raise ToolError(f"{operation.name} は絵を返すと書いていないので、送りません")
             # 送る絵として数える（#344） 描けなかった・断った絵は送らないので数えない
-            self.usage.record_image()
+            # 下見のために先に描いた絵は、送ると答えたときに数える（:meth:`_Held.release`）
+            if not _current().previewing:
+                self.usage.record_image()
             if hide:
                 return ImageResult(
                     png=result.png, caption=str(redact(result.caption, self._file_secrets()))
@@ -728,12 +943,13 @@ class EditorBridge:
             names=document.seen_project_names,
             remembered=host.remembered_names(),
         )
-        for secret, mark in learned.items():
-            self._known_names.setdefault(secret, mark)
+        with self._names_lock:
+            for secret, mark in learned.items():
+                self._known_names.setdefault(secret, mark)
 
     def _file_secrets(self) -> list[tuple[str, str]]:
         self._learn_names()
-        return secret_pairs(self._known_names)
+        return self._name_pairs()
 
     def take_send_request(self) -> SendRequest | None:
         """送ってよいかの確かめが 1 件あれば取り出す 無ければ ``None`` 画面のスレッドから呼ぶ"""

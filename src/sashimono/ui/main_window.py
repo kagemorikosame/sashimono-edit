@@ -1236,7 +1236,7 @@ class MainWindow(QMainWindow):
         """本人の好みの設定を変える"""
         from sashimono.ui.preferences_dialog import PreferencesDialog
 
-        dialog = PreferencesDialog(self._preferences, self)
+        dialog = PreferencesDialog(self._preferences, self, send_log=self._chat.send_log)
         answer = dialog.exec()
         # 開くたびに作る窓 閉じたら捨てる 消えるのは呼んだイベントループへ戻ったときなので、
         # この後で結果を読む間は残る

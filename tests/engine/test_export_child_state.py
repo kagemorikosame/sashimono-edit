@@ -181,6 +181,8 @@ NOT_FOR_THE_CHILD = frozenset(
         "ai_send_frames",
         "ai_send_text",
         "ai_send_files",
+        "ai_send_ask_each_call",
+        "ai_send_log",
         "ai_limit_turn_tokens",
         "ai_limit_turn_images",
         "ai_limit_turn_minutes",

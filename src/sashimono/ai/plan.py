@@ -24,6 +24,7 @@ from typing import Any
 
 from sashimono.ai.handoff import GET_HANDOFF, StopReason
 from sashimono.ai.host import ToolError
+from sashimono.ai.outbound import SentText
 from sashimono.core.commands import Document
 
 __all__ = [
@@ -340,7 +341,11 @@ class WorkPlan:
             instruction = instruction[: INSTRUCTION_LIMIT - 1] + "…"
 
         def free(text: str) -> str:
-            return text if show_text or not text else PLAN_TEXT_HIDDEN
+            if not text:
+                return text
+            # 送る計画の文には印を付ける 欄の名前（goal・title など）は道具ごとに違い、印が無いと
+            # 本文を返しても送った物の下見と記録に載らない（Codex の指摘 #450）
+            return SentText(text) if show_text else PLAN_TEXT_HIDDEN
 
         return {
             "goal": free(view.goal),
