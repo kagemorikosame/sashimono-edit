@@ -14,7 +14,14 @@ from fractions import Fraction
 from sashimono.core.model import Clip, ClipId, MediaItem, PackedSpan, Project, Timeline
 from sashimono.core.timebase import FrameRate
 
-__all__ = ["HistoryReader", "outside_packed", "packed_refusal", "packed_text", "read_window"]
+__all__ = [
+    "HistoryReader",
+    "Window",
+    "outside_packed",
+    "packed_refusal",
+    "packed_text",
+    "read_windows",
+]
 
 #: クリップの頭より前の音をどれだけ読むか（秒 タイムラインの時間） 引数はクリップ・タイムラインの
 #: 速さ・音の標本化の速さ 中身はエフェクトの登録（エンジン層）を見るので、コア層は受け取って使う
@@ -27,7 +34,11 @@ def _timelines(project: Project) -> Iterator[Timeline]:
         yield scene.timeline
 
 
-def read_window(
+#: クリップが読む素材の区間（秒 頭と終わり）
+Window = tuple[Fraction, Fraction]
+
+
+def read_windows(
     clip: Clip,
     timeline: Timeline,
     *,
@@ -35,54 +46,56 @@ def read_window(
     draws: bool = True,
     history: HistoryReader | None = None,
     sample_rate: int = 48000,
-) -> tuple[Fraction, Fraction]:
-    """クリップが素材のどこからどこまでを読むか（秒）
+) -> tuple[Window, ...]:
+    """クリップが素材のどこからどこまでを読むか（秒） 絵と音で別々の区間
 
-    絵を止める時刻（``hold_at``）が頭より前なら、そこも読む 音は頭から長さの分を読み続ける
+    絵を止める時刻（``hold_at``）が頭より前なら、絵はそこを読む 音は頭から長さの分を読み続ける
     前の音を読むエフェクト（リバーブ・ディレイ）は頭より前も読む（``history``）
     ``sounds`` はクリップが音を鳴らすか（:meth:`Project.plays_sound`）
-    鳴らさなければ止めた絵の後ろも、前の音も読まない
-    ``draws`` はクリップが絵を描くか（:meth:`Project.draws_picture`） 描かなければ止める時刻を見ない
+    ``draws`` はクリップが絵を描くか（:meth:`Project.draws_picture`）
+    絵と音を 1 つの区間にまとめると、止めた絵と音の間の使わない所まで読む数え方になり、
+    入っている範囲が 2 か所に分かれた素材で、範囲の中の編集まで断る
     パッケージの書き出しが入れる範囲 :func:`~sashimono.engine.package.plan.media_spans` と同じ数え方
     ずれると、展開した先でディレイを長くしても断られず、響きの頭が無音になる
     """
     start = clip.source_in
-    # 鳴らさないクリップ（映像トラックの動画）の前の音は誰も読まない 差し引くと、範囲の中の
-    # 映像へリバーブを足すだけで断られる
-    if sounds and history is not None:
-        seconds = history(clip, timeline.rate, sample_rate)
-        if seconds > 0:
-            lookback = Fraction(seconds).limit_denominator(sample_rate)
-            start = max(Fraction(0), start - lookback * clip.speed)
-    # 前の音は頭（source_in）から数える hold_at は絵だけを止めるので、そこから引くと
-    # 止めた絵より前の要らない音まで読むことになり、入っている範囲の中の編集まで断る
     end = clip.source_out(timeline.rate)
-    # hold_at は絵だけに効く 音声トラックのクリップで止める時刻まで広げると、読まない所を
-    # 理由に置くのを断る
-    if clip.hold_at is not None and draws:
-        start = min(start, clip.hold_at)
-        if not sounds:
-            # 音を鳴らさない（sounds が偽）クリップは止めた絵より後ろを読まない 終わりまで数えると、
-            # 範囲だけの静止した絵を延ばすのも断る 鳴らすクリップは音が止めた後も読み進む
-            end = min(end, clip.hold_at)
-    return start, end
+    windows: list[Window] = []
+    if draws:
+        if clip.hold_at is None:
+            windows.append((start, end))
+        else:
+            # 止める時刻まで進み、そこで止まる 頭より前なら初めからその絵だけ
+            windows.append((min(start, clip.hold_at), min(end, clip.hold_at)))
+    if sounds:
+        # 前の音は頭（source_in）から数える hold_at は絵だけを止める
+        heard = start
+        if history is not None:
+            seconds = history(clip, timeline.rate, sample_rate)
+            if seconds > 0:
+                lookback = Fraction(seconds).limit_denominator(sample_rate)
+                heard = max(Fraction(0), start - lookback * clip.speed)
+        windows.append((heard, end))
+    # 絵も音も出さないクリップ（無い道の番号など）は、置いた区間のまま数える 何も読まない扱いに
+    # すると、道を選び直しただけで範囲の外の音が鳴り出す
+    return tuple(windows) or ((start, end),)
 
 
 def outside_packed(
     project: Project, history: HistoryReader | None = None
-) -> dict[ClipId, tuple[MediaItem, Fraction, Fraction]]:
-    """入っている範囲の外を読むクリップ（素材と読む区間）"""
+) -> dict[ClipId, tuple[MediaItem, tuple[Window, ...]]]:
+    """入っている範囲の外を読むクリップ（素材と、外へ出る読む区間）"""
     packed = {item.id: item for item in project.media if item.packed}
     if not packed:
         return {}
-    found: dict[ClipId, tuple[MediaItem, Fraction, Fraction]] = {}
+    found: dict[ClipId, tuple[MediaItem, tuple[Window, ...]]] = {}
     for timeline in _timelines(project):
         for track in timeline.tracks:
             for clip in track.clips:
                 item = packed.get(clip.media_id) if clip.media_id is not None else None
                 if item is None:
                     continue
-                start, end = read_window(
+                windows = read_windows(
                     clip,
                     timeline,
                     sounds=project.plays_sound(track, clip),
@@ -90,8 +103,9 @@ def outside_packed(
                     history=history,
                     sample_rate=project.settings.sample_rate,
                 )
-                if not item.covers(start, end):
-                    found[clip.id] = (item, start, end)
+                outside = tuple(w for w in windows if not item.covers(*w))
+                if outside:
+                    found[clip.id] = (item, outside)
     return found
 
 
@@ -112,10 +126,16 @@ def packed_refusal(
     if not now:
         return None
     earlier = outside_packed(before, history)
-    for clip_id, (item, start, end) in now.items():
-        old = earlier.get(clip_id)
-        if old is not None and old[1] <= start and end <= old[2]:
+    for clip_id, (item, windows) in now.items():
+        old = earlier.get(clip_id, (item, ()))[1]
+        widened = [
+            (start, end)
+            for start, end in windows
+            if not any(a <= start and end <= b for a, b in old)
+        ]
+        if not widened:
             continue
+        start, end = widened[0]
         return (
             f"「{item.name}」は持ち出し用パッケージに入っている範囲（{packed_text(item.packed)}）"
             f"の外を読むことになるので、できません（読もうとした所 {float(start):.1f}〜"

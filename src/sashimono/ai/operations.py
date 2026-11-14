@@ -302,6 +302,7 @@ from sashimono.core.model import (
     Marker,
     MediaId,
     MediaItem,
+    PackedSpan,
     ParamValue,
     Project,
     Scene,
@@ -1239,14 +1240,12 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
             # フォルダは 1 件ごとに待つので、全部を確かめると一覧の返事が止まる
             "missing": not Path(item.path).is_file(),
             # 持ち出し用パッケージで範囲だけを入れた素材の、入っている区間（秒 #445）
-            # 外を読む編集は断られるので、AI は先にここで読める所を知る 頭は切り上げ、終わりは
-            # 切り捨てて内側に丸める 四捨五入だと 1/30 秒の頭が 0.033 になり、そのまま使うと断られる
+            # 外を読む編集は断られるので、AI は先にここで読める所を知る 小数は内側に丸め、
+            # 正確な分数（source_in と hold_at はそのまま受け取る）も添える
             **(
                 {
-                    "packed_seconds": [
-                        [math.ceil(span.start * 1000) / 1000, math.floor(span.end * 1000) / 1000]
-                        for span in item.packed
-                    ]
+                    "packed_seconds": [_inward_seconds(span) for span in item.packed],
+                    "packed_exact": [[str(span.start), str(span.end)] for span in item.packed],
                 }
                 if item.packed
                 else {}
@@ -5628,6 +5627,20 @@ def _set_speed(host: EditorHost, arguments: dict[str, Any]) -> object:
     if warnings:
         result["warnings"] = warnings
     return result
+
+
+def _inward_seconds(span: PackedSpan) -> list[float]:
+    """入っている区間を、内側へ丸めた小数（秒）にする
+
+    四捨五入だと 1/30 秒の頭が 0.033 になり、そのまま使うと範囲の外として断られる 1 ミリ秒より
+    短い区間（止めた絵 1 枚など）は内側へ丸めると頭と終わりが入れ替わるので、丸めずに返す
+    小数のままでも :func:`_hold_at` が分数に戻せる
+    """
+    start = math.ceil(span.start * 1000) / 1000
+    end = math.floor(span.end * 1000) / 1000
+    if start > end:
+        return [float(span.start), float(span.end)]
+    return [start, end]
 
 
 def _hold_at(value: object, name: str = "hold_at") -> Fraction | None:

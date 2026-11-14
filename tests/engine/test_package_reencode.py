@@ -12,6 +12,7 @@ import zipfile
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 
 import av
 import pytest
@@ -33,6 +34,7 @@ from sashimono.engine.package.remux import (
     REENCODE_LEAST_PSNR,
     Reencoded,
     Span,
+    _copy_colors,
     cut_media,
     frame_psnr,
     reencodable,
@@ -132,6 +134,26 @@ def test_only_formats_kept_as_they_are_are_offered(pixel_format: str, expected: 
     item = MediaItem(path=Path("D:/a.mov"), duration=Fraction(4), video_streams=(stream,))
     clip = Clip(timeline_start=0, duration=25, media_id=item.id, source_in=Fraction(0))
     assert bool(editing_media(_project(item, clip))) is expected
+
+
+def test_unset_color_marks_are_filled_from_the_first_picture() -> None:
+    """行列・原色・伝達の「決まっていない」は 2 0 だけを空と見ると、道が 2 と書いた素材で
+    絵の BT.709 を写せず、元と比べる所で違うと見てし直しをやめる 決まっている値は上書きしない"""
+    encoder = SimpleNamespace(color_range=0, colorspace=2, color_primaries=2, color_trc=6)
+    frame = SimpleNamespace(color_range=1, colorspace=1, color_primaries=1, color_trc=1)
+    _copy_colors(encoder, frame)
+    assert vars(encoder) == {
+        "color_range": 1,
+        "colorspace": 1,
+        "color_primaries": 1,
+        "color_trc": 6,
+    }
+    # 絵も決まっていなければ写さない
+    blank = SimpleNamespace(color_range=0, colorspace=2, color_primaries=2, color_trc=2)
+    _copy_colors(
+        blank, SimpleNamespace(color_range=0, colorspace=2, color_primaries=2, color_trc=2)
+    )
+    assert blank.colorspace == 2
 
 
 def test_two_editing_streams_are_not_offered() -> None:

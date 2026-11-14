@@ -24,7 +24,7 @@ from sashimono.core.model import (
     Timeline,
     Track,
 )
-from sashimono.core.packed import read_window
+from sashimono.core.packed import read_windows
 from sashimono.effects import registry
 from sashimono.effects.sources import source_registry
 from sashimono.effects.spec import FileSpec, FontSpec
@@ -141,9 +141,9 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
             found[item.id] = None
             continue
         # 止めるのは絵だけで、音は source_in から長さの分を読み続ける（AudioMixer） 絵の読む所と
-        # 音の読む所の和を入れる（#449 の Codex の指摘） 数え方は開いた先で範囲の外を断る確かめ
+        # 音の読む所を別々に入れる（#449 の Codex の指摘） 数え方は開いた先で範囲の外を断る確かめ
         # （#445）と 1 つにする ずれると、入れていない所を読む編集が断られずに通る
-        start, end = read_window(
+        windows = read_windows(
             clip,
             timeline,
             sounds=project.plays_sound(track, clip),
@@ -151,17 +151,16 @@ def media_spans(project: Project, margin: Fraction) -> dict[MediaId, list[Span] 
             history=history_seconds,
             sample_rate=project.settings.sample_rate,
         )
-        start = max(Fraction(0), start - margin)
-        end = end + margin
-        if item.duration > 0:
-            end = min(end, item.duration)
-        if end < start:
-            end = start
         if item.id in found and found[item.id] is None:
             continue
         spans = found.setdefault(item.id, [])
         assert spans is not None
-        spans.append(Span(start, end))
+        for start, end in windows:
+            start = max(Fraction(0), start - margin)
+            end = end + margin
+            if item.duration > 0:
+                end = min(end, item.duration)
+            spans.append(Span(start, max(start, end)))
     return {
         key: (spans_union(spans) if spans is not None else None) for key, spans in found.items()
     }

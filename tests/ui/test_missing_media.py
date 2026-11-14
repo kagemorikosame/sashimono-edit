@@ -209,6 +209,21 @@ def test_packed_seconds_are_rounded_inward(
     )
     [row] = call_tool(window, "list_media", {})["media"]
     assert row["packed_seconds"] == [[0.034, 0.666]]
+    assert row["packed_exact"] == [["1/30", "2/3"]]
+
+
+def test_a_single_picture_range_is_not_turned_inside_out(
+    window: MainWindow, sample_av: SampleMedia, tmp_path: Path
+) -> None:
+    """止めた絵 1 枚だけの区間を内側へ丸めると頭が終わりより後ろになり、AI が使える時刻を失う"""
+    span = PackedSpan(Fraction(1, 30), Fraction(1, 30))
+    item = replace(probe_media(sample_av.path), packed=(span,))
+    window._adopt_opened(
+        Project.create(media=(item,), name="範囲だけ"), tmp_path / "展開.sme", notice=False
+    )
+    [row] = call_tool(window, "list_media", {})["media"]
+    [[start, end]] = row["packed_seconds"]
+    assert start == end and Fraction(str(start)).limit_denominator(1000000) == Fraction(1, 30)
 
 
 def test_an_old_list_does_not_stay_after_opening_another_project(

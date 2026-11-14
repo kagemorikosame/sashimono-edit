@@ -24,7 +24,7 @@ from sashimono.core.model import (
     TrackKind,
     VideoStreamInfo,
 )
-from sashimono.core.packed import packed_refusal
+from sashimono.core.packed import outside_packed, packed_refusal
 from sashimono.core.timebase import FrameRate
 
 RATE = FrameRate(30, 1)
@@ -154,7 +154,9 @@ class TestRefusal:
         project = replace(
             document.project, timeline=replace(document.project.timeline, tracks=(track,))
         )
-        # 読むのは 12〜15 秒の音だけ 5 秒の絵は描かない
+        # 読むのは 12〜15 秒の音だけ 5 秒の絵は描かない 前から外を読む扱いだと、縮める編集は
+        # 前の区間の中として通ってしまうので、初めの状態が外を読んでいないことも確かめる
+        assert outside_packed(project) == {}
         Document(project).execute(TrimClip(clip.id, tail_delta=-10))
 
     def test_sound_history_counts_from_the_head_not_the_held_picture(self) -> None:
@@ -166,9 +168,31 @@ class TestRefusal:
         project = replace(
             document.project, timeline=replace(document.project.timeline, tracks=(track,))
         )
-        reach = Document(project, sound_history=lambda _c, _r, _s: 1.5)
+
+        def history(_c: Clip, _r: FrameRate, _s: int) -> float:
+            return 1.5
+
+        reach = Document(project, sound_history=history)
         # 絵は 5 秒 音は 10.5〜15 秒 どちらも 5〜20 秒の中
+        assert outside_packed(project, history) == {}
         reach.execute(TrimClip(clip.id, tail_delta=-10))
+
+    def test_the_picture_and_the_sound_are_checked_apart(self) -> None:
+        """止めた絵と音の間の使わない所は読まない 1 つの区間にまとめると、範囲が 2 か所に
+        分かれた素材で、範囲の中の編集まで断る"""
+        packed = (PackedSpan(Fraction(5), Fraction(6)), PackedSpan(Fraction(12), Fraction(20)))
+        document, clip = _document(packed)
+        held = replace(clip, hold_at=Fraction(5), audio_stream=1)
+        track = Track(kind=TrackKind.MIXED, name="混合 1", clips=(held,))
+        project = replace(
+            document.project, timeline=replace(document.project.timeline, tracks=(track,))
+        )
+        assert outside_packed(project) == {}
+        # 90 コマから 120 コマへ 読むのは 5 秒の絵と 12〜16 秒の音
+        Document(project).execute(TrimClip(clip.id, tail_delta=30))
+        # 音が範囲の終わりを越えれば断る
+        with pytest.raises(ValueError, match="外を読む"):
+            Document(project).execute(TrimClip(clip.id, tail_delta=300))
 
     @pytest.mark.parametrize(
         ("kind", "allowed"), [(TrackKind.VIDEO, True), (TrackKind.AUDIO, False)]

@@ -750,6 +750,16 @@ def _x264_format(name: str) -> str | None:
 #: 範囲の印のテレビの範囲（FFmpeg の AVCOL_RANGE_MPEG）
 _TV_RANGE = 1
 
+#: 色の印の「決まっていない」値 範囲は 0、行列・原色・伝達は 2（0 は行列では RGB、原色と伝達では
+#: 予約） 0 だけを見ると、道が 2 と書いた素材で絵の BT.709 を写せず、比べる所で違うと見て
+#: し直しをやめる
+_UNSET_COLORS: dict[str, frozenset[int]] = {
+    "color_range": frozenset({0}),
+    "colorspace": frozenset({2}),
+    "color_primaries": frozenset({0, 2}),
+    "color_trc": frozenset({0, 2}),
+}
+
 
 def _copy_colors(encoder: Any, frame: Any) -> None:
     """``encoder`` の決まっていない色の印を ``frame`` から写す
@@ -757,10 +767,11 @@ def _copy_colors(encoder: Any, frame: Any) -> None:
     ProRes は範囲（テレビの範囲）を道でなく絵ごとに持つ 書かずに開くと、開いた先の読み手が
     範囲を推し直して色が浅く・濃くずれる（試験の素材で RGB の PSNR が 36 dB に落ちた）
     """
-    for name in ("color_range", "colorspace", "color_primaries", "color_trc"):
-        if not getattr(encoder, name, None) and getattr(frame, name, None):
+    for name, unset in _UNSET_COLORS.items():
+        value = getattr(frame, name, None)
+        if getattr(encoder, name, None) in unset and value is not None and value not in unset:
             with contextlib.suppress(AttributeError, ValueError, TypeError):
-                setattr(encoder, name, getattr(frame, name))
+                setattr(encoder, name, value)
 
 
 def _color_marks(frame: Any) -> tuple[int, int]:
