@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from sashimono.core.commands import AddClip, Command, Document, TrimClip
+from sashimono.core.commands import (
+    DEFAULT_STILL_FRAMES,
+    AddClip,
+    Command,
+    Document,
+    TrimClip,
+)
 from sashimono.core.commands.insert import place_media, place_media_spans
 from sashimono.core.commands.speed import ChangeSpeed
 from sashimono.core.io.serialize import load_project, project_from_dict, project_to_dict
@@ -258,6 +264,21 @@ class TestPlacing:
             assert clip.source_in == Fraction(30)
             # 切り捨てるので、丸めて区間の外へ 1 コマ出ない
             assert clip.source_out(RATE) <= Fraction(81, 2)
+
+    def test_a_single_held_picture_is_placed_as_a_still(self) -> None:
+        """止めた絵 1 枚だけの区間を 1 コマ以上で置くと続きを読んで断られ、元の止め絵を消すと
+        素材一覧から置き直せない 止めた絵で、音を付けずに置く"""
+        document, _clip = _document((PackedSpan(Fraction(5), Fraction(5)),))
+        item = document.project.media[0]
+        commands = place_media(document.project, [item], at_frame=300)
+        with document.checkpoint("置く"):
+            for command in commands:
+                document.execute(command)
+        placed = [c.clip for c in commands if isinstance(c, AddClip) and c.clip.media_id == item.id]
+        assert len(placed) == 1
+        [still] = placed
+        assert still.source_in == Fraction(5) and still.hold_at == Fraction(5)
+        assert still.duration == DEFAULT_STILL_FRAMES
 
     def test_a_span_asked_up_to_the_range_end_stays_inside(self) -> None:
         """範囲と同じ区間を頼んで近い方へ丸めると 1 コマ外へ出て、範囲の中なのに断られる"""
