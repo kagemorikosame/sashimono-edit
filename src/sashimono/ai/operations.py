@@ -249,6 +249,7 @@ from sashimono.core.commands.insert import (
 from sashimono.core.commands.layers import places_mixed
 from sashimono.core.commands.speed import SPEED_PERCENT_RANGE, ChangeSpeed, speed_members
 from sashimono.core.commands.volume import clip_volume, volume_commands
+from sashimono.core.direction import DirectionEvent, KindDensity, measure_direction
 from sashimono.core.emphasis import (
     EMPHASIS_EASINGS,
     EMPHASIS_KINDS,
@@ -2537,6 +2538,124 @@ def _check_style_guide(host: EditorHost, arguments: dict[str, Any]) -> object:
             " 方針の外の種類は problems にある"
         )
     return _paged_after(head, rows, arguments, "problems", note)
+
+
+#: 色の補正に当たるエフェクトの分類 演出の「色」に数える（エフェクトの定義の category）
+_COLOR_CATEGORY = "色"
+#: 返す「近すぎる所」の数の上限 型ごと 全部並べると、寄るを 1 秒おきに付けた作品で一覧が埋まる
+_CLOSE_SHOWN = 10
+
+
+def _min_gaps_argument(arguments: dict[str, Any]) -> dict[str, float]:
+    raw = arguments.get("min_gaps")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ToolError('min_gaps は型の名前から秒への対応で渡してください（例 {"zoom": 6}）')
+    gaps: dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ToolError(f"min_gaps の {key} は 0 以上の秒です（{value!r} が来ました）")
+        gaps[str(key)] = float(value)
+    return gaps
+
+
+def _density_row(density: KindDensity) -> dict[str, Any]:
+    kind = density.kind
+    row: dict[str, Any] = {
+        "kind": kind.key,
+        "name": kind.name,
+        "counts": kind.counts,
+        "count": density.count,
+        "per_minute": density.per_minute,
+        "min_gap_seconds": density.min_gap_seconds,
+        "median_gap_seconds": density.median_gap_seconds,
+        "limit_seconds": density.limit_seconds,
+        "too_close": len(density.too_close),
+    }
+    if density.too_close:
+        row["too_close_at"] = [
+            {"first_frame": c.first_frame, "second_frame": c.second_frame, "gap": c.gap_seconds}
+            for c in density.too_close[:_CLOSE_SHOWN]
+        ]
+    if kind.unit and density.strength_max is not None:
+        row["strength"] = {
+            "unit": kind.unit,
+            "min": density.strength_min,
+            "median": density.strength_median,
+            "max": density.strength_max,
+        }
+    if density.coverage is not None:
+        row["coverage"] = density.coverage
+    return row
+
+
+def _event_row(event: DirectionEvent) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "kind": event.kind,
+        "start_frame": event.start_frame,
+        "end_frame": event.end_frame,
+        "clip_id": event.clip_id,
+        "track_id": event.track_id,
+    }
+    if event.strength is not None:
+        row["strength"] = round(event.strength, 3)
+    if event.pan_only:
+        row["pan_only"] = True
+    return row
+
+
+def _measure_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
+    project = _project(host)
+    raw_scene = str(arguments.get("scene_id") or "")
+    timeline = project.timeline
+    if raw_scene:
+        scene = project.find_scene(SceneId(raw_scene))
+        if scene is None:
+            raise ToolError(f"シーンが見つかりません: {raw_scene}（list_scenes で一覧を取れます）")
+        timeline = scene.timeline
+    colors = frozenset(d.kind for d in registry.all() if d.category == _COLOR_CATEGORY)
+    start = arguments.get("start_frame")
+    end = arguments.get("end_frame")
+    try:
+        report = measure_direction(
+            project,
+            timeline,
+            color_kinds=colors,
+            start_frame=_frame_argument(arguments, "start_frame", 0) if start is not None else None,
+            end_frame=_frame_argument(arguments, "end_frame", 0) if end is not None else None,
+            min_gaps=_min_gaps_argument(arguments),
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    head: dict[str, Any] = {
+        "scene_id": raw_scene or None,
+        "start_frame": report.start_frame,
+        "end_frame": report.end_frame,
+        "seconds": report.seconds,
+        "kinds": [_density_row(density) for density in report.kinds],
+        "scene_clips": report.scene_clips,
+        "speed_changes": report.speed_changes,
+    }
+    if not project.style_guide.empty:
+        # 方針との合いも同じ返事で見られるようにする 数だけを添え、在りかは check_style_guide で読む
+        # 方針の外の効果を数に入れずに密度だけを返すと、密度は良いのに方針の外という作品を見逃す
+        counts = dict.fromkeys((STYLE_FONT, STYLE_COLOR, STYLE_EFFECT), 0)
+        for problem in style_problems(project):
+            counts[problem.kind] += 1
+        head["outside_guide"] = counts
+    note = (
+        "数えたのは演出の頭が範囲に入っている物です too_close は limit_seconds より近く続いた所"
+        "（やりすぎの目安） 下限は min_gaps で型ごとに変えられます"
+        " シーンのクリップは 1 本の絵として数え、中は scene_id を渡して測ります"
+    )
+    if "outside_guide" in head:
+        note += (
+            " outside_guide は編集の方針の外の書体・色・効果の数で、在りかは"
+            " check_style_guide で読めます"
+        )
+    rows = [_event_row(event) for event in report.events]
+    return _paged_after(head, rows, arguments, "events", note)
 
 
 def _author(by: Author | None) -> str | None:
@@ -11542,6 +11661,38 @@ OPERATIONS: tuple[Operation, ...] = (
         schema=_schema(_paging()),
         handler=_check_style_guide,
         # 返すのは書体の名前・色・効果の種類とクリップの在りかだけ 方針の文も本文も返さない
+        sends=_STRUCTURE,
+    ),
+    Operation(
+        name="measure_direction",
+        description=(
+            "作品に付いた演出（寄る・ずらす zoom 揺らす shake 場面切り替え transition"
+            " テロップ telop 効果音 sound 色 color テンポ cut）を型ごとに数える（読むだけ）"
+            " kinds に回数・1 分あたり（per_minute）・続く 2 回の間隔（最短と中央 秒）・強さ・"
+            "やりすぎの目安の下限（limit_seconds）より近い所（too_close）を返す"
+            " 型ごとに何を数えたかは counts の文 演出を付けた後に、付けすぎ・足りない・偏りを"
+            "数で確かめるのに使う 字幕（起こしから置いた物）・映像の音・BGM・ナレーションは"
+            "数えない 範囲（start_frame〜end_frame）を省くと全体 一覧（events）は" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "scene_id": _string("測るシーン 省くとメイン（開いているシーンではない）"),
+                "start_frame": _integer("測る範囲の頭 省くとタイムラインの頭"),
+                "end_frame": _integer("測る範囲の終わり（含まない） 省くとタイムラインの終わり"),
+                "min_gaps": {
+                    "type": "object",
+                    "description": (
+                        '型ごとのやりすぎの目安の下限（秒）の上書き 例 {"zoom": 6}'
+                        " 省いた型は既定（kinds の limit_seconds）"
+                    ),
+                    "additionalProperties": {"type": "number"},
+                },
+                **_paging(),
+            }
+        ),
+        handler=_measure_direction,
+        # 返すのは型・フレーム・強さ・クリップとトラックの ID だけ
+        # テロップの本文も方針の文も返さない
         sends=_STRUCTURE,
     ),
     Operation(
