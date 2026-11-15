@@ -2,12 +2,15 @@
  "tolerances": {
   "scene_frames": 2,
   "talk_seconds": 1.0,
-  "subtitle_seconds": 0.5
+  "subtitle_seconds": 0.5,
+  "filler_seconds": 0.5
  },
  "materials": [
   {"id": "E04", "tasks": ["silence", "subtitles", "export", "groups"]},
   {"id": "E05", "tasks": ["silence", "talk", "subtitles", "highlights", "groups"]},
-  {"id": "E09", "tasks": ["silence", "scenes", "export"]},
-  {"id": "E11", "tasks": ["scenes"]}
+  {"id": "E09", "tasks": ["silence", "scenes", "export", "seams"]},
+  {"id": "E11", "tasks": ["scenes"]},
+  {"id": "E12", "tasks": ["highlights", "fillers"]},
+  {"id": "E13", "tasks": ["highlights", "fillers"]}
  ]
 }
