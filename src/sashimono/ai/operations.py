@@ -10601,7 +10601,8 @@ _SCREEN_TEXT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.TEXT})
 #: アプリ自身の設定 書き出しのフォルダや退避の置き場が入る
 _APP_SETTINGS = frozenset({Outbound.APP_SETTINGS, Outbound.FILES})
 #: 字幕起こし（#469） 素材の名前を返し、省いた引数は本人の設定（AI の起こしのモデル・語の時刻・
-#: 声へ寄せるか）で起こして、使った方式を返事の method に載せる
+#: 声へ寄せるか）で起こして、使った方式を返事の method に載せる アプリの設定を書かないと、
+#: 設定を送らないと決めた人の所でも本人の設定の値が黙って返事に載る
 _TRANSCRIBE = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
 #: 保存したプリセット・エイリアスで字幕に見た目を着せる道具（#308） 見つからないと断る文に
 #: 保存してある物の名前を並べる（AI が名前を選び直すための唯一の手掛かり） 本人の持ち物の

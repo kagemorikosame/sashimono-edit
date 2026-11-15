@@ -123,11 +123,13 @@ class FakeHost:
         self.ripple_layers = True
         self.transcribed_stream: int | None = None
         self.transcribed_words_only = False
-        #: 起こしに渡した値（#469） 起こしていなければ None
+        #: 起こしに渡した値（#469） 起こしていなければ None 断る試験が「起こし始めてから断った」
+        #: を見分けられるよう、既定の値ではなく None で始める
         self.transcribed_model: str | None = None
         self.transcribed_word_timestamps: bool | None = None
         self.transcribed_timing: SubtitleTiming | None = None
-        #: 本人の設定の AI の起こしのモデルと語の時刻（#469）
+        #: 本人の設定の AI の起こしのモデルと語の時刻（#469） 試験ごとに替え、省いた引数が
+        #: 設定に従うかを見る 本物の設定を読むと試験が利用者の機械の設定で変わる
         self.transcribe_model = "large-v3"
         self.words = True
         #: 話者の分離（#323）を頼まれた素材・音声・人数 断らせたいときは理由を入れる
@@ -614,7 +616,8 @@ class FakeHost:
         #: 起こすように頼まれた音声ストリームの番号
         self.transcribed_stream = audio_stream
         self.transcribed_words_only = words_only
-        #: 起こすように頼まれたモデル・語の時刻・時刻の合わせ方（#469）
+        #: 起こすように頼まれたモデル・語の時刻・時刻の合わせ方（#469） 返事の method だけを
+        #: 見ると、文言は合っていても違う方式で起こしたことを見逃す
         self.transcribed_model = model
         self.transcribed_word_timestamps = word_timestamps
         self.transcribed_timing = timing

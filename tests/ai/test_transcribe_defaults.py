@@ -110,6 +110,7 @@ class TestWhenAsked:
         # "false" を真と読むと、頼みと逆の方式で数分起こす
         with pytest.raises(ToolError, match="fit_to_voice"):
             _transcribe(host, fit_to_voice="false")
+        assert host.transcribed_model is None
 
 
 class TestWordsOnly:
@@ -123,6 +124,7 @@ class TestWordsOnly:
         # 語の時刻だけを足す頼みは行の時刻を変えない 受けると寄せたと思わせる
         with pytest.raises(ToolError, match="retime_subtitles"):
             _transcribe(host, words_only=True, fit_to_voice=True)
+        assert host.transcribed_model is None
 
     def test_words_only_takes_word_times_even_when_the_setting_is_off(self, host: FakeHost) -> None:
         # 設定で語の時刻を切っていても、足す頼みそのものが語の時刻を取る頼み

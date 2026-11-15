@@ -496,6 +496,9 @@ class EditorHost(Protocol):
     def ai_transcribe_model(self) -> str:
         """AI が字幕を起こすとき、モデルを指示されなければ使うモデル（#469）
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.ai_transcribe_model`）
+
+        道具の側に決め打ちすると、GPU の無い PC で下書きだけ欲しい人も、毎回 AI に「turbo で」と
+        頼むしかない 窓の選択と分けるのは、窓は人がその場で選ぶので AI の既定に引きずられないため
         """
         ...
 
@@ -504,7 +507,9 @@ class EditorHost(Protocol):
         """字幕起こしで語の時刻も取るか（#420）
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.word_timestamps`）
 
-        AI が引数で渡さなければこれを使う（#469）
+        AI が引数で渡さなければこれを使う（#469） 窓と同じ設定を読むのは、同じ人が窓と AI の
+        どちらで起こしても語の時刻の有無がそろうため 分けると、AI で起こした字幕だけ語の境目で
+        切れないことに気付けない
         """
         ...
 
