@@ -308,7 +308,17 @@ def test_a_python_bound_stall_is_sampled_while_it_lasts(tmp_path: Path) -> None:
     try:
         watch.beat()
         began = time.perf_counter()
-        while time.perf_counter() - began < 0.4:
+
+        def sampled() -> int:
+            stall = watch._stall
+            return len(stall.samples) if stall is not None else 0
+
+        # 400 ms は回し続ける 混んだ機械で見張りの係がなかなか回ってこないときは、2 回写すまで
+        # 回し続ける 400 ms で切ると、その間に係が 1 度も動かなかっただけで落ちる 上限は 10 秒
+        # 写せない書き方なら上限まで回って並び無しのまま記録され、下の確かめで落ちる
+        while time.perf_counter() - began < 0.4 or (
+            sampled() < 2 and time.perf_counter() - began < 10
+        ):
             sum(range(1000))
         watch.beat()
         deadline = time.perf_counter() + 5

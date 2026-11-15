@@ -165,10 +165,15 @@ class TestListing:
         widget._table.selectAll()
         assert widget.selected_segments() == (fresh.segments[0].id,)
 
+    @pytest.mark.parametrize("shown_first", [False, True])
     def test_the_chosen_rows_survive_catching_up(
-        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        shown_first: bool,
     ) -> None:
         # 壊れると、隠れている間に作品が変わっただけで、人が選んでいた字幕が AI から見えなくなる
+        # タブを表に出して追いついたときも同じ 先に AI が読んだかどうかで選択が変わらない
         widget, _ = panel
         model = widget._table.selectionModel()
         adding = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
@@ -179,7 +184,29 @@ class TestListing:
         assert len(chosen) == 2
         widget.set_shown(False)
         widget.set_project(RippleCut(((0, 30),)).apply(placed))
+        if shown_first:
+            widget.set_shown(True)
         assert widget.selected_segments() == chosen
+
+    @pytest.mark.parametrize("shown_first", [False, True])
+    def test_the_playhead_row_is_chosen_again_after_catching_up(
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        shown_first: bool,
+    ) -> None:
+        # 壊れると、隠れている間に再生位置が動くと前の時刻の一覧で行を選び、追いついた後も
+        # 再生位置と違う字幕を AI やテキストの配置へ渡す
+        # 一覧は [30,90) [120,180) [210,270) 頭の 60 フレームを切ると [60,120) [150,210)
+        # 165 は前の一覧なら 2 本目、今の一覧なら 3 本目
+        widget, _ = panel
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 60),)).apply(placed))
+        widget.set_frame(165)
+        if shown_first:
+            widget.set_shown(True)
+        assert widget.selected_segments() == (widget._rows[2][0],)
+        assert widget._table.currentRow() == 2
 
     def test_a_failed_rebuild_is_tried_again(
         self,

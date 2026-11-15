@@ -176,6 +176,9 @@ class SubtitlePanel(QWidget):
         #: 一覧を作り直さず、作り直しが要ることだけ覚える（:attr:`_stale`）
         self._shown = True
         self._stale = False
+        #: 再生位置に合わせて選んだ行の字幕（:meth:`_highlight`） 人が選び直したら ``None``
+        #: 追いつくときに人の選択と見分ける 再生位置の行を選び直すと、前の時刻の行が戻る
+        self._followed: SegmentId | None = None
         self._updating = False
         #: 起こしの実行係 バックエンドの読み込みは重いので、初めて使うときに作る
         self._service: TranscriptionService | None = None
@@ -365,6 +368,10 @@ class SubtitlePanel(QWidget):
         if frame == self._frame:
             return
         self._frame = frame
+        if self._stale:
+            # 隠れている間の一覧は前の時刻のまま 選ぶと、切った後に別の字幕へ移った位置で
+            # 前の行を選び、追いついた後もそれが人の選択として残る 作り直すときに選ぶ
+            return
         self._highlight()
 
     @property
@@ -642,6 +649,7 @@ class SubtitlePanel(QWidget):
         """再生ヘッドの位置にある字幕を選ぶ"""
         for row, (_, start, end) in enumerate(self._rows):
             if start <= self._frame < end:
+                self._followed = self._rows[row][0]
                 if self._table.currentRow() != row:
                     self._updating = True
                     self._table.selectRow(row)
@@ -656,6 +664,8 @@ class SubtitlePanel(QWidget):
     def _on_row_selected(self) -> None:
         if self._updating:
             return
+        # 人が選んだ 再生位置で選んだ行ではなくなる
+        self._followed = None
         row = self._table.currentRow()
         if 0 <= row < len(self._rows):
             _, start, _ = self._rows[row]
@@ -1348,25 +1358,21 @@ class SubtitlePanel(QWidget):
             self._catch_up()
 
     def _catch_up(self) -> None:
-        """遅らせた一覧の作り直しを済ませる
+        """遅らせた一覧の作り直しを済ませる 見えていなくても作る
 
-        見えた時に呼ぶ 呼ばないと、隠れている間に変わった作品の字幕が、次に作品が
-        変わるまで前の時刻のまま並ぶ
-        """
-        if self._stale:
-            self._reload_rows()
-
-    def _catch_up_shown(self) -> None:
-        """行を読む前に、見えていなくても一覧を今の素材に合わせる
-
-        隠れている間の一覧は前の素材の行のまま残っている そのまま読むと、AI やメニューが
-        別の素材の字幕を選んでいると受け取る
+        見えた時と、行を読む前（AI・メニュー）に呼ぶ 呼ばないと、隠れている間に変わった
+        作品の字幕が前の時刻のまま並び、別の素材の字幕を選んでいると受け取る
+        どちらから呼んでも人の選択を同じに保つ 片方だけで保つと、先に AI が読んだかどうかで
+        見えた後の選択が変わる（#475 の CodeRabbit）
         """
         if not self._stale:
             return
         # 作り直すと表の選択が消える 人が選んでいた字幕は、今の一覧に残っていれば選び直す
         # 選び直さないと、隠れている間に作品が変わっただけで AI へ渡す選択が空になる
+        # 再生位置で選んだ行は選び直さない 作り直した一覧で今の時刻の行を選び直す
         chosen = set(self._chosen_rows())
+        if self._followed is not None and chosen == {self._followed}:
+            chosen = set()
         shown, self._shown = self._shown, True
         try:
             self._reload_rows()
@@ -1393,12 +1399,12 @@ class SubtitlePanel(QWidget):
 
     def selected_segments(self) -> tuple[SegmentId, ...]:
         """表で選んでいる行の字幕 上から順 AI が人の選択を読む口（#352）"""
-        self._catch_up_shown()
+        self._catch_up()
         return self._chosen_rows()
 
     def place_selected_rows(self) -> None:
         """選んだ行（無ければ再生位置の 1 行）をテキストとしてタイムラインへ置く"""
-        self._catch_up_shown()
+        self._catch_up()
         media = self._current_media()
         if media is None:
             return

@@ -415,6 +415,24 @@ class TestCut:
         assert remux._same_packets(source, whole, index, moment, end, lambda: False)
         assert not remux._same_packets(source, missing, index, moment, end, lambda: False)
 
+    def test_matching_mp3_packets_are_not_trusted(self, tmp_path: Path) -> None:
+        """壊れると、MP3 でもパケットが同じなら認め、比べる窓の外の欠けを見落とす
+
+        MP3 は前のパケットの残り（bit reservoir）を引くので、窓の中が同じでも頭の音が
+        変わりうる 解き始めで音が変わる理由の分かっている AAC だけを認める
+        """
+        if shutil.which("ffmpeg") is None:
+            pytest.skip("ffmpeg が無いので素材を作れない")
+        source = tmp_path / "tone.mp3"
+        _ffmpeg(
+            "-f", "lavfi", "-i", "sine=frequency=300:duration=4:sample_rate=44100",
+            "-c:a", "libmp3lame", str(source),
+        )  # fmt: skip
+        index = probe_media(source).audio_streams[0].index
+        assert not remux._same_packets(
+            source, source, index, Fraction(1), Fraction(2), lambda: False
+        )
+
     def test_unreadable_pictures_are_not_trusted(
         self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

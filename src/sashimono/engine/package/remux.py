@@ -637,8 +637,13 @@ def _same_sound(
     return True
 
 
-#: 1 つのパケットが持つ音の長さを読めないときに比べない印（:func:`_packet_seconds`）
+#: 1 つのパケットが持つ音の長さを読めないときに比べない印（:func:`_decoding_setup`）
 _UNKNOWN_LENGTH = Fraction(0)
+
+#: パケットが同じなら音の違いを認める符号 解き始めで音が変わる理由（PNS の乱数）が分かって
+#: いる物だけにする MP3 は前のパケットの残り（bit reservoir 最大 511 バイト）を引くので、比べる
+#: 窓の外の欠けを見落とす 理由の分からない符号の違いは写し漏れとして扱う（#475 の CodeRabbit）
+_PACKET_TRUSTED_CODECS = frozenset({"aac"})
 
 #: パケットの時刻・中身・付け足しの情報（区間の頭で飛ばす標本の数など 解いた音を変える）
 _PacketKey = tuple[Fraction, bytes, tuple[tuple[str, bytes], ...]]
@@ -660,12 +665,16 @@ def _same_packets(
     さかのぼる長さはパケット 2 つぶん 決め打ちにすると、1 パケットが長い形（8 kHz の AAC は
     128 ms）で 1 つ前まで届かない 復号の設定（符号の名前・標本の速さ・チャンネル・頭の設定）も
     比べる 設定が違えば同じパケットでも違う音になる
-    パケットの長さを読めない・1 つも無いときは確かめられなかったとして偽（まるごと入る）
+    パケットの長さを読めない・1 つも無い・AAC でないときは確かめられなかったとして偽（まるごと入る）
     区間の外を無音に置き換えた PCM（:func:`_hush`）は中身が変わるので偽になる
     """
     old_setup, length = _decoding_setup(source, index)
     new_setup, _ = _decoding_setup(target, index)
-    if length == _UNKNOWN_LENGTH or old_setup != new_setup:
+    if (
+        length == _UNKNOWN_LENGTH
+        or old_setup != new_setup
+        or old_setup[0] not in _PACKET_TRUSTED_CODECS
+    ):
         return False
     begin = start - 2 * length
     old = _packets(source, index, begin, end, cancelled)
