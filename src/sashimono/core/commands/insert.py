@@ -235,16 +235,33 @@ def _place(
     if project.find_media(media.id) is None:
         commands.append(AddMedia(media))
 
+    # 範囲だけを入れた素材は、頼まれた区間も切り捨てて数える 近い方へ丸めると、範囲の終わりと
+    # 同じ区間を頼まれたときに 1 コマ外へ出て、範囲の中を頼んだのに断られる
+    rounding = Rounding.FLOOR if media.packed else Rounding.NEAREST
+    if span is None and media.packed:
+        # 持ち出し用パッケージで範囲だけを入れた素材は、入っている区間に収めて置く（#445）
+        # 全体を置こうとすると範囲の外を読むので断られ、素材一覧から置き直せなくなる
+        # 区間が何か所かあれば一番長い所
+        longest = max(media.packed, key=lambda packed: packed.end - packed.start)
+        span = (longest.start, longest.end)
     source_in = Fraction(0) if span is None else span[0]
+    # 範囲だけの素材で長さ 0 の区間は、止めた絵 1 枚を持ち出した所（前後の余裕を 0 にしたとき）
+    # 1 コマ以上の長さで置くと続きの絵と音を読んで断られ、元の止め絵を消すと置き直せなくなる
+    # その絵で止めた映像だけを、静止画と同じ長さで置く
+    frozen = bool(media.packed) and span is not None and span[1] <= span[0]
+    if frozen and not media.has_video:
+        return commands
     duration = (
         _timeline_duration(project, media)
         if span is None
-        else max(1, seconds_to_frame(span[1] - span[0], project.rate, Rounding.NEAREST))
+        else DEFAULT_STILL_FRAMES
+        if frozen
+        else max(1, seconds_to_frame(span[1] - span[0], project.rate, rounding))
     )
     if duration <= 0:
         return commands
 
-    streams = media.audio_streams if split_audio else media.audio_streams[:1]
+    streams = () if frozen else media.audio_streams if split_audio else media.audio_streams[:1]
     parts = (1 if media.has_video or media.is_still else 0) + len(streams)
     # 置くクリップが 2 本以上あるときだけリンクする 1 本しかないのにグループを
     # 付けると、あとで別の素材と誤って連動する余地を残すことになる
@@ -270,7 +287,10 @@ def _place(
         # 端数で 1 コマ増えた素材は、絵のクリップが映像の終わりを越える 越えた所を最後の
         # 絵で止める 止めないと書き出した動画の終わりが黒くなる（#402） 映像の長さで
         # 切らないのは、音の終わり（話し声やBGMの尻）を黙って欠かさないため
-        picture = replace(picture, hold_at=held_at_end(picture, media, project.rate))
+        picture = replace(
+            picture,
+            hold_at=source_in if frozen else held_at_end(picture, media, project.rate),
+        )
 
     # 音ごとに作る 音量とフェードの欄は 2 本目以降の音にも付ける 付けないと、
     # 置いた直後に 2 本目の音だけ音量をいじれない

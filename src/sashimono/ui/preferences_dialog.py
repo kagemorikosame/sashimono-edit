@@ -898,6 +898,19 @@ class PreferencesDialog(QDialog):
         )
         form.addRow("持ち出し用パッケージを開く場所", self._package_folder)
 
+        # 作品のフォルダを写して別の作品にした人は、写した先の素材を指してほしいことがあり、
+        # 元の素材を指してほしい人もいる（#447） 既定は前の版と同じ物を開く側
+        self._media_relative_first = QCheckBox(
+            "作品を開くとき、素材を作品のフォルダから見た場所で先に探す", self
+        )
+        self._media_relative_first.setChecked(preferences.media_relative_first)
+        self._media_relative_first.setToolTip(
+            "切っていると、保存したときの場所を先に見て、無ければ作品のフォルダから見た同じ並びの"
+            "場所を見る 入れると逆の順にする（作品と素材をフォルダごと写して別の作品にしたとき、"
+            "写した先の素材を開く）"
+        )
+        form.addRow(self._media_relative_first)
+
         self._wheel_unfocused = QCheckBox(
             "設定パネルで、クリックしていない欄でもホイールで値を変える", self
         )
@@ -1567,6 +1580,7 @@ class PreferencesDialog(QDialog):
             shelf_thumbnails=self._shelf_thumbnails.isChecked(),
             save_overwrite_without_asking=self._save_overwrite.isChecked(),
             package_folder=self._package_folder.folder(),
+            media_relative_first=self._media_relative_first.isChecked(),
             wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),

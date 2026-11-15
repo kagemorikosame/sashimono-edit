@@ -41,6 +41,7 @@ from sashimono.core.model import (
     group_as_one,
     group_reaches,
 )
+from sashimono.core.relink import moved_media
 from sashimono.core.timebase import FrameRate, seconds_to_frame
 from sashimono.effects.easing import ease
 from sashimono.effects.sources import PREVIOUS_OBJECT
@@ -638,7 +639,9 @@ class FrameRenderer:
             self._effects.canvas_encoded = self._encoded
 
         alive = {m.id for m in project.media}
-        for key in [k for k in self._decoders if k[0] not in alive]:
+        # 付け替えた素材（#447）のデコーダも閉じる ID が同じなので、閉じないと前のファイルの絵を出す
+        moved = moved_media(previous, project)
+        for key in [k for k in self._decoders if k[0] not in alive or k[0] in moved]:
             self._decoders.pop(key).close()
 
         # 音声波形の音も、使われなくなったものは閉じる 開いたままだと、クリップを消しても

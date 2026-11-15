@@ -240,7 +240,9 @@ def _start_editor(arguments: list[str]) -> int:
     path = None
     if len(arguments) > 1:
         try:
-            project = load_project(Path(arguments[1]))
+            project = load_project(
+                Path(arguments[1]), relative_first=PreferenceStore().load().media_relative_first
+            )
             path = Path(arguments[1])
         except ProjectFileError as exc:
             print(f"プロジェクトを開けない: {exc}", file=sys.stderr)
@@ -252,6 +254,9 @@ def _start_editor(arguments: list[str]) -> int:
     QTimer.singleShot(0, mark_started)
     # 窓が描かれてから尋ねる 先に尋ねると、何のソフトの話かが分からない
     QTimer.singleShot(0, window.offer_recovery)
+    if project is not None:
+        # 渡された作品の素材が見つからなければ知らせる（#447 〔開く…〕と同じ）
+        QTimer.singleShot(0, lambda: window.show_missing_media(only_if_missing=True))
     # 新しい版を確かめるのは、起動が落ち着いてから 起動を待たせない
     QTimer.singleShot(STARTUP_DELAY_MS, window.start_updates)
     return application.exec()

@@ -131,7 +131,8 @@ class RecoverySession:
 
     def save(self, project: Project, source: Path | None) -> None:
         """いまの状態を退避する 書き込み中に落ちても前回の退避は残る"""
-        save_project(project, self.path)
+        # 素材の相対の場所（#447）は書かない 退避のフォルダから数えた場所は作品の場所と関係が無い
+        save_project(project, self.path, relative=False)
         meta = {
             "source": str(source) if source is not None else None,
             "name": project.name,

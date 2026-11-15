@@ -34,6 +34,7 @@ from sashimono.core.model import (
     LayerMode,
     Marker,
     MediaItem,
+    PackedSpan,
     Project,
     ProjectSettings,
     Scene,
@@ -143,6 +144,7 @@ def _full_project() -> Project:
         ),
         transcripts=((1, Transcript((segment,), language="ja", model="small")),),
         display_name="本編の名前",
+        packed=(PackedSpan(Fraction(1, 3), Fraction(7, 2)),),
     )
     scene = Scene("場面", Timeline(rate=RATE))
     filled = Clip(

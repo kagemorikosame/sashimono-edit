@@ -18,6 +18,7 @@ import ast
 import importlib
 import inspect
 import pkgutil
+import wave
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -202,6 +203,19 @@ def _import_media(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     path.write_bytes(b"")
     host.probe_result = material.video_media
     return host, "import_media", {"paths": [str(path)]}
+
+
+def _relink_media(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    host = _text_host(material)
+    path = material.tmp_path / "移した先.wav"
+    # 読める素材にする 読めないファイルは force でも付け替えない 0.1 秒の無音の WAV は
+    # 長さも道の数も作品の素材と違って見えるので、force で確かめを越えて付け替えさせる
+    with wave.open(str(path), "wb") as sound:
+        sound.setnchannels(1)
+        sound.setsampwidth(2)
+        sound.setframerate(8000)
+        sound.writeframes(b"\0\0" * 800)
+    return host, "relink_media", {"media_id": _ids(host)["media"], "path": str(path), "force": True}
 
 
 def _place_subtitles(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
@@ -476,6 +490,7 @@ EXAMPLES: dict[str, Example] = {
     "place_scene": _place_scene,
     "add_text in a scene": _in_scene,
     "import_media": _import_media,
+    "relink_media": _relink_media,
     "place_subtitles": _place_subtitles,
     "jet_cut": _jet_cut,
     "cut_fillers": _cut_fillers,
