@@ -2554,8 +2554,10 @@ def _min_gaps_argument(arguments: dict[str, Any]) -> dict[str, float]:
         raise ToolError('min_gaps は型の名前から秒への対応で渡してください（例 {"zoom": 6}）')
     gaps: dict[str, float] = {}
     for key, value in raw.items():
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-            raise ToolError(f"min_gaps の {key} は 0 以上の秒です（{value!r} が来ました）")
+        # NaN と無限大も断る 通すと limit_seconds に入り、厳密な JSON として読めない返事になる
+        valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if not valid or not math.isfinite(value) or value < 0:
+            raise ToolError(f"min_gaps の {key} は 0 以上の有限の秒です（{value!r} が来ました）")
         gaps[str(key)] = float(value)
     return gaps
 
@@ -2606,7 +2608,9 @@ def _event_row(event: DirectionEvent) -> dict[str, Any]:
 
 
 def _measure_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
-    project = _project(host)
+    # 開いているシーンを差し込んだ形（host.project）でなく文書の作品から選ぶ 差し込んだ形を
+    # 使うと、シーンを開いているときに scene_id を省いてもメインでなくそのシーンを測る
+    project = host.document.project
     raw_scene = str(arguments.get("scene_id") or "")
     timeline = project.timeline
     if raw_scene:
@@ -2641,8 +2645,13 @@ def _measure_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         # 方針との合いも同じ返事で見られるようにする 数だけを添え、在りかは check_style_guide で読む
         # 方針の外の効果を数に入れずに密度だけを返すと、密度は良いのに方針の外という作品を見逃す
         counts = dict.fromkeys((STYLE_FONT, STYLE_COLOR, STYLE_EFFECT), 0)
+        # 測ったのと同じタイムラインと範囲の物だけを数える 作品全体を数えると、範囲の密度と
+        # 範囲の外の方針の外が混ざり、直す所を読み違える
         for problem in style_problems(project):
-            counts[problem.kind] += 1
+            if (problem.scene_id or "") == raw_scene and (
+                report.start_frame <= problem.start_frame < report.end_frame
+            ):
+                counts[problem.kind] += 1
         head["outside_guide"] = counts
     note = (
         "数えたのは演出の頭が範囲に入っている物です too_close は limit_seconds より近く続いた所"
@@ -2651,8 +2660,8 @@ def _measure_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
     )
     if "outside_guide" in head:
         note += (
-            " outside_guide は編集の方針の外の書体・色・効果の数で、在りかは"
-            " check_style_guide で読めます"
+            " outside_guide は編集の方針の外の書体・色・効果のうち、測った所に頭がある物の数で、"
+            "在りかは check_style_guide で読めます"
         )
     rows = [_event_row(event) for event in report.events]
     return _paged_after(head, rows, arguments, "events", note)

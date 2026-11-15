@@ -27,7 +27,6 @@ from fractions import Fraction
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
-    Effect,
     ParamValue,
     Project,
     Timeline,
@@ -42,6 +41,7 @@ __all__ = [
     "KINDS_BY_KEY",
     "NARRATION_FOLDER",
     "SHAKE",
+    "SHAKE_DEFAULTS",
     "SHAKE_EFFECT_KIND",
     "SOUND",
     "SOUND_EFFECT_MAX_SECONDS",
@@ -78,9 +78,15 @@ SOUND_EFFECT_MAX_SECONDS = 10
 #: 配置の値の線のうち、寄る・ずらすに使う欄
 #: （``core/emphasis.py`` の ``zoom_curves`` ``pan_curves``）
 _TRANSFORM_KIND = "transform"
-_SCALE = "scale"
+#: 拡大率は全体と縦横別の 3 つ どれを動かしても寄って見える（縦横別だけを動かす作品もある）
+_SCALES = ("scale", "scale_x", "scale_y")
 _POSITIONS = ("pos_x", "pos_y")
-_SHAKE_RANGES = ("range_x", "range_y")
+#: ランダム移動の幅の欄と、項目を持たないとき（定義の既定のまま）の幅 Z は奥行きで大きさが揺れる
+#: 既定を知らないと、項目を省いたランダム移動を揺れていないと読む 食い違いは試験が定義と照らす
+SHAKE_DEFAULTS: Mapping[str, float] = {"range_x": 10.0, "range_y": 10.0, "range_z": 0.0}
+#: 強さを測るために線をなめる点の数の上限 長いクリップを 1 フレームずつなめると重いので間引く
+#: 行き過ぎて戻る曲線の山を拾えれば足り、数千点あれば 1 時間の寄りでも山を外さない
+_SAMPLES = 2000
 _TEXT_KIND = "text"
 _TRANSITION_KIND = "transition"
 _FILTER_KIND = "filter"
@@ -121,7 +127,7 @@ DIRECTION_KINDS: tuple[DirectionKind, ...] = (
     DirectionKind(
         SHAKE,
         "揺らす",
-        "ランダム移動のエフェクト（幅にキーフレームがあれば幅が 0 より大きい所ごと）",
+        "ランダム移動のエフェクト（X・Y・Z のどれかの幅が 0 より大きい所ごと）",
         # 揺れは驚き・笑いの一瞬に使う物で、続くと字幕が読めない
         10.0,
         "px",
@@ -227,32 +233,70 @@ class DirectionReport:
     speed_changes: int = 0
 
 
-def _curve(params: Mapping[str, ParamValue], name: str) -> AnimatedValue | None:
-    value = params.get(name)
-    return value if isinstance(value, AnimatedValue) else None
+def _as_curve(value: ParamValue | None, default: float) -> AnimatedValue:
+    """欄の値を線にする 項目が無ければ定義の既定の値で止まった線"""
+    if isinstance(value, AnimatedValue):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return AnimatedValue(float(value))
+    return AnimatedValue(default)
 
 
-def _away_spans(curves: Sequence[tuple[AnimatedValue, float]]) -> list[tuple[int, int]]:
-    """どれかの線が休みの値から離れている区間（クリップの頭からのフレーム）
+def _rest(curve: AnimatedValue) -> float:
+    """休みの値 点があれば最初の点（点より前はその値で止まる）、無ければ止まった値"""
+    return curve.keyframes[0].value if curve.keyframes else curve.static
 
-    ``curves`` は線と休みの値の組 キーフレームの間ごとに、両端のどちらかが休みから離れていれば
-    その間を「動いている」とし、続く間をつなげて 1 回にする 寄って・止まって・戻すまでを
-    1 回に数えるため（点ごとに数えると、強調 1 回が 3 回に見える）
+
+def _frames(span: tuple[int, int]) -> range:
+    start, end = span
+    return range(start, end + 1, max(1, (end - start) // _SAMPLES))
+
+
+def _away_spans(
+    curves: Sequence[tuple[AnimatedValue, float]], length: int
+) -> list[tuple[int, int]]:
+    """どれかの線が休みの値から離れている区間（クリップの頭からのフレーム ``0``〜``length``）
+
+    ``curves`` は線と休みの値の組 キーフレームとクリップの両端で区切った間ごとに、両端か
+    真ん中のどれかが休みから離れていれば「動いている」とし、休みでない点を挟んで続く間を
+    1 回につなぐ 寄って・止まって・戻すまでを 1 回に数えるため（点ごとに数えると強調 1 回が
+    3 回に見える） 休みへ戻った点では切る（つなぐと離れた 2 回の強調を 1 回と読み、近すぎるのを
+    見逃す） クリップの外に残った点（後からトリムした物）は見ない 映らない所の動きを数えると、
+    出ていない演出が回数に入る 最後の点より後も値は止まって続くので、クリップの終わりまで見る
     """
-    frames = sorted({k.frame for curve, _ in curves for k in curve.keyframes})
+    inner = {k.frame for curve, _ in curves for k in curve.keyframes if 0 < k.frame < length}
+    frames = sorted({0, length, *inner})
 
-    def away(frame: int) -> bool:
+    def away(frame: float) -> bool:
         return any(abs(curve.at(frame) - rest) > _MOVED for curve, rest in curves)
 
     spans: list[tuple[int, int]] = []
     for left, right in itertools.pairwise(frames):
-        if not (away(left) or away(right)):
+        if not (away(left) or away((left + right) / 2) or away(right)):
             continue
-        if spans and spans[-1][1] == left:
+        if spans and spans[-1][1] == left and away(left):
             spans[-1] = (spans[-1][0], right)
         else:
             spans.append((left, right))
     return spans
+
+
+def _farthest(curve: AnimatedValue, span: tuple[int, int]) -> float | None:
+    """休みの大きさからの比（%）のうち 100 から一番離れた値 寄る（120%）と引く（80%）の両方を見る
+
+    点の値だけでなく間もなめる 行き過ぎて戻る曲線（back・elastic）は点と点の間に山があり、
+    点だけを見ると強さを小さく読む
+    """
+    rest = _rest(curve)
+    if rest <= 0:
+        return None
+    ratios = [curve.at(frame) / rest * 100 for frame in _frames(span)]
+    best = max(ratios, key=lambda percent: abs(percent - 100))
+    return best if abs(best - 100) > _MOVED else None
+
+
+def _animated(params: Mapping[str, ParamValue], names: Sequence[str]) -> list[AnimatedValue]:
+    return [v for name in names if isinstance(v := params.get(name), AnimatedValue)]
 
 
 def _zoom_events(track: Track, clip: Clip) -> Iterator[DirectionEvent]:
@@ -261,52 +305,28 @@ def _zoom_events(track: Track, clip: Clip) -> Iterator[DirectionEvent]:
     )
     if transform is None:
         return
-    scale = _curve(transform.params, _SCALE)
-    positions = [c for c in (_curve(transform.params, n) for n in _POSITIONS) if c is not None]
-    curves = [(c, c.keyframes[0].value) for c in (scale, *positions) if c and c.is_animated]
-    for start, end in _away_spans(curves):
-        strength: float | None = None
-        pan_only = True
-        if scale is not None and scale.is_animated:
-            rest = scale.keyframes[0].value
-            inside = [k.value for k in scale.keyframes if start <= k.frame <= end]
-            if rest > 0 and any(abs(value - rest) > _MOVED for value in inside):
-                pan_only = False
-                # 休みの大きさからの比 寄る（120%）と引く（80%）の両方で、離れた方の端を返す
-                strength = max((value / rest * 100 for value in inside), key=lambda p: abs(p - 100))
-        yield _event(ZOOM, track, clip, start, end, strength, pan_only=pan_only)
+    scales = [c for c in _animated(transform.params, _SCALES) if c.is_animated]
+    positions = [c for c in _animated(transform.params, _POSITIONS) if c.is_animated]
+    curves = [(c, _rest(c)) for c in (*scales, *positions)]
+    for span in _away_spans(curves, clip.duration):
+        found = [p for c in scales if (p := _farthest(c, span)) is not None]
+        strength = max(found, key=lambda p: abs(p - 100)) if found else None
+        yield _event(ZOOM, track, clip, *span, strength, pan_only=strength is None)
 
 
 def _shake_events(track: Track, clip: Clip) -> Iterator[DirectionEvent]:
     for effect in clip.effects:
         if effect.kind != SHAKE_EFFECT_KIND or not effect.enabled:
             continue
-        animated = [c for c in (_curve(effect.params, n) for n in _SHAKE_RANGES) if c]
-        if any(c.is_animated for c in animated):
-            curves = [(c, 0.0) for c in animated if c.is_animated]
-            for start, end in _away_spans(curves):
-                peak = max(
-                    (k.value for c, _ in curves for k in c.keyframes if start <= k.frame <= end),
-                    default=None,
-                )
-                yield _event(SHAKE, track, clip, start, end, peak)
-            continue
-        # 幅が動かないランダム移動は、クリップの間ずっと揺れる 1 回の演出
-        widths = [_static(effect, name) for name in _SHAKE_RANGES]
-        known = [w for w in widths if w is not None]
-        if known and max(known) <= 0:
-            continue
-        yield _event(SHAKE, track, clip, 0, clip.duration, max(known) if known else None)
-
-
-def _static(effect: Effect, name: str) -> float | None:
-    value = effect.params.get(name)
-    if isinstance(value, AnimatedValue):
-        return value.static
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    # 項目を持たない（定義の既定のまま）物は、幅を知らないので強さを返さない
-    return None
+        # 固定の幅の軸も線として一緒に見る 動く軸だけを見ると、横は 8px でずっと揺れているのに
+        # 縦の線が 0 のままなら「揺れ 0」と読む
+        curves = [
+            (_as_curve(effect.params.get(name), default), 0.0)
+            for name, default in SHAKE_DEFAULTS.items()
+        ]
+        for span in _away_spans(curves, clip.duration):
+            peak = max(abs(curve.at(f)) for curve, _ in curves for f in _frames(span))
+            yield _event(SHAKE, track, clip, *span, peak)
 
 
 def _event(
@@ -319,11 +339,15 @@ def _event(
     *,
     pan_only: bool = False,
 ) -> DirectionEvent:
-    """クリップの頭からの範囲をタイムラインの位置に直した出来事 クリップの外は切る"""
-    begin = clip.timeline_start + max(0, min(start, clip.duration))
-    finish = clip.timeline_start + max(0, min(end, clip.duration))
+    """クリップの頭からの範囲をタイムラインの位置に直した出来事"""
     return DirectionEvent(
-        kind, begin, max(begin, finish), str(clip.id), str(track.id), strength, pan_only=pan_only
+        kind,
+        clip.timeline_start + start,
+        clip.timeline_start + end,
+        str(clip.id),
+        str(track.id),
+        strength,
+        pan_only=pan_only,
     )
 
 
@@ -350,9 +374,13 @@ def direction_events(
     ``color_kinds`` は色の補正に当たるエフェクトの種類（定義の分類が「色」の物）
     シーンのクリップは 1 本の絵として数え（カット・寄る・揺らす・色）、中は辿らない
     中を辿ると、同じシーンを 2 か所に置いたときに中の演出を 2 倍に数え、測る範囲も合わない
+    見るのは書き出しに出るトラックだけ（ミュートとソロは描画と音の合成と同じ決まり）
+    出ないトラックの演出を数えると、外したつもりの演出が残って見える
     """
     colors = frozenset(color_kinds)
     rate = timeline.rate
+    shown = {track.id for track in timeline.active_picture_tracks()}
+    heard = {track.id for track in timeline.active_sound_tracks()}
     found: list[DirectionEvent] = []
     for track in timeline.tracks:
         for clip in track.clips:
@@ -360,6 +388,20 @@ def direction_events(
                 continue
             source = clip.source
             kind = source.kind if source is not None else None
+            if track.id in heard and _is_sound_effect(project, track, clip, rate):
+                found.append(_event(SOUND, track, clip, 0, clip.duration))
+                continue
+            if track.id not in shown:
+                continue
+            if kind == _FILTER_KIND:
+                # フィルタは自分の絵を持たず下の絵へ掛けるので、絵を描くかの決まりで選ぶと
+                # 落ちることがある 先に見て、フィルタで掛けた色や揺れを数え落とさない
+                if _has_color(clip, colors):
+                    found.append(_event(COLOR, track, clip, 0, clip.duration))
+                found.extend(_shake_events(track, clip))
+                continue
+            if not project.draws_picture(track, clip):
+                continue
             if kind == _TRANSITION_KIND:
                 seconds = float(frame_to_seconds(clip.duration, rate))
                 found.append(_event(TRANSITION, track, clip, 0, clip.duration, seconds))
@@ -368,29 +410,17 @@ def direction_events(
                 if clip.subtitle_origin is None:
                     found.append(_event(TELOP, track, clip, 0, clip.duration))
                 continue
-            if _is_sound_effect(project, track, clip, rate):
-                found.append(_event(SOUND, track, clip, 0, clip.duration))
-                continue
-            picture = project.draws_picture(track, clip)
-            if picture and _has_color(clip, colors):
+            if _has_color(clip, colors):
                 found.append(_event(COLOR, track, clip, 0, clip.duration))
-            if picture and kind == _FILTER_KIND:
-                found.extend(_shake_events(track, clip))
-                continue
             # 寄る・揺らす・カットは素材とシーンのクリップだけ テキストや図形の配置の動きは
             # 登場の動きとして付けた物で、話者や要所へ寄る演出ではない
-            if not picture or source is not None:
+            if source is not None:
                 continue
             found.append(_event(CUT, track, clip, 0, clip.duration))
             found.extend(_zoom_events(track, clip))
             found.extend(_shake_events(track, clip))
     found.sort(key=lambda e: (e.start_frame, e.kind, e.track_id))
     return found
-
-
-def _cut_starts(events: Sequence[DirectionEvent], start: int) -> list[int]:
-    """カットの頭 同じ位置で重ねた何本か（絵と上の素材）は 1 回に数え、範囲の頭は除く"""
-    return sorted({e.start_frame for e in events if e.start_frame > start})
 
 
 def _seconds(frames: int, rate: FrameRate) -> float:
@@ -405,21 +435,20 @@ def _density(
     start: int,
     end: int,
     limit: float | None,
+    overlapping: Sequence[DirectionEvent] = (),
 ) -> KindDensity:
+    """``events`` は範囲に頭が入る出来事 ``overlapping`` は範囲と重なる出来事（色とカットで使う）"""
     minutes = max(_seconds(end - start, rate), 1e-9) / 60
+    starts = [e.start_frame for e in events]
+    count = len(events)
     if kind.key == CUT:
-        starts = _cut_starts(events, start)
         # カットの長さは、範囲の頭・各カットの頭・範囲の終わりの間 最後のカットも長さに入れる
-        bounds = [start, *starts, end]
-        gaps = [b - a for a, b in itertools.pairwise(bounds) if b > a]
-        pairs = list(itertools.pairwise(bounds))
-        count = len(starts)
+        # 絵が 1 本も無い範囲（音だけ）では測らない 測ると、無いカットを短すぎると返す
+        bounds = [start, *starts, end] if overlapping else []
+        pairs = [(a, b) for a, b in itertools.pairwise(bounds) if b > a]
     else:
-        starts = [e.start_frame for e in events]
-        gaps = [b - a for a, b in itertools.pairwise(starts)]
         pairs = list(itertools.pairwise(starts))
-        count = len(events)
-    gap_seconds = [_seconds(g, rate) for g in gaps]
+    gap_seconds = [_seconds(b - a, rate) for a, b in pairs]
     close: list[CloseCall] = []
     if limit is not None:
         close = [
@@ -430,7 +459,9 @@ def _density(
     strengths = [e.strength for e in events if e.strength is not None]
     coverage = None
     if kind.key == COLOR:
-        coverage = _covered(events, start, end) / max(end - start, 1)
+        # 範囲より前から続く色も覆う長さに入れる 頭の位置で選ぶと、全体を整えた作品の後半を
+        # 測ったときに割合が 0 と出る
+        coverage = _covered(overlapping, start, end) / max(end - start, 1)
     return KindDensity(
         kind=kind,
         count=count,
@@ -447,7 +478,7 @@ def _density(
 
 
 def _covered(events: Sequence[DirectionEvent], start: int, end: int) -> int:
-    """重なりを 1 回に数えた、出来事が覆うフレームの数"""
+    """重なりを 1 回に数えた、出来事が範囲の中で覆うフレームの数"""
     total = 0
     reach = start
     for event in sorted(events, key=lambda e: e.start_frame):
@@ -456,6 +487,25 @@ def _covered(events: Sequence[DirectionEvent], start: int, end: int) -> int:
             total += finish - begin
             reach = finish
     return total
+
+
+def _counted(every: Sequence[DirectionEvent], start: int, end: int) -> list[DirectionEvent]:
+    """範囲に頭が入る出来事 カットは同じ位置の何本か（絵と上の素材）を 1 回にまとめ、範囲の頭は除く
+
+    範囲の頭に置いたクリップはカットでなく始まり 同じ位置を 1 回にまとめないと、回数と
+    一覧の行が食い違う
+    """
+    picked: list[DirectionEvent] = []
+    cuts: set[int] = set()
+    for event in every:
+        if not start <= event.start_frame < end:
+            continue
+        if event.kind == CUT:
+            if event.start_frame == start or event.start_frame in cuts:
+                continue
+            cuts.add(event.start_frame)
+        picked.append(event)
+    return picked
 
 
 def measure_direction(
@@ -467,7 +517,7 @@ def measure_direction(
     end_frame: int | None = None,
     min_gaps: Mapping[str, float] | None = None,
 ) -> DirectionReport:
-    """``timeline`` の演出を型ごとに数える 範囲の頭が入っている出来事だけを数える
+    """``timeline`` の演出を型ごとに数える 範囲に頭が入っている出来事を数える
 
     範囲を省けば全体（0〜タイムラインの長さ） ``min_gaps`` は型ごとのやりすぎの下限（秒）の上書き
     """
@@ -484,12 +534,7 @@ def measure_direction(
     if unknown:
         raise ValueError(f"知らない型: {'、'.join(unknown)}（{'・'.join(KINDS_BY_KEY)} のどれか）")
     every = direction_events(project, timeline, color_kinds=color_kinds)
-    # 範囲の頭に置いたクリップはカットでなく始まり 一覧に残すと、数（count）と一覧の行が食い違う
-    inside = [
-        e
-        for e in every
-        if start <= e.start_frame < end and not (e.kind == CUT and e.start_frame == start)
-    ]
+    inside = _counted(every, start, end)
     rate = timeline.rate
     densities = tuple(
         _density(
@@ -499,6 +544,11 @@ def measure_direction(
             start=start,
             end=end,
             limit=overrides.get(kind.key, kind.min_gap_seconds),
+            overlapping=[
+                e
+                for e in every
+                if e.kind == kind.key and e.start_frame < end and start < e.end_frame
+            ],
         )
         for kind in DIRECTION_KINDS
     )

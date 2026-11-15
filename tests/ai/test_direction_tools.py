@@ -7,6 +7,8 @@ tests/core/test_direction.py
 
 from __future__ import annotations
 
+import math
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -15,7 +17,14 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddClip, AddEffect, AddTrack, SetStyleGuide
+from sashimono.core.commands import (
+    AddClip,
+    AddEffect,
+    AddScene,
+    AddTrack,
+    SetStyleGuide,
+    new_scene,
+)
 from sashimono.core.io.serialize import json_text
 from sashimono.core.model import (
     Clip,
@@ -124,3 +133,43 @@ def test_bad_arguments_are_refused(host: FakeHost) -> None:
         run(host, "measure_direction", scene_id="none")
     with pytest.raises(ToolError, match="範囲が空"):
         run(host, "measure_direction", start_frame=300)
+
+
+def test_main_is_measured_even_while_a_scene_is_open(host: FakeHost) -> None:
+    """開いているシーンを測ると、scene_id を省いてメインを頼んだのに別のタイムラインの数が返る"""
+    track = Track(kind=TrackKind.VIDEO, name="文字")
+    telop = Clip(timeline_start=0, duration=30, source=GeneratedSource("text"))
+    scene = new_scene(host.document.project, "オープニング")
+    scene = replace(
+        scene, timeline=replace(scene.timeline, tracks=(replace(track, clips=(telop,)),))
+    )
+    host.apply_commands([AddScene(scene)], "シーン")
+    host.set_active_scene(scene.id)
+    main = run(host, "measure_direction")
+    assert (main["scene_id"], main["end_frame"], _kinds(main)["telop"]["count"]) == (None, 300, 0)
+    inner = run(host, "measure_direction", scene_id=str(scene.id))
+    assert (inner["scene_id"], _kinds(inner)["telop"]["count"]) == (str(scene.id), 1)
+
+
+def test_not_finite_gaps_are_refused(host: FakeHost) -> None:
+    """NaN や無限大を通すと limit_seconds に入り、厳密な JSON として読めない返事になる"""
+    for value in (math.nan, math.inf):
+        with pytest.raises(ToolError, match="有限"):
+            run(host, "measure_direction", min_gaps={"zoom": value})
+
+
+def test_guide_problems_follow_the_measured_range(host: FakeHost) -> None:
+    """作品全体の方針の外を添えると、範囲の密度と範囲の外の物が混ざり、直す所を読み違える"""
+    track = Track(kind=TrackKind.VIDEO, name="文字")
+    late = Clip(
+        timeline_start=200,
+        duration=30,
+        source=GeneratedSource("text"),
+        effects=(Effect("glow"),),
+    )
+    host.apply_commands(
+        [SetStyleGuide(StyleGuide(effects=("blur",))), AddTrack(track), AddClip(track.id, late)],
+        "方針",
+    )
+    assert run(host, "measure_direction", end_frame=100)["outside_guide"]["effect"] == 0
+    assert run(host, "measure_direction", start_frame=100)["outside_guide"]["effect"] == 1

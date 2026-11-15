@@ -19,6 +19,7 @@ from sashimono.core.direction import (
     CUT,
     DIRECTION_KINDS,
     SHAKE,
+    SHAKE_DEFAULTS,
     SOUND,
     TELOP,
     TRANSITION,
@@ -28,6 +29,7 @@ from sashimono.core.direction import (
     direction_events,
     measure_direction,
 )
+from sashimono.core.emphasis import easing_point
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -145,6 +147,50 @@ class TestZoom:
         kinds = [e.kind for e in direction_events(project, project.timeline)]
         assert kinds == [TELOP]
 
+    def test_returning_to_rest_splits_even_without_a_flat_stretch(self, work: _Work) -> None:
+        # 戻った点を挟んでつなぐと、寄って戻ってすぐまた寄る 2 回を 1 回と読み、近すぎるのを見逃す
+        scale = _curve((0, 100), (10, 120), (20, 100), (30, 130), (40, 100))
+        project = work.build(video=(work.clip(0, 300, effects=(_transform(scale=scale),)),))
+        zooms = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
+        assert [(e.start_frame, e.end_frame) for e in zooms] == [(0, 20), (20, 40)]
+
+    def test_a_kept_zoom_lasts_to_the_end_of_the_clip(self, work: _Work) -> None:
+        # 最後の点より後も寄ったまま映る ここで切ると、寄りっぱなしの長さを短く読む
+        scale = _curve((30, 100), (40, 150))
+        project = work.build(video=(work.clip(0, 300, effects=(_transform(scale=scale),)),))
+        (zoom,) = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
+        assert (zoom.start_frame, zoom.end_frame, zoom.strength) == (30, 300, 150)
+
+    def test_points_left_outside_a_trimmed_clip_are_ignored(self, work: _Work) -> None:
+        # トリムで外に残った点の動きを数えると、映らない演出が回数と近すぎる所に入る
+        scale = _curve((0, 100), (150, 100), (160, 120), (170, 100))
+        project = work.build(video=(work.clip(0, 100, effects=(_transform(scale=scale),)),))
+        assert not [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
+
+    def test_scaling_one_axis_is_a_zoom(self, work: _Work) -> None:
+        # 縦横別の拡大率だけを動かす作品もある 全体の拡大率だけを見ると寄りを 0 回と読む
+        scale_x = _curve((0, 100), (10, 125), (20, 100))
+        clip = work.clip(0, 300, effects=(_transform(scale_x=scale_x),))
+        project = work.build(video=(clip,))
+        (zoom,) = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
+        assert zoom.strength == pytest.approx(125)
+
+    def test_overshoot_between_points_is_the_strength(self, work: _Work) -> None:
+        # 行き過ぎて戻る曲線は点の間に山がある 点の値だけを見ると強さを小さく読む
+        interpolation, curve = easing_point("back")
+        scale = AnimatedValue(
+            keyframes=(
+                Keyframe(0, 100.0),
+                Keyframe(30, 100.0, interpolation, curve=curve),
+                Keyframe(60, 120.0),
+                Keyframe(90, 100.0),
+            )
+        )
+        project = work.build(video=(work.clip(0, 300, effects=(_transform(scale=scale),)),))
+        (zoom,) = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
+        assert zoom.strength is not None
+        assert zoom.strength > 120.5
+
 
 class TestShake:
     def test_keyframed_width_counts_each_burst(self, work: _Work) -> None:
@@ -173,6 +219,31 @@ class TestShake:
         )
         project = work.build(video=(work.clip(0, 90, effects=(off, flat)),))
         assert not [e for e in direction_events(project, project.timeline) if e.kind == SHAKE]
+
+    def test_a_still_axis_keeps_shaking_while_another_is_keyed(self, work: _Work) -> None:
+        # 動く軸だけを見ると、横はずっと 8px 揺れているのに縦の線が 0 なら「揺れ 0」と読む
+        flat = _curve((0, 0), (100, 0))
+        shake = Effect("random_move", params={"range_x": AnimatedValue(8.0), "range_y": flat})
+        project = work.build(video=(work.clip(0, 300, effects=(shake,)),))
+        (event,) = [e for e in direction_events(project, project.timeline) if e.kind == SHAKE]
+        assert (event.start_frame, event.end_frame, event.strength) == (0, 300, 8)
+
+    def test_depth_and_default_widths_count(self, work: _Work) -> None:
+        # 奥行きだけの揺れや、項目を省いた（定義の既定 10px の）揺れを数えないと揺れを見逃す
+        depth = Effect(
+            "random_move",
+            params={
+                "range_x": AnimatedValue(0.0),
+                "range_y": AnimatedValue(0.0),
+                "range_z": AnimatedValue(5.0),
+            },
+        )
+        plain = Effect("random_move")
+        project = work.build(
+            video=(work.clip(0, 90, effects=(depth,)), work.clip(90, 90, effects=(plain,)))
+        )
+        shakes = [e for e in direction_events(project, project.timeline) if e.kind == SHAKE]
+        assert [(e.start_frame, e.strength) for e in shakes] == [(0, 5), (90, 10)]
 
 
 class TestOtherKinds:
@@ -225,6 +296,30 @@ class TestOtherKinds:
         project = work.build(text=(telop,))
         assert direction_events(project, project.timeline) == []
 
+    def test_muted_and_unsoloed_tracks_are_not_counted(self, work: _Work) -> None:
+        # 書き出しに出ないトラックを数えると、外したつもりの演出が残って見える
+        telop = Clip(timeline_start=0, duration=30, source=GeneratedSource("text"))
+        sound = Clip(timeline_start=0, duration=30, media_id=work.effect.id)
+        project = work.build(video=(work.clip(0, 300),), text=(telop,), sound=(sound,))
+        video, text, audio = project.timeline.tracks
+        muted = (video, replace(text, muted=True), replace(audio, muted=True))
+        quiet = project.with_timeline(replace(project.timeline, tracks=muted))
+        assert [e.kind for e in direction_events(quiet, quiet.timeline)] == [CUT]
+        soloed = (replace(video, solo=True), text, audio)
+        alone = project.with_timeline(replace(project.timeline, tracks=soloed))
+        assert TELOP not in [e.kind for e in direction_events(alone, alone.timeline)]
+
+    def test_filters_count_their_color(self, work: _Work) -> None:
+        # フィルタで全体の色を整えた作品を「色 0」と読むと、AI が同じ補正をクリップごとに積む
+        graded = Clip(
+            timeline_start=0,
+            duration=300,
+            source=GeneratedSource("filter"),
+            effects=(Effect("grade"),),
+        )
+        project = work.build(video=(work.clip(0, 300),), text=(graded,))
+        assert _kind(_measure(project), COLOR).coverage == pytest.approx(1.0)
+
 
 class TestDensity:
     def test_close_zooms_are_reported_against_the_limit(self, work: _Work) -> None:
@@ -263,6 +358,28 @@ class TestDensity:
         telop = _kind(report, TELOP)
         assert (report.seconds, telop.count, telop.per_minute) == (20.0, 2, 6.0)
 
+    def test_color_coverage_counts_what_started_before_the_range(self, work: _Work) -> None:
+        # 頭の位置だけで選ぶと、全体を整えた作品の後半を測ったときに覆う割合が 0 と出る
+        graded = work.clip(0, 600, effects=(Effect("grade"),))
+        color = _kind(_measure(work.build(video=(graded,)), start_frame=300), COLOR)
+        assert (color.count, color.coverage) == (0, 1.0)
+
+    def test_stacked_cuts_are_one_in_the_list_too(self, work: _Work) -> None:
+        # 回数は 1 なのに一覧に 2 行あると、AI は一覧を数えて回数を読み違える
+        project = work.build(video=(work.clip(0, 300), work.clip(300, 300)))
+        upper = Track(kind=TrackKind.VIDEO, name="V2", clips=(work.clip(300, 60),))
+        tracks = (*project.timeline.tracks, upper)
+        stacked = project.with_timeline(replace(project.timeline, tracks=tracks))
+        report = _measure(stacked)
+        cuts = [e for e in report.events if e.kind == CUT]
+        assert (_kind(report, CUT).count, len(cuts)) == (1, 1)
+
+    def test_sound_only_range_has_no_shot_lengths(self, work: _Work) -> None:
+        # 絵の無い範囲をカットの長さとして測ると、無いカットを短すぎると返す
+        sound = Clip(timeline_start=0, duration=15, media_id=work.effect.id)
+        cut = _kind(_measure(work.build(sound=(sound,))), CUT)
+        assert (cut.min_gap_seconds, cut.too_close) == (None, ())
+
     def test_bad_requests_are_refused(self, work: _Work) -> None:
         # 黙って全体を測ったり知らない型を捨てたりすると、頼んだ物と違う数を正しいと思って使う
         project = work.build(video=(work.clip(0, 300),))
@@ -274,9 +391,19 @@ class TestDensity:
 
 def test_names_match_the_layers_that_make_them() -> None:
     """コア層は名前だけを写して持つ 作る側が名前を変えたのに写しが古いと、黙って 0 回と数える"""
+    from sashimono.effects import registry
     from sashimono.effects.emphasis import SHAKE_EFFECT_KIND
+    from sashimono.effects.spec import TrackSpec
     from sashimono.engine.audio.voicevox import NARRATION_FOLDER
 
     assert direction.SHAKE_EFFECT_KIND == SHAKE_EFFECT_KIND
     assert direction.NARRATION_FOLDER == NARRATION_FOLDER
     assert len({kind.key for kind in DIRECTION_KINDS}) == len(DIRECTION_KINDS)
+    definition = registry.get(SHAKE_EFFECT_KIND)
+    assert definition is not None
+    defaults = {
+        spec.name: spec.default
+        for spec in definition.parameters
+        if spec.name in SHAKE_DEFAULTS and isinstance(spec, TrackSpec)
+    }
+    assert defaults == dict(SHAKE_DEFAULTS)
