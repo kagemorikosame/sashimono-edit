@@ -228,6 +228,41 @@ def test_a_failed_export_leaves_no_half_set(
     assert [path.name for path in eval_dir.exports.iterdir()] == ["E03_seams_none.mp4"]
 
 
+def test_a_failed_swap_brings_back_the_previous_set(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3 本は書けたが、2 本目の付け替えで落ちた（開いたままの書き出しへのアクセス拒否など）
+
+    壊れると、今回の 1 本と前の回の 2 本が並び、本人が違う回の処理を見比べる
+    """
+    tool, eval_dir, book = folder
+    eval_dir.exports.mkdir(parents=True, exist_ok=True)
+    styles = ("none", "crossfade", "zoom")
+    for video in styles:
+        (eval_dir.exports / f"E03_seams_{video}.mp4").write_bytes(b"old")
+
+    def export(project: Project, output: Path) -> None:
+        output.write_bytes(b"new")
+
+    real_replace = Path.replace
+
+    def replace(self: Path, target: Path) -> Path:
+        if self.name == "E03_seams_crossfade.partial.mp4":
+            raise PermissionError("開いたままの書き出しは置き換えられない")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    [record] = tool.command_run(
+        eval_dir, book, ["E03"], results=tmp_path / "r.jsonl", commit="", seam_exporter=export
+    )
+    assert (record["status"], record["reason"]) == ("failed", "export-error")
+    assert sorted(path.name for path in eval_dir.exports.iterdir()) == sorted(
+        f"E03_seams_{video}.mp4" for video in styles
+    )
+    for video in styles:
+        assert (eval_dir.exports / f"E03_seams_{video}.mp4").read_bytes() == b"old"
+
+
 @pytest.mark.parametrize("bad", [-0.5, float("nan")])
 def test_a_broken_tolerance_is_refused(tool: ModuleType, tmp_path: Path, bad: float) -> None:
     """負か有限でない許す幅 壊れると、当たりを 1 つも数えない誤った f1 が ok のまま残る"""

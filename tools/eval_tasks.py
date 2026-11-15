@@ -770,6 +770,7 @@ def seam_exports(
     作品には字幕を付けないので、``jet_cut`` の字幕で話を守る所（``keep_speech``）は効かない 字幕の
     無い素材に ``jet_cut`` を掛けたのと同じ詰め方で、結果の行にもそう書く
     3 本は書き終えてから名前を付け替える 途中で落ちたときに、前の回の書き出しと混ざって残らない
+    付け替えの途中で落ちたときも、前の回の 3 本へ戻す（:func:`_publish_set`）
     """
     from sashimono.core.seams import (
         SEAM_VIDEOS,
@@ -821,10 +822,38 @@ def seam_exports(
         for partial, _final in written:
             partial.unlink(missing_ok=True)
         raise
-    for partial, final in written:
-        if partial.exists():
-            partial.replace(final)
+    _publish_set(written)
     return metrics
+
+
+def _publish_set(written: list[tuple[Path, Path]]) -> None:
+    """書き終えた 3 本を本人が開く名前へ付け替える 1 本でも付け替えられなければ前の回の 3 本へ戻す
+
+    本人は 3 本を見比べるので、今回の 1 本と前の回の 2 本が並ぶと、違う回の処理を比べてしまう
+    付け替えは、開いたままの書き出しへのアクセス拒否などで途中から落ちる 前の回の物は退避しておき、
+    落ちたら今回付け替えた物を消して退避した物を戻す
+    """
+    backups: list[tuple[Path, Path]] = []
+    placed: list[Path] = []
+    try:
+        for _partial, final in written:
+            if final.exists():
+                backup = final.with_name(f"{final.stem}.previous{final.suffix}")
+                final.replace(backup)
+                backups.append((backup, final))
+        for partial, final in written:
+            partial.replace(final)
+            placed.append(final)
+    except BaseException:
+        for final in placed:
+            final.unlink(missing_ok=True)
+        for backup, final in backups:
+            backup.replace(final)
+        for partial, _final in written:
+            partial.unlink(missing_ok=True)
+        raise
+    for backup, _final in backups:
+        backup.unlink(missing_ok=True)
 
 
 # --- グループを保つ（#437） ---
