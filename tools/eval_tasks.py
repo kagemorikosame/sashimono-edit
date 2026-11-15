@@ -235,6 +235,12 @@ def load_tasks(path: Path = TASKS_FILE) -> TaskBook:
         subtitle_seconds=float(raw.get("subtitle_seconds", default.subtitle_seconds)),
         filler_seconds=float(raw.get("filler_seconds", default.filler_seconds)),
     )
+    # 負の幅や有限でない幅は、組む窓が逆さか空になって当たりを 1 つも数えず、誤った f1 が ok の
+    # まま残る 読む所で止める
+    for name in ("scene_frames", "talk_seconds", "subtitle_seconds", "filler_seconds"):
+        value = getattr(tolerances, name)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"tolerances の {name} は 0 以上の有限の数にする: {value!r}")
     materials: list[Material] = []
     for entry in data.get("materials", []):
         identifier = str(entry.get("id", ""))
@@ -413,7 +419,7 @@ class ToolParams:
         min_scene = DEFAULT_MIN_SCENE if self.min_scene is None else self.min_scene
         return threshold, min_scene
 
-    def record(self, task: str) -> dict[str, float | str]:
+    def record(self, task: str) -> dict[str, float | str | bool]:
         """結果の行に残す値 課題に関係する物だけ"""
         if task == SILENCE:
             return {
@@ -432,12 +438,20 @@ class ToolParams:
             # 手元の置き場は場所を伏せて印だけ書く 書くと本人のフォルダ名が公開の結果に載る
             return {"model": LOCAL_MODEL if _is_local_model(self.asr_model) else self.asr_model}
         if task == SEAMS:
-            from sashimono.core.seams import DEFAULT_SEAM_CROSSFADE_MS, DEFAULT_SEAM_ZOOM_PERCENT
+            from sashimono.core.seams import (
+                DEFAULT_SEAM_AUDIO_FADE_MS,
+                DEFAULT_SEAM_CROSSFADE_MS,
+                DEFAULT_SEAM_ZOOM_PERCENT,
+            )
 
+            # 書き出しを変える値はすべて残す 残さないと、後で既定を変えたときに前の 3 本が
+            # どの値で作られたか分からない 字幕で話を守らない（作品に字幕が無い）ことも書く
             return {
                 **self.record(SILENCE),
+                "keep_speech": False,
                 "crossfade_ms": DEFAULT_SEAM_CROSSFADE_MS,
                 "zoom_percent": DEFAULT_SEAM_ZOOM_PERCENT,
+                "audio_fade_ms": DEFAULT_SEAM_AUDIO_FADE_MS,
             }
         return {}
 
@@ -749,9 +763,13 @@ def seam_exports(
 ) -> dict[str, float | int | None]:
     """無音を詰めたつなぎ目を、映像の処理の仕方ごとに書き出す（``jet_cut`` の ``smooth`` と同じ形）
 
-    処理の仕方は設定画面で選べる 3 通り（何もしない・クロスフェード・寄り） 長さと寄りの割合は
-    既定のまま 跳びが隠れたかは人が見比べる 数えるのは、つなぎ目の数と処理できた数と書き出しの秒
-    処理できなかった数が増えたら、短いクリップで断られる所が増えたと読める
+    処理の仕方は設定画面で選べる 3 通り（何もしない・クロスフェード・寄り） 長さと寄りの割合と
+    音のフェードは既定のまま 跳びが隠れたかは人が見比べる 数えるのは、つなぎ目の数と処理できた数と
+    書き出しの秒 処理できなかった数が増えたら、短いクリップで断られる所が増えたと読める
+
+    作品には字幕を付けないので、``jet_cut`` の字幕で話を守る所（``keep_speech``）は効かない 字幕の
+    無い素材に ``jet_cut`` を掛けたのと同じ詰め方で、結果の行にもそう書く
+    3 本は書き終えてから名前を付け替える 途中で落ちたときに、前の回の書き出しと混ざって残らない
     """
     from sashimono.core.seams import (
         SEAM_VIDEOS,
@@ -773,7 +791,9 @@ def seam_exports(
     if ranges:
         document.execute(RippleCut(ranges))
     rate = document.project.rate
-    frames = seams_after_cuts(ranges)
+    # 末尾の無音を削った所は作品の終わりで、後ろに絵が続かないのでつなぎ目ではない 数えると
+    # つなぎ目の数が増え、処理した数とも食い違う
+    frames = tuple(frame for frame in seams_after_cuts(ranges) if frame < document.project.duration)
     metrics: dict[str, float | int | None] = {
         "seams": len(frames),
         "removed_seconds": round(
@@ -781,17 +801,29 @@ def seam_exports(
         ),
     }
     outputs.mkdir(parents=True, exist_ok=True)
-    for video in SEAM_VIDEOS:
-        style = SeamStyle(video=video)
-        # 詰めてできたつなぎ目（同じ素材を飛び飛びにつないだ対）だけ ``jet_cut`` と同じ決まり
-        plan = plan_smoothing(
-            document.project, frames, style, seam_transition(style), SeamScope(jumps_only=True)
-        )
-        metrics[f"handled_{video}"] = len(plan.handled)
-        metrics[f"skipped_{video}"] = len(plan.skipped)
-        began = time.perf_counter()
-        exporter(plan.project, outputs / f"{material}_seams_{video}.mp4")
-        metrics[f"export_seconds_{video}"] = round(time.perf_counter() - began, 2)
+    written: list[tuple[Path, Path]] = []
+    try:
+        for video in SEAM_VIDEOS:
+            style = SeamStyle(video=video)
+            # 詰めてできたつなぎ目（同じ素材を飛び飛びにつないだ対）だけ ``jet_cut`` と同じ決まり
+            plan = plan_smoothing(
+                document.project, frames, style, seam_transition(style), SeamScope(jumps_only=True)
+            )
+            metrics[f"handled_{video}"] = len(plan.handled)
+            metrics[f"skipped_{video}"] = len(plan.skipped)
+            final = outputs / f"{material}_seams_{video}.mp4"
+            partial = outputs / f"{material}_seams_{video}.partial.mp4"
+            began = time.perf_counter()
+            exporter(plan.project, partial)
+            metrics[f"export_seconds_{video}"] = round(time.perf_counter() - began, 2)
+            written.append((partial, final))
+    except BaseException:
+        for partial, _final in written:
+            partial.unlink(missing_ok=True)
+        raise
+    for partial, final in written:
+        if partial.exists():
+            partial.replace(final)
     return metrics
 
 
