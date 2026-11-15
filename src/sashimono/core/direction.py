@@ -247,9 +247,20 @@ def _rest(curve: AnimatedValue) -> float:
     return curve.keyframes[0].value if curve.keyframes else curve.static
 
 
-def _frames(span: tuple[int, int]) -> range:
+def _frames(span: tuple[int, int], curves: Sequence[AnimatedValue]) -> list[int]:
+    """強さを測るためになめるフレーム 間の中のキーの位置は必ず入れ、キーの間ごとに点を配る
+
+    範囲全体を同じ刻みで間引くと、長いクリップの 1 フレームだけの山（キーの位置）を飛ばして
+    強さを小さく読む キーの間ごとに配るのは、行き過ぎて戻る曲線の山がキーの間にあるため
+    """
     start, end = span
-    return range(start, end + 1, max(1, (end - start) // _SAMPLES))
+    keys = {k.frame for curve in curves for k in curve.keyframes if start < k.frame < end}
+    bounds = sorted({start, end, *keys})
+    step_budget = max(1, _SAMPLES // max(1, len(bounds) - 1))
+    frames = {end}
+    for left, right in itertools.pairwise(bounds):
+        frames.update(range(left, right, max(1, (right - left) // step_budget)))
+    return sorted(frames)
 
 
 def _away_spans(
@@ -257,8 +268,10 @@ def _away_spans(
 ) -> list[tuple[int, int]]:
     """どれかの線が休みの値から離れている区間（クリップの頭からのフレーム ``0``〜``length``）
 
-    ``curves`` は線と休みの値の組 キーフレームとクリップの両端で区切った間ごとに、両端か
-    真ん中のどれかが休みから離れていれば「動いている」とし、休みでない点を挟んで続く間を
+    ``curves`` は線と休みの値の組 キーフレームとクリップの両端で区切った間を左を含み右を
+    含まない区間として見て、左端か真ん中が休みから離れていれば「動いている」とする 右端で
+    見ると、HOLD で 30 フレーム目に切り替わる寄りを 0 フレーム目からと読み、頭を 30 にした
+    範囲で数え落とす 休みでない点を挟んで続く間を
     1 回につなぐ 寄って・止まって・戻すまでを 1 回に数えるため（点ごとに数えると強調 1 回が
     3 回に見える） 休みへ戻った点では切る（つなぐと離れた 2 回の強調を 1 回と読み、近すぎるのを
     見逃す） クリップの外に残った点（後からトリムした物）は見ない 映らない所の動きを数えると、
@@ -272,7 +285,7 @@ def _away_spans(
 
     spans: list[tuple[int, int]] = []
     for left, right in itertools.pairwise(frames):
-        if not (away(left) or away((left + right) / 2) or away(right)):
+        if not (away(left) or away((left + right) / 2)):
             continue
         if spans and spans[-1][1] == left and away(left):
             spans[-1] = (spans[-1][0], right)
@@ -290,7 +303,7 @@ def _farthest(curve: AnimatedValue, span: tuple[int, int]) -> float | None:
     rest = _rest(curve)
     if rest <= 0:
         return None
-    ratios = [curve.at(frame) / rest * 100 for frame in _frames(span)]
+    ratios = [curve.at(frame) / rest * 100 for frame in _frames(span, (curve,))]
     best = max(ratios, key=lambda percent: abs(percent - 100))
     return best if abs(best - 100) > _MOVED else None
 
@@ -325,7 +338,8 @@ def _shake_events(track: Track, clip: Clip) -> Iterator[DirectionEvent]:
             for name, default in SHAKE_DEFAULTS.items()
         ]
         for span in _away_spans(curves, clip.duration):
-            peak = max(abs(curve.at(f)) for curve, _ in curves for f in _frames(span))
+            lines = [curve for curve, _ in curves]
+            peak = max(abs(line.at(f)) for line in lines for f in _frames(span, lines))
             yield _event(SHAKE, track, clip, *span, peak)
 
 

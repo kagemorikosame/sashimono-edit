@@ -35,6 +35,7 @@ from sashimono.core.model import (
     Clip,
     Effect,
     GeneratedSource,
+    Interpolation,
     Keyframe,
     MediaItem,
     Project,
@@ -190,6 +191,26 @@ class TestZoom:
         (zoom,) = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
         assert zoom.strength is not None
         assert zoom.strength > 120.5
+
+    def test_a_one_frame_peak_in_a_long_clip_is_the_strength(self, work: _Work) -> None:
+        # 長いクリップを同じ刻みで間引くと、キー 1 つだけの山を飛ばして強さを小さく読む
+        scale = _curve((0, 100), (30, 120), (31, 180), (32, 120))
+        project = work.build(video=(work.clip(0, 6000, effects=(_transform(scale=scale),)),))
+        (zoom,) = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
+        assert zoom.strength == pytest.approx(180)
+
+    def test_a_hold_switch_starts_the_zoom_at_the_key(self, work: _Work) -> None:
+        # 右端の値で前の間を採ると、30 で切り替わる寄りを 0 からと読み、頭を 30 にすると数え落とす
+        scale = AnimatedValue(
+            keyframes=(
+                Keyframe(0, 100.0, Interpolation.HOLD),
+                Keyframe(30, 120.0, Interpolation.HOLD),
+                Keyframe(60, 100.0, Interpolation.HOLD),
+            )
+        )
+        project = work.build(video=(work.clip(0, 300, effects=(_transform(scale=scale),)),))
+        zooms = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
+        assert [(e.start_frame, e.end_frame) for e in zooms] == [(30, 60)]
 
 
 class TestShake:
