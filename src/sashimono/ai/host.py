@@ -493,6 +493,22 @@ class EditorHost(Protocol):
         ...
 
     @property
+    def ai_transcribe_model(self) -> str:
+        """AI が字幕を起こすとき、モデルを指示されなければ使うモデル（#469）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.ai_transcribe_model`）
+        """
+        ...
+
+    @property
+    def word_timestamps(self) -> bool:
+        """字幕起こしで語の時刻も取るか（#420）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.word_timestamps`）
+
+        AI が引数で渡さなければこれを使う（#469）
+        """
+        ...
+
+    @property
     def subtitle_timing(self) -> SubtitleTiming:
         """起こした字幕の時刻の合わせ方（#426）
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.subtitle_timing`）
@@ -664,11 +680,16 @@ class EditorHost(Protocol):
         *,
         audio_stream: int | None = None,
         words_only: bool = False,
+        word_timestamps: bool,
+        timing: SubtitleTiming,
     ) -> str:
         """起こしを始める 戻り値は画面に出す短い文言
 
         ``audio_stream`` は起こす音声ストリームの番号 ``None`` なら 1 本目
         ``words_only`` は語の時刻だけを今の字幕へ足す（#420 文言と話者は変えない）
+        ``word_timestamps`` と ``timing`` は道具が本人の設定と引数から決めた値（#469）
+        省けるようにしないのは、ここで設定へ戻すと AI が「寄せないで」と頼まれた呼び出しでも
+        黙って設定の側で起こすから
         """
         ...
 

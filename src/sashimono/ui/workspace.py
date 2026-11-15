@@ -36,6 +36,8 @@ from sashimono.ai.models import DEFAULT_MODEL as DEFAULT_AI_MODEL
 from sashimono.ai.models import EFFORTS as AI_EFFORTS
 from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.outbound import Outbound, SendChoice
+from sashimono.asr.backend import DEFAULT_MODEL as DEFAULT_ASR_MODEL
+from sashimono.asr.backend import MODELS as ASR_MODELS
 from sashimono.compat.subtitle_looks import LookRules
 from sashimono.core import userdirs
 from sashimono.core.commands.preset import PresetOptions
@@ -789,6 +791,12 @@ class Preferences:
     #: 山の音の立ち上がりをそのまま残したい人（音楽・効果音の作品）は切る 切ると前の動き
     #: （山の手前で止めて、届かないことを伝える）
     loudness_limiter: bool = True
+    #: AI アシスタントが字幕を起こすとき、モデルを指示されなければ使うモデル（#469） 選べるのは
+    #: 起こしの窓と同じ :data:`~sashimono.asr.backend.MODELS` 既定は一番正確な large-v3
+    #: 速さと精度の釣り合いは機械と素材で答えが違う GPU の無い PC で下書きだけ欲しい人は
+    #: large-v3-turbo などへ下げる 窓から人が起こすときは窓の選択に従い、これは使わない
+    #: 決めないままだと AI が速さを気にして small を選び、同じ素材でも字幕の質が呼ぶたびに変わった
+    ai_transcribe_model: str = DEFAULT_ASR_MODEL
     #: 字幕起こしで語の時刻も取るか（#420） 取ると AI が語の境目で切れ、字幕の下に残った語も
     #: 読める 実物の素材で起こす時間は素材によって 0.8〜2 倍（large-v3 と GPU）・1.1〜1.2 倍
     #: （small と CPU）だった 既定は入り 切ると起こしは速いことがあるが、切り抜きが言葉の途中で
@@ -1332,6 +1340,11 @@ class PreferenceStore:
                 data.get("check_loudness_target"), plain.check_loudness_target
             ),
             loudness_limiter=_flag(data.get("loudness_limiter"), plain.loudness_limiter),
+            ai_transcribe_model=_choice(
+                data.get("ai_transcribe_model"),
+                tuple(info.name for info in ASR_MODELS),
+                plain.ai_transcribe_model,
+            ),
             word_timestamps=_flag(data.get("word_timestamps"), plain.word_timestamps),
             subtitle_fit_voice=_flag(data.get("subtitle_fit_voice"), plain.subtitle_fit_voice),
             subtitle_start_offset_ms=_within(
