@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from fractions import Fraction
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, QPoint, Qt, Signal
 from PySide6.QtGui import QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -549,12 +549,12 @@ class SubtitlePanel(QWidget):
             # 実プロジェクトで、選ぶ 1 回に 50 ms ほど（#455） 見えたときに作り直す
             self._stale = True
             return
-        self._stale = False
         signature = self._rows_signature()
         if signature == self._signature and self._table.rowCount() == len(self._segments()):
             # 中身は同じ 幅だけ入れ直す 長さが変わって桁が増えていれば、
             # ここで合図が飛んで折り返しを取り直す（変わっていなければ何も起きない）
             self._table.horizontalHeader().resizeSection(0, self._time_column_width())
+            self._stale = False
             return
         # 印は**作り終えてから**立てる 途中で落ちたのに立てると、同じ
         # プロジェクトを開き直しても作り直さず、半端な表が残ったままになる
@@ -599,6 +599,9 @@ class SubtitlePanel(QWidget):
             self._table.setUpdatesEnabled(True)
             self._updating = False
         self._signature = signature
+        # 遅れの印も作り終えてから下ろす 途中で落ちたのに下ろすと、追いつく所（見えたとき・
+        # 行を読む前）が作り直しを飛ばし、半端な一覧を今の物として読む
+        self._stale = False
 
         self._table.resizeRowsToContents()
         self._update_actions()
@@ -1345,7 +1348,11 @@ class SubtitlePanel(QWidget):
             self._catch_up()
 
     def _catch_up(self) -> None:
-        """遅らせた一覧の作り直しを済ませる"""
+        """遅らせた一覧の作り直しを済ませる
+
+        見えた時に呼ぶ 呼ばないと、隠れている間に変わった作品の字幕が、次に作品が
+        変わるまで前の時刻のまま並ぶ
+        """
         if self._stale:
             self._reload_rows()
 
@@ -1357,17 +1364,37 @@ class SubtitlePanel(QWidget):
         """
         if not self._stale:
             return
+        # 作り直すと表の選択が消える 人が選んでいた字幕は、今の一覧に残っていれば選び直す
+        # 選び直さないと、隠れている間に作品が変わっただけで AI へ渡す選択が空になる
+        chosen = set(self._chosen_rows())
         shown, self._shown = self._shown, True
         try:
             self._reload_rows()
         finally:
             self._shown = shown
+        if not chosen:
+            return
+        model = self._table.selectionModel()
+        # 足していく selectRow は前の選択を置き換えるので、何行も選んでいると最後の 1 行だけ残る
+        adding = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        self._updating = True
+        try:
+            model.clearSelection()
+            for row, (segment_id, _start, _end) in enumerate(self._rows):
+                if segment_id in chosen:
+                    model.select(self._table.model().index(row, 0), adding)
+        finally:
+            self._updating = False
+
+    def _chosen_rows(self) -> tuple[SegmentId, ...]:
+        """表で選んでいる行の字幕 上から順"""
+        rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
+        return tuple(self._rows[row][0] for row in rows if 0 <= row < len(self._rows))
 
     def selected_segments(self) -> tuple[SegmentId, ...]:
         """表で選んでいる行の字幕 上から順 AI が人の選択を読む口（#352）"""
         self._catch_up_shown()
-        rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
-        return tuple(self._rows[row][0] for row in rows if 0 <= row < len(self._rows))
+        return self._chosen_rows()
 
     def place_selected_rows(self) -> None:
         """選んだ行（無ければ再生位置の 1 行）をテキストとしてタイムラインへ置く"""

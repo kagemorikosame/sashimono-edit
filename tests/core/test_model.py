@@ -361,8 +361,12 @@ class TestTranscript:
         import pickle
         from dataclasses import replace
 
-        assert transcript == replace(transcript)
-        assert hash(transcript.segments) == hash(replace(transcript).segments)
+        # 索引だけをわざと変えた物も、同じ字幕なら等しく、ハッシュも同じ
+        skewed = replace(transcript)
+        object.__setattr__(skewed, "_starts", ())
+        object.__setattr__(skewed, "_reach", (Fraction(999),))
+        assert transcript == skewed
+        assert hash(transcript) == hash(skewed)
         shorter = replace(transcript, segments=transcript.segments[:1])
         assert list(shorter.overlapping(Fraction(0), Fraction(100))) == [transcript.segments[0]]
         copied = pickle.loads(pickle.dumps(transcript))

@@ -124,6 +124,11 @@ def _frame_lines(frame: FrameType | None) -> list[str]:
     画面のスレッドが Python を回し続けている間は 1 回写すのに 50 ms 以上かかり、200 ms までの
     止まりで 1 度も写せなかった（#455 の実プロジェクトの記録で 65% が並び無し） 使うのは
     場所と行と名前だけなので、フレームから直に読む
+
+    辿る途中で GIL を手放すと、相手のスレッドが動いてフレームを捨てる その間に辿った
+    先読みの係（GL の呼び出しで GIL を手放し直す）の並びが壊れ、記録を入れた人のアプリが
+    開いた直後に落ちた（#455 で約 40 回開いて 5 回 Segmentation fault 直した後は 72 回で 0 回）
+    ここでは段の間で I/O も GIL を手放す呼び出しもしない
     """
     found: list[str] = []
     while frame is not None and len(found) < STACK_DEPTH:

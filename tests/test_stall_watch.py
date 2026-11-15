@@ -316,6 +316,7 @@ def test_a_python_bound_stall_is_sampled_while_it_lasts(tmp_path: Path) -> None:
             time.sleep(0.01)
     finally:
         watch.stop()
-    (record,) = _records(tmp_path / "stalls.jsonl")
+    # 後片付けの間に試験の側が遅れると、別の短い止まりも書かれうる 狙った 1 回目だけを見る
+    record = _records(tmp_path / "stalls.jsonl")[0]
     assert isinstance(record["samples"], list)
     assert len(record["samples"]) >= 2

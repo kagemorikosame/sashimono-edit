@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, QItemSelectionModel
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
 from sashimono.core.commands import (
@@ -37,6 +37,7 @@ from sashimono.core.model import (
     Track,
     TrackKind,
     Transcript,
+    TranscriptSegment,
 )
 from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.effects.sources import TEXT
@@ -144,14 +145,63 @@ class TestListing:
         assert item is not None and item.text() == "00:00:00:00"
 
     def test_rows_are_read_from_the_current_media_while_hidden(
-        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        video_media: MediaItem,
     ) -> None:
         # 壊れると、隠れている間に残った前の一覧の行を、AI が人の選んだ字幕として受け取る
         widget, _ = panel
+        widget._table.selectRow(1)
+        before = set(widget.selected_segments())
+        assert before
+        widget.set_shown(False)
+        fresh = Transcript(
+            segments=(TranscriptSegment(start=Fraction(1), end=Fraction(2), text="新しい"),)
+        )
+        widget.set_project(SetTranscript(video_media.id, fresh).apply(placed))
+        # 前の字幕の ID はもう一覧に無い 読む前に今の一覧へ合わせ、前の ID を返さない
+        assert not set(widget.selected_segments()) & before
+        widget._table.selectAll()
+        assert widget.selected_segments() == (fresh.segments[0].id,)
+
+    def test_the_chosen_rows_survive_catching_up(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、隠れている間に作品が変わっただけで、人が選んでいた字幕が AI から見えなくなる
+        widget, _ = panel
+        model = widget._table.selectionModel()
+        adding = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        model.clearSelection()
+        for row in (1, 2):
+            model.select(widget._table.model().index(row, 0), adding)
+        chosen = widget.selected_segments()
+        assert len(chosen) == 2
         widget.set_shown(False)
         widget.set_project(RippleCut(((0, 30),)).apply(placed))
-        # 読む前に今の作品へ合わせる（隠れたままでも）
-        widget.selected_segments()
+        assert widget.selected_segments() == chosen
+
+    def test_a_failed_rebuild_is_tried_again(
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、作り直しの途中で落ちたのに追いついた扱いになり、半端な一覧が残り続ける
+        widget, _ = panel
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+
+        def broken(_media: MediaItem) -> dict[object, tuple[int, int]]:
+            raise RuntimeError("途中で落ちた")
+
+        monkeypatch.setattr(widget, "_placement", broken)
+        with pytest.raises(RuntimeError):
+            widget.set_shown(True)
+        assert widget._stale
+        monkeypatch.undo()
+        widget.set_shown(True)
+        assert not widget._stale
         item = widget._table.item(0, 0)
         assert item is not None and item.text() == "00:00:00:00"
 

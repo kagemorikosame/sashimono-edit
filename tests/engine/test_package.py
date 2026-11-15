@@ -37,6 +37,7 @@ from sashimono.core.model import (
 )
 from sashimono.effects.spec import FileSpec
 from sashimono.engine.decode import AudioDecoder, VideoDecoder, probe_media
+from sashimono.engine.decode.rational import as_fraction
 from sashimono.engine.package import archive, plan, remux
 from sashimono.engine.package.archive import (
     PACKAGE_SUFFIX,
@@ -357,10 +358,62 @@ class TestCut:
         span = (Fraction(2), Fraction(3))
         assert remux._same_packets(source, source, stream.index, *span, lambda: False)
         assert not remux._same_packets(source, other, stream.index, *span, lambda: False)
+        # 解いた音がずれたときにパケットで認め直す道を通しても、中身の違う音は拒む
+        assert not remux._same_sound(
+            source, other, stream.index, stream.sample_rate, stream.channels,
+            [Span(*span)], lambda: False,
+        )  # fmt: skip
         # 範囲にパケットが無ければ確かめられないとする（空どうしを同じと見ない）
         assert not remux._same_packets(
             source, source, stream.index, Fraction(100), Fraction(101), lambda: False
         )
+
+    def test_a_missing_packet_before_a_long_aac_packet_is_noticed(self, tmp_path: Path) -> None:
+        """壊れると、1 パケットが長い音（8 kHz の AAC は 128 ms）で頭の 1 つ前が欠けても認める
+
+        AAC は 1 つ前のパケットと重ね合わせて頭の音を作る 比べる所を決め打ちの長さで
+        さかのぼると、長いパケットでは 1 つ前まで届かず、頭の音が変わった切り出しを入れる
+        """
+        if shutil.which("ffmpeg") is None:
+            pytest.skip("ffmpeg が無いので素材を作れない")
+        source = tmp_path / "slow.mka"
+        _ffmpeg(
+            "-f", "lavfi", "-i", "sine=frequency=300:duration=6:sample_rate=8000",
+            "-c:a", "aac", "-ar", "8000", str(source),
+        )  # fmt: skip
+        moment = Fraction(3)
+        with av.open(str(source)) as reader:
+            stream = reader.streams.audio[0]
+            length = Fraction(stream.codec_context.frame_size, stream.codec_context.sample_rate)
+            stamps = [
+                packet.pts * as_fraction(packet.time_base)
+                for packet in reader.demux(stream)
+                if packet.pts is not None
+            ]
+        assert length > Fraction(1, 10)
+        # 頭を含むパケットの 1 つ前（頭の音を作るのに要る物）
+        holding = max(stamp for stamp in stamps if stamp <= moment)
+        before = max(stamp for stamp in stamps if stamp < holding)
+        whole = tmp_path / "whole.mka"
+        missing = tmp_path / "missing.mka"
+        for target, dropped in ((whole, None), (missing, before)):
+            with av.open(str(source)) as reader, av.open(str(target), "w", format="matroska") as w:
+                stream = reader.streams.audio[0]
+                copy = w.add_stream_from_template(stream)
+                for packet in reader.demux(stream):
+                    if packet.dts is None:
+                        continue
+                    if (
+                        packet.pts is not None
+                        and packet.pts * as_fraction(packet.time_base) == dropped
+                    ):
+                        continue
+                    packet.stream = copy
+                    w.mux(packet)
+        index = probe_media(source).audio_streams[0].index
+        end = moment + Fraction(1, 4)
+        assert remux._same_packets(source, whole, index, moment, end, lambda: False)
+        assert not remux._same_packets(source, missing, index, moment, end, lambda: False)
 
     def test_unreadable_pictures_are_not_trusted(
         self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
