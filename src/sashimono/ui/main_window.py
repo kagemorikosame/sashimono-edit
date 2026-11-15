@@ -854,6 +854,8 @@ class MainWindow(QMainWindow):
         # パネルで、同時に見る場面が少ない
         self.tabifyDockWidget(pool_dock, subtitle_dock)
         pool_dock.raise_()
+        # タブが裏にある間は字幕の一覧を作り直さない（選ぶたびに見えない表を組んでいた #455）
+        subtitle_dock.visibilityChanged.connect(self._subtitles.set_shown)
         self._subtitle_dock = subtitle_dock
 
         chat_dock = self._dock("AI アシスタント", "chat")

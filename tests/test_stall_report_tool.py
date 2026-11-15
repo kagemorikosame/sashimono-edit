@@ -82,6 +82,26 @@ def test_painting_and_timeline_work_are_separated(tool: ModuleType) -> None:
     assert tool.classify(tool.parse(compute)) == tool.TIMELINE
 
 
+def test_a_panel_that_follows_the_selection_is_not_counted_as_the_timeline(
+    tool: ModuleType,
+) -> None:
+    """壊れると、選ぶ知らせを受けた字幕パネルの重さがタイムラインに付き、直す所を読み違える"""
+    select = [*LOOP, "sashimono/ui/timeline/view.py:787 set_selection"]
+    subtitles = _record(
+        50, [*select, "sashimono/ui/main_window.py:2776 _on_selection_changed",
+             "sashimono/ui/subtitle/panel.py:592 _reload_rows"],
+    )  # fmt: skip
+    inspector = _record(
+        50, [*select, "sashimono/ui/main_window.py:2768 _on_selection_changed",
+             "sashimono/ui/inspector/panel.py:858 _rebuild", "sashimono/core/model/clip.py:10 x"],
+    )  # fmt: skip
+    summary = tool.summarize([subtitles, inspector])
+    assert tool.classify(tool.parse(subtitles)) == tool.OTHER
+    assert summary.places["ui/subtitle/panel.py _reload_rows"] == 1
+    # 設定パネルが本体の計算を呼んで止まったときは、設定パネルのまま
+    assert tool.classify(tool.parse(inspector)) == tool.INSPECTOR
+
+
 def test_waiting_in_the_event_loop_while_a_worker_runs_is_background(tool: ModuleType) -> None:
     """壊れると、裏のスレッドと GIL を取り合って止まった所が「その他」に埋もれる"""
     record = _record(

@@ -619,13 +619,71 @@ def _same_sound(
             new = copied.read_seconds(moment, length)
             if old.shape != new.shape:
                 return False
-            if old.size and float(np.max(np.abs(old - new))) > _SOUND_TOLERANCE:
+            # 解いた音がずれても、パケットが時刻も中身も元と同じなら写し漏れではない
+            # AAC の雑音の置き換え（PNS）は復号器の中の乱数で音を作り、乱数は解き始めた
+            # 所から進むので、同じパケットでも元と写しで違う音になる（-28 dB ほど）
+            # 実物の録画（音声 4 本の OBS）で 1 本がこれに当たり、3.1 GB の素材を範囲だけ
+            # 写せずにまるごと入れた（#455）
+            if (
+                old.size
+                and float(np.max(np.abs(old - new))) > _SOUND_TOLERANCE
+                and not _same_packets(source, target, index, moment, moment + length, cancelled)
+            ):
                 return False
         # 解けなかった所は読み手が無音で埋める 両方が無音なら同じに見えるので、解けなかったら
         # 確かめられなかったとして切り出さない（#449 の CodeRabbit の指摘）
         if original.decode_error is not None or copied.decode_error is not None:
             return False
     return True
+
+
+#: 解いた音がずれたとき、パケットそのものを比べ始める所（区間の頭からさかのぼる秒）
+#: AAC は 1 つ前のパケットと重ね合わせて頭の音を作るので、頭の手前の 2 つほど（48kHz で
+#: 1 つ 21 ms）も同じか見る 長く取りすぎない 区間の頭が映像のキーフレームに当たると、
+#: 入れ物の中でそれより前に並ぶ音は写さず、頭の手前は 70 ms ほどしか入らない
+_PACKET_LEAD = Fraction(1, 20)
+
+
+def _same_packets(
+    source: Path,
+    target: Path,
+    index: int,
+    start: Fraction,
+    end: Fraction,
+    cancelled: Callable[[], bool],
+) -> bool:
+    """``start`` の少し前から ``end`` までの道 ``index`` のパケットが、時刻も中身も元と同じか
+
+    1 つも無ければ確かめられなかったとして偽 区間の外を無音に置き換えた PCM（:func:`_hush`）は
+    中身が変わるので偽になり、今までどおりまるごと入る
+    """
+    begin = start - _PACKET_LEAD
+    old = _packets(source, index, begin, end, cancelled)
+    return bool(old) and old == _packets(target, index, begin, end, cancelled)
+
+
+def _packets(
+    path: Path, index: int, start: Fraction, end: Fraction, cancelled: Callable[[], bool]
+) -> list[tuple[Fraction, bytes]]:
+    """素材の原点から数えた ``[start, end]`` に表示の時刻があるパケット（時刻と中身）"""
+    with av.open(str(path)) as container:
+        stream = container.streams[index]
+        origin = media_origin(container)
+        time_base = as_fraction(stream.time_base) if stream.time_base else Fraction(1, 1000)
+        # 索引の粗い入れ物でも手前に着くよう、1 秒前へ戻ってから読む
+        container.seek(max(0, int((origin + start - 1) / time_base)), stream=stream, backward=True)
+        found: list[tuple[Fraction, bytes]] = []
+        for packet in container.demux(stream):
+            if cancelled():
+                raise Cancelled
+            shown = _seconds(packet)
+            if shown is None:
+                continue
+            if shown > origin + end:
+                break
+            if shown >= origin + start:
+                found.append((shown - origin, bytes(packet)))
+        return found
 
 
 # --- 編集用の大きな形式を符号にし直す（#446） --------------------------------------

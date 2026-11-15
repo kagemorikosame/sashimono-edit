@@ -172,6 +172,10 @@ class SubtitlePanel(QWidget):
         self._rows: list[tuple[SegmentId, int, int]] = []
         #: 一覧を作ったときの中身の印 同じなら作り直さない
         self._signature: tuple[object, ...] | None = None
+        #: パネルが見えているか（ドックのタブが表か :meth:`set_shown`） 見えていない間は
+        #: 一覧を作り直さず、作り直しが要ることだけ覚える（:attr:`_stale`）
+        self._shown = True
+        self._stale = False
         self._updating = False
         #: 起こしの実行係 バックエンドの読み込みは重いので、初めて使うときに作る
         self._service: TranscriptionService | None = None
@@ -539,6 +543,13 @@ class SubtitlePanel(QWidget):
         2000 本あると作り直しだけで 70ms 掛かる 字幕に関係のない編集
         （クリップの色を変えるなど）でそれを払うのは無駄
         """
+        if not self._shown:
+            # 見えていない間は作り直さない 既定の配置では字幕はメディアの裏のタブにあり、
+            # タイムラインで選び直すたびに見えない一覧を作り直していた 字幕が 739 本ある
+            # 実プロジェクトで、選ぶ 1 回に 50 ms ほど（#455） 見えたときに作り直す
+            self._stale = True
+            return
+        self._stale = False
         signature = self._rows_signature()
         if signature == self._signature and self._table.rowCount() == len(self._segments()):
             # 中身は同じ 幅だけ入れ直す 長さが変わって桁が増えていれば、
@@ -1324,13 +1335,43 @@ class SubtitlePanel(QWidget):
         dialog.deleteLater()
         return answer if accepted else None
 
+    def set_shown(self, shown: bool) -> None:
+        """パネルが見えるようになった・隠れた（ドックの ``visibilityChanged``）
+
+        見えるようになったら、隠れている間に遅らせた一覧の作り直しを済ませる
+        """
+        self._shown = shown
+        if shown:
+            self._catch_up()
+
+    def _catch_up(self) -> None:
+        """遅らせた一覧の作り直しを済ませる"""
+        if self._stale:
+            self._reload_rows()
+
+    def _catch_up_shown(self) -> None:
+        """行を読む前に、見えていなくても一覧を今の素材に合わせる
+
+        隠れている間の一覧は前の素材の行のまま残っている そのまま読むと、AI やメニューが
+        別の素材の字幕を選んでいると受け取る
+        """
+        if not self._stale:
+            return
+        shown, self._shown = self._shown, True
+        try:
+            self._reload_rows()
+        finally:
+            self._shown = shown
+
     def selected_segments(self) -> tuple[SegmentId, ...]:
         """表で選んでいる行の字幕 上から順 AI が人の選択を読む口（#352）"""
+        self._catch_up_shown()
         rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
         return tuple(self._rows[row][0] for row in rows if 0 <= row < len(self._rows))
 
     def place_selected_rows(self) -> None:
         """選んだ行（無ければ再生位置の 1 行）をテキストとしてタイムラインへ置く"""
+        self._catch_up_shown()
         media = self._current_media()
         if media is None:
             return

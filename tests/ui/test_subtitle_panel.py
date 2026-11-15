@@ -129,6 +129,32 @@ class TestListing:
         assert item is not None
         assert item.text() == "00:00:00:00"
 
+    def test_a_hidden_panel_rebuilds_when_shown(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、メディアの裏のタブにある字幕の一覧を、タイムラインで選び直すたびに作り直して
+        # 選ぶ操作が止まる（#455） 逆に見えたときに作り直さないと、前の時刻のまま残る
+        widget, _ = panel
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+        item = widget._table.item(0, 0)
+        assert item is not None and item.text() == "00:00:01:00", "隠れている間に作り直した"
+        widget.set_shown(True)
+        item = widget._table.item(0, 0)
+        assert item is not None and item.text() == "00:00:00:00"
+
+    def test_rows_are_read_from_the_current_media_while_hidden(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、隠れている間に残った前の一覧の行を、AI が人の選んだ字幕として受け取る
+        widget, _ = panel
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+        # 読む前に今の作品へ合わせる（隠れたままでも）
+        widget.selected_segments()
+        item = widget._table.item(0, 0)
+        assert item is not None and item.text() == "00:00:00:00"
+
     def test_subtitles_outside_the_timeline_are_marked(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
     ) -> None:

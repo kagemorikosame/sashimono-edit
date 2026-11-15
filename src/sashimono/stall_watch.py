@@ -23,7 +23,6 @@ import os
 import sys
 import threading
 import time
-import traceback
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -115,6 +114,24 @@ def _where(filename: str) -> str:
         last = len(parts) - 1 - parts[-2::-1].index("sashimono") - 1
         return "/".join(parts[last:])
     return Path(filename).name
+
+
+def _frame_lines(frame: FrameType | None) -> list[str]:
+    """呼び出しの並び（外から内へ、内側の :data:`STACK_DEPTH` 段）を ``場所:行 名前`` で返す
+
+    :func:`traceback.extract_stack` を使わない あちらは段ごとにソースのファイルを確かめ
+    （``linecache.checkcache`` の stat）、行の中身も読む そのたびに GIL を手放して取り直すので、
+    画面のスレッドが Python を回し続けている間は 1 回写すのに 50 ms 以上かかり、200 ms までの
+    止まりで 1 度も写せなかった（#455 の実プロジェクトの記録で 65% が並び無し） 使うのは
+    場所と行と名前だけなので、フレームから直に読む
+    """
+    found: list[str] = []
+    while frame is not None and len(found) < STACK_DEPTH:
+        code = frame.f_code
+        found.append(f"{_where(code.co_filename)}:{frame.f_lineno} {code.co_name}")
+        frame = frame.f_back
+    found.reverse()
+    return found
 
 
 class StallWatch:
@@ -219,10 +236,7 @@ class StallWatch:
             if ident == own:
                 # 見張り自身の並びは毎回同じで、読む人の邪魔になる
                 continue
-            lines = [
-                f"{_where(entry.filename)}:{entry.lineno} {entry.name}"
-                for entry in traceback.extract_stack(frame, limit=STACK_DEPTH)
-            ]
+            lines = _frame_lines(frame)
             # 名前で引く 同じ名前のスレッド（取り消して頼み直した読み込みの係など）が
             # 並ぶと片方が消えるので、2 本目からは番号を添える ``MainThread`` は 1 本だけなので
             # 名前のまま残り、手引きの読み方（MainThread の並びを見る）は変わらない

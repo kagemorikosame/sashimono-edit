@@ -321,6 +321,47 @@ class TestCut:
         finally:
             decoder.close()
 
+    def test_aac_with_noise_substitution_is_cut(self, media_dir: Path, tmp_path: Path) -> None:
+        """壊れると、雑音の置き換え（PNS）を使う AAC の録画を範囲だけ写せず、毎回まるごと入れる
+
+        PNS の音は復号器の中の乱数で作るので、同じパケットでも解き始めた所で音が変わる
+        解いた音だけで比べると、正しく写した切り出しを違うと見て捨てていた（#455 の実物は
+        3.1 GB の録画がまるごと入った） パケットが時刻も中身も同じなら写し漏れではない
+        """
+        if not libx264_available():
+            pytest.skip("ffmpeg に libx264 が無いので実素材のテストを飛ばす")
+        source = media_dir / "package-pns.mp4"
+        if not source.exists():
+            _ffmpeg(
+                "-f", "lavfi", "-i", "anoisesrc=d=20:c=white:r=48000:a=0.3:seed=455",
+                "-f", "lavfi", "-i", "testsrc=d=20:s=96x64:r=30",
+                "-ac", "2", "-c:a", "aac", "-aac_pns", "1", "-b:a", "48k",
+                "-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p", "-shortest", str(source),
+            )  # fmt: skip
+        spans = [Span(Fraction(73, 10), Fraction(9)), Span(Fraction(13), Fraction(15))]
+        target = tmp_path / "pns.mp4"
+        assert cut_media(source, target, spans, muxer="mp4")
+        # 切り出した音のパケットは、使う範囲で元とバイトごとに同じ
+        stream = probe_media(source).audio_streams[0]
+        for span in spans:
+            assert remux._same_packets(
+                source, target, stream.index, span.start, span.end, lambda: False
+            )
+
+    def test_changed_packets_are_not_trusted(self, media_dir: Path, tmp_path: Path) -> None:
+        """壊れると、中身の違うパケットを比べても同じと見て、別の音の切り出しを入れる"""
+        source = _video(media_dir)
+        other = tmp_path / "other.mp4"
+        _ffmpeg("-i", str(source), "-af", "volume=0.5", "-c:v", "copy", "-c:a", "aac", str(other))
+        stream = probe_media(source).audio_streams[0]
+        span = (Fraction(2), Fraction(3))
+        assert remux._same_packets(source, source, stream.index, *span, lambda: False)
+        assert not remux._same_packets(source, other, stream.index, *span, lambda: False)
+        # 範囲にパケットが無ければ確かめられないとする（空どうしを同じと見ない）
+        assert not remux._same_packets(
+            source, source, stream.index, Fraction(100), Fraction(101), lambda: False
+        )
+
     def test_unreadable_pictures_are_not_trusted(
         self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -335,6 +335,39 @@ class TestTranscript:
         assert list(transcript.overlapping(Fraction(3), Fraction(4))) == []
         assert len(list(transcript.overlapping(Fraction(2), Fraction(5)))) == 2
 
+    def test_overlapping_finds_the_same_segments_as_a_full_scan(self) -> None:
+        # 索引で範囲を絞るので、長い字幕の後ろに短い字幕が続く（終わりが並ばない）所で
+        # 頭の手前の長い字幕を取りこぼすと、クリップの頭に出るはずの字幕が消える
+        import random
+
+        rng = random.Random(455)
+        starts = sorted(Fraction(rng.randint(0, 600), 4) for _ in range(300))
+        segments = tuple(
+            TranscriptSegment(
+                start=start, end=start + Fraction(rng.choice((1, 2, 40, 400)), 4), text=str(i)
+            )
+            for i, start in enumerate(starts)
+        )
+        transcript = Transcript(segments=segments)
+        for _ in range(500):
+            low = Fraction(rng.randint(-8, 700), 4)
+            high = low + Fraction(rng.randint(0, 80), 4)
+            expected = [s for s in segments if s.overlaps(low, high)]
+            assert list(transcript.overlapping(low, high)) == expected
+
+    def test_the_index_stays_out_of_equality_and_copies(self, transcript: Transcript) -> None:
+        # 索引が比べに入ると、同じ字幕なのに別物と見て一覧を作り直す 写し（replace と
+        # 子のプロセスへ送る pickle）で索引が古いまま残ると、別の字幕の範囲で絞る
+        import pickle
+        from dataclasses import replace
+
+        assert transcript == replace(transcript)
+        assert hash(transcript.segments) == hash(replace(transcript).segments)
+        shorter = replace(transcript, segments=transcript.segments[:1])
+        assert list(shorter.overlapping(Fraction(0), Fraction(100))) == [transcript.segments[0]]
+        copied = pickle.loads(pickle.dumps(transcript))
+        assert list(copied.overlapping(Fraction(0), Fraction(100))) == list(transcript.segments)
+
     def test_with_text_marks_edited(self, transcript: Transcript) -> None:
         # 手で直した印が付かないと、整理の「手で直した字幕には触らない」が効かず直した文を
         # 書き換える ID が変わると差し替え先が見つからず編集が落ちる

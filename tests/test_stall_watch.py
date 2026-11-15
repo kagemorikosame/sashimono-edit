@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
@@ -276,3 +277,45 @@ def test_the_memory_of_this_process_can_be_read() -> None:
     assert usage.resident_mb > 1
     if sys.platform == "win32":
         assert usage.private_mb is not None and usage.private_mb > 1
+
+
+def test_the_stack_reads_like_the_traceback_module(tmp_path: Path) -> None:
+    """壊れると、写し方を速くしたときに並びの向きや形が変わり、``stall_report.py`` が読み違える"""
+    import traceback
+
+    from sashimono.stall_watch import STACK_DEPTH, _frame_lines, _where
+
+    def deep(level: int) -> FrameType:
+        return deep(level - 1) if level else sys._getframe()
+
+    frame = deep(STACK_DEPTH + 5)
+    expected = [
+        f"{_where(entry.filename)}:{entry.lineno} {entry.name}"
+        for entry in traceback.extract_stack(frame, limit=STACK_DEPTH)
+    ]
+    assert _frame_lines(frame) == expected
+    assert len(expected) == STACK_DEPTH
+
+
+def test_a_python_bound_stall_is_sampled_while_it_lasts(tmp_path: Path) -> None:
+    """壊れると、画面のスレッドが Python を回し続けた止まりで並びを写せず、記録が並び無しになる
+
+    本物の時計とスレッドで確かめる 写すのに GIL を何度も手放す書き方（ソースの行を読む）だと、
+    400 ms の止まりでも 1 回も写せなかった（#455）
+    """
+    watch = StallWatch(tmp_path / "stalls.jsonl", threshold_ms=30.0)
+    watch.start()
+    try:
+        watch.beat()
+        began = time.perf_counter()
+        while time.perf_counter() - began < 0.4:
+            sum(range(1000))
+        watch.beat()
+        deadline = time.perf_counter() + 5
+        while not watch.recorded and time.perf_counter() < deadline:
+            time.sleep(0.01)
+    finally:
+        watch.stop()
+    (record,) = _records(tmp_path / "stalls.jsonl")
+    assert isinstance(record["samples"], list)
+    assert len(record["samples"]) >= 2
