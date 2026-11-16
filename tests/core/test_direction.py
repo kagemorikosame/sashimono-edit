@@ -216,9 +216,7 @@ class TestZoom:
         # 左端と真ん中だけを見ると、間の後ろ半分で動き出す寄りを「動いていない」と読み数え落とす
         scale = AnimatedValue(
             keyframes=(
-                Keyframe(
-                    0, 100.0, Interpolation.BEZIER, control_points=(0.0, 0.0, 1.0, -1 / 3)
-                ),
+                Keyframe(0, 100.0, Interpolation.BEZIER, control_points=(0.0, 0.0, 1.0, -1 / 3)),
                 Keyframe(60, 120.0, Interpolation.HOLD),
                 Keyframe(90, 100.0, Interpolation.HOLD),
             )
