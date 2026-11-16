@@ -1378,9 +1378,19 @@ class SubtitlePanel(QWidget):
             self._reload_rows()
         finally:
             self._shown = shown
-        if not chosen:
-            return
         model = self._table.selectionModel()
+        if not chosen:
+            # 再生位置の行を今の時刻で選び直す 一覧の中身が前と同じだと作り直しを飛ばすので、
+            # 作り直しの中の選び直しを当てにしない 隠れている間に再生位置だけが動いたとき、
+            # 前の時刻の行が残って AI やテキストの配置へ渡る（#475 の CodeRabbit）
+            # 今の行を外してから選ぶ 外さないと、同じ行のときに選び直しを飛ばす
+            self._updating = True
+            try:
+                model.clear()
+            finally:
+                self._updating = False
+            self._highlight()
+            return
         # 足していく selectRow は前の選択を置き換えるので、何行も選んでいると最後の 1 行だけ残る
         adding = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
         self._updating = True

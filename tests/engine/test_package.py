@@ -49,7 +49,12 @@ from sashimono.engine.package.archive import (
 from sashimono.engine.package.plan import fonts_used, media_spans, scripts_used
 from sashimono.engine.package.remux import Cancelled, Span, cut_media, output_format
 from sashimono.engine.package.scrub import scrub_image
-from tests.media_fixtures import libx264_available, make_delayed, make_rotated
+from tests.media_fixtures import (
+    encoder_available,
+    libx264_available,
+    make_delayed,
+    make_rotated,
+)
 
 
 def _ffmpeg(*arguments: str) -> None:
@@ -421,8 +426,9 @@ class TestCut:
         MP3 は前のパケットの残り（bit reservoir）を引くので、窓の中が同じでも頭の音が
         変わりうる 解き始めで音が変わる理由の分かっている AAC だけを認める
         """
-        if shutil.which("ffmpeg") is None:
-            pytest.skip("ffmpeg が無いので素材を作れない")
+        # libmp3lame は ffmpeg を組むときに入れないと無い 無い組み方では素材を作れずに落ちる
+        if shutil.which("ffmpeg") is None or not encoder_available("libmp3lame"):
+            pytest.skip("ffmpeg か libmp3lame が無いので MP3 の素材を作れない")
         source = tmp_path / "tone.mp3"
         _ffmpeg(
             "-f", "lavfi", "-i", "sine=frequency=300:duration=4:sample_rate=44100",

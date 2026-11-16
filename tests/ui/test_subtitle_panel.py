@@ -208,6 +208,27 @@ class TestListing:
         assert widget.selected_segments() == (widget._rows[2][0],)
         assert widget._table.currentRow() == 2
 
+    @pytest.mark.parametrize("shown_first", [False, True])
+    def test_the_playhead_row_follows_when_only_the_playhead_moved(
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        shown_first: bool,
+    ) -> None:
+        # 壊れると、隠れている間に字幕も配置も変わらず再生位置だけが動いたとき、作り直しを
+        # 飛ばして前の位置の行が残り、AI やテキストの配置が前の字幕を受け取る
+        widget, _ = panel
+        widget.set_frame(45)
+        first = widget._rows[0][0]
+        assert widget.selected_segments() == (first,)
+        widget.set_shown(False)
+        widget.set_project(placed)
+        widget.set_frame(135)
+        if shown_first:
+            widget.set_shown(True)
+        assert widget.selected_segments() == (widget._rows[1][0],)
+        assert widget._table.currentRow() == 1
+
     def test_a_failed_rebuild_is_tried_again(
         self,
         panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
