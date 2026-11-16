@@ -83,6 +83,9 @@ class SubtitleLook:
     count: int
     #: 字幕の数
     total: int
+    #: 字幕に掛けた効果の種類（掛けた順） 縁取りを縁取りの層でなく効果（``border``）で付ける
+    #: 作品がある 書かないと、縁の付いた字幕を「縁取りなし」と書き、AI が縁の無い字幕を置く
+    effects: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +148,7 @@ def _size(clip: Clip) -> float:
 
 
 def _subtitle_look(project: Project) -> SubtitleLook | None:
-    looks: Counter[tuple[str, float, str | None, str | None]] = Counter()
+    looks: Counter[tuple[str, float, str | None, str | None, tuple[str, ...]]] = Counter()
     for timeline in _timelines(project):
         for track in timeline.tracks:
             for clip in track.clips:
@@ -155,6 +158,7 @@ def _subtitle_look(project: Project) -> SubtitleLook | None:
                 if clip.subtitle_origin is None:
                     continue
                 font = fill = outline = None
+                effects: dict[str, None] = {}
                 for kind, value, where in clip_styles(clip):
                     if kind == FONT:
                         font = value
@@ -162,11 +166,13 @@ def _subtitle_look(project: Project) -> SubtitleLook | None:
                         fill = value
                     elif kind == COLOR and where == _STROKE_WHERE:
                         outline = value
-                looks[(font or "", _size(clip), fill, outline)] += 1
+                    elif kind == EFFECT:
+                        effects.setdefault(value, None)
+                looks[(font or "", _size(clip), fill, outline, tuple(effects))] += 1
     if not looks:
         return None
-    (font, size, color, outline), count = looks.most_common(1)[0]
-    return SubtitleLook(font, size, color, outline, count, sum(looks.values()))
+    (font, size, color, outline, effects_used), count = looks.most_common(1)[0]
+    return SubtitleLook(font, size, color, outline, count, sum(looks.values()), effects_used)
 
 
 def measure_habits(project: Project) -> StyleHabits:
@@ -236,13 +242,24 @@ def _tempo(habits: StyleHabits) -> str:
     return "\n".join(lines)
 
 
+def _effect_name(kind: str) -> str:
+    """効果の表示名と種類 本人は表示名で、AI は種類で読む 今の環境に無い種類は種類だけ"""
+    definition = registry.get(kind)
+    return f"{definition.label}（{kind}）" if definition is not None else kind
+
+
 def _subtitles(look: SubtitleLook | None) -> str:
     if look is None:
         return ""
     parts = [f"書体 {look.font}", f"大きさ {_number(look.size)}px"]
     if look.color is not None:
         parts.append(f"字の色 {look.color}")
-    parts.append(f"縁取り {look.outline}" if look.outline is not None else "縁取りなし")
+    if look.outline is not None:
+        parts.append(f"縁取り {look.outline}")
+    elif not look.effects:
+        parts.append("縁取りなし")
+    if look.effects:
+        parts.append("効果 " + "・".join(_effect_name(kind) for kind in look.effects))
     return "・".join(parts) + f"（字幕 {look.total} 本のうち {look.count} 本がこの見た目）"
 
 

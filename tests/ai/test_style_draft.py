@@ -168,6 +168,19 @@ class TestDraft:
         assert len(guide.fonts) == STYLE_ITEMS_LIMIT
         assert guide.fonts[0] == "見出しの書体"
 
+    def test_effects_on_subtitles_are_written(self, work: Project) -> None:
+        # 縁取りを効果で付けた字幕を「縁取りなし」と書くと、AI が縁の無い字幕を置く
+        origin = SubtitleOrigin(media_id=None, stream=0, segment_id=SegmentId("b"))
+        plain = _text(1200, "字幕の書体", _WHITE, subtitle_origin=origin)
+        assert plain.source is not None
+        source = replace(plain.source, strokes=())
+        bordered = replace(plain, source=source, effects=(Effect("border"),))
+        track = Track(kind=TrackKind.VIDEO, name="縁", clips=(bordered,))
+        alone = work.with_timeline(replace(work.timeline, tracks=(work.timeline.tracks[0], track)))
+        guide = draft_guide(measure_habits(alone))
+        assert "縁取りなし" not in guide.subtitles
+        assert "（border）" in guide.subtitles
+
 
 class TestRead:
     def test_reading_does_not_touch_the_file(self, work: Project, tmp_path: Path) -> None:
