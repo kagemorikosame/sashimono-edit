@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,18 @@ from PySide6.QtWidgets import (
 )
 
 from sashimono.core.commands import Author
-from sashimono.core.model import STYLE_ITEMS_LIMIT, Project, StyleGuide
+from sashimono.core.io.serialize import save_project
+from sashimono.core.model import (
+    STYLE_ITEMS_LIMIT,
+    Clip,
+    Effect,
+    GeneratedSource,
+    Project,
+    Stroke,
+    StyleGuide,
+    Track,
+    TrackKind,
+)
 from sashimono.core.model.style import STYLE_EFFECTS_LIMIT
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
@@ -200,6 +212,96 @@ class TestDialog:
         assert "書体 1" in summary and "テンポ" in summary
         # 要約は窓の 1 行 本人の文そのものは出さない（長い文で窓が広がる）
         assert GUIDE.notes not in summary
+
+
+def _saved_work(folder: Path) -> Path:
+    """書体 1 つ・色 2 つ・発光 1 つのテキストを 2 秒置いた作品を保存する"""
+    source = GeneratedSource(
+        "text",
+        params={"text": "本文", "font": "過去の書体", "color": (1.0, 1.0, 0.0, 1.0)},
+        strokes=(Stroke(params={"color": (0.0, 0.0, 0.0, 1.0)}),),
+    )
+    telop = Clip(timeline_start=0, duration=60, source=source, effects=(Effect("glow"),))
+    project = Project.create()
+    track = Track(kind=TrackKind.VIDEO, name="文字", clips=(telop,))
+    project = project.with_timeline(replace(project.timeline, tracks=(track,)))
+    path = folder / "過去の作品.sme"
+    save_project(project, path)
+    return path
+
+
+class TestDraft:
+    def test_a_work_fills_the_fields(self, qt_application: QApplication, tmp_path: Path) -> None:
+        """壊れると、作品から下書きを作っても欄が空のままか、書いた「そのほか」が消える"""
+        del qt_application
+        dialog = StyleGuideDialog(StyleGuide(notes="本人の決まり"), effects=EFFECTS)
+        assert dialog.load_draft(_saved_work(tmp_path))
+        guide = dialog.guide()
+        assert guide.fonts == ("過去の書体",)
+        assert guide.colors == ("#ffff00", "#000000")
+        assert guide.effects == ("glow",)
+        assert "1 分あたり" in guide.tempo
+        assert guide.notes == "本人の決まり"
+        assert "OK で確定" in dialog.draft_note
+        assert _ok(dialog)
+        dialog.deleteLater()
+
+    def test_a_broken_work_keeps_the_fields(
+        self, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        """落ちると窓ごと閉じて、書きかけの方針が消える"""
+        del qt_application
+        broken = tmp_path / "壊れた.sme"
+        broken.write_text("{", encoding="utf-8")
+        dialog = StyleGuideDialog(GUIDE, effects=EFFECTS)
+        assert not dialog.load_draft(broken)
+        assert dialog.guide() == GUIDE
+        assert "作れませんでした" in dialog.draft_note
+        dialog.deleteLater()
+
+    def test_the_button_asks_for_a_work(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ボタンが作品の選び方（.sme だけ）を出さないと、書き出した動画を選べてしまう"""
+        del qt_application
+        path = _saved_work(tmp_path)
+        asked: list[str] = []
+
+        def choose(*arguments: object) -> tuple[str, str]:
+            asked.append(str(arguments[-1]))
+            return str(path), ""
+
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", choose)
+        dialog = StyleGuideDialog(StyleGuide(), effects=EFFECTS)
+        buttons = dialog.findChild(QDialogButtonBox)
+        assert buttons is not None
+        (draft,) = [b for b in buttons.buttons() if b.text() == "作品から下書き…"]
+        draft.click()
+        assert asked == ["Sashimono Edit の作品 (*.sme)"]
+        assert dialog.guide().fonts == ("過去の書体",)
+        dialog.deleteLater()
+
+    def test_a_confirmed_draft_is_one_undo_step(
+        self, window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """確定は SetStyleGuide の 1 段 戻せないと、下書きを試しただけの方針が残る"""
+        path = _saved_work(tmp_path)
+
+        def draft(dialog: StyleGuideDialog) -> None:
+            assert dialog.load_draft(path)
+
+        _answer_guide(monkeypatch, draft)
+
+        def accept(self: ProjectSettingsDialog) -> int:
+            assert self.guide_row.edit()
+            return int(QDialog.DialogCode.Accepted)
+
+        monkeypatch.setattr(ProjectSettingsDialog, "exec", accept)
+        window.edit_settings()
+        document = window.document
+        assert document.project.style_guide.fonts == ("過去の書体",)
+        window.undo()
+        assert document.project.style_guide.empty
 
 
 class TestProjectSettings:
