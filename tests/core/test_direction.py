@@ -212,6 +212,21 @@ class TestZoom:
         zooms = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
         assert [(e.start_frame, e.end_frame) for e in zooms] == [(30, 60)]
 
+    def test_a_zoom_that_starts_late_in_the_span_is_counted(self, work: _Work) -> None:
+        # 左端と真ん中だけを見ると、間の後ろ半分で動き出す寄りを「動いていない」と読み数え落とす
+        scale = AnimatedValue(
+            keyframes=(
+                Keyframe(
+                    0, 100.0, Interpolation.BEZIER, control_points=(0.0, 0.0, 1.0, -1 / 3)
+                ),
+                Keyframe(60, 120.0, Interpolation.HOLD),
+                Keyframe(90, 100.0, Interpolation.HOLD),
+            )
+        )
+        project = work.build(video=(work.clip(0, 300, effects=(_transform(scale=scale),)),))
+        zooms = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
+        assert [(e.start_frame, e.end_frame) for e in zooms] == [(0, 90)]
+
 
 class TestShake:
     def test_keyframed_width_counts_each_burst(self, work: _Work) -> None:
