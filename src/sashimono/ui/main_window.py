@@ -4496,14 +4496,16 @@ class MainWindow(QMainWindow):
         *,
         audio_stream: int | None = None,
         words_only: bool = False,
+        word_timestamps: bool,
+        timing: SubtitleTiming,
     ) -> str:
         return self._subtitles.start_transcription(
             media_id,
             model,
             audio_stream=audio_stream,
-            word_timestamps=self._preferences.word_timestamps,
+            word_timestamps=word_timestamps,
             words_only=words_only,
-            timing=self._preferences.subtitle_timing,
+            timing=timing,
         )
 
     def transcription_status(self) -> str:
@@ -4526,6 +4528,14 @@ class MainWindow(QMainWindow):
     @property
     def loudness_target(self) -> float:
         return float(self._preferences.check_loudness_target)
+
+    @property
+    def ai_transcribe_model(self) -> str:
+        return self._preferences.ai_transcribe_model
+
+    @property
+    def word_timestamps(self) -> bool:
+        return self._preferences.word_timestamps
 
     @property
     def subtitle_timing(self) -> SubtitleTiming:

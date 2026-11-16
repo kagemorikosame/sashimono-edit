@@ -34,6 +34,7 @@ from sashimono.ai.models import MODELS as AI_MODELS
 from sashimono.ai.models import find_model
 from sashimono.ai.outbound import ASKED, DESTINATION, Outbound, SendChoice
 from sashimono.ai.send_log import KEEP_DAYS, SendLog
+from sashimono.asr.backend import MODELS as ASR_MODELS
 from sashimono.core.emphasis import (
     EMPHASIS_EASING_NAMES,
     EMPHASIS_EASINGS,
@@ -1247,6 +1248,21 @@ class PreferencesDialog(QDialog):
             "届かないことを伝える リミッターは設定パネルの「リミッター」で直せる"
         )
         form.addRow(self._loudness_limiter)
+        # AI の起こしのモデル（#469） 速さと精度の釣り合いは機械と素材で答えが違う
+        self._ai_transcribe_model = QComboBox(self)
+        for info in ASR_MODELS:
+            self._ai_transcribe_model.addItem(info.describe(), info.name)
+        self._ai_transcribe_model.setCurrentIndex(
+            max(0, self._ai_transcribe_model.findData(preferences.ai_transcribe_model))
+        )
+        self._ai_transcribe_model.setToolTip(
+            "AI アシスタントが字幕を起こすとき、モデルを頼まれなければ使うモデル"
+            " AI は自分の判断で小さいモデルへ下げない 「速く下書きで」「small で」と頼めば"
+            "その起こしだけ従う large-v3 が一番正確 GPU の無い PC では長い素材に時間が掛かるので、"
+            "下書きだけでよければ large-v3-turbo（速度重視）へ下げる"
+            " 字幕パネルの窓から起こすときは窓で選んだモデルを使う"
+        )
+        form.addRow("AI が字幕を起こすモデル", self._ai_transcribe_model)
         # 語の時刻（#420） 起こす時間と切る位置の確かさの釣り合いは人で違う
         self._word_timestamps = QCheckBox("字幕起こしで語の時刻も取る", self)
         self._word_timestamps.setChecked(preferences.word_timestamps)
@@ -1632,6 +1648,7 @@ class PreferencesDialog(QDialog):
             ai_image_edge=int(self._image_edge.currentData()),
             check_loudness_target=int(self._check_loudness.currentData()),
             loudness_limiter=self._loudness_limiter.isChecked(),
+            ai_transcribe_model=str(self._ai_transcribe_model.currentData()),
             word_timestamps=self._word_timestamps.isChecked(),
             subtitle_fit_voice=self._subtitle_fit_voice.isChecked(),
             subtitle_start_offset_ms=self._subtitle_start_offset.value(),
