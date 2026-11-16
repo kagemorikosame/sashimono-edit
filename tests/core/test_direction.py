@@ -296,6 +296,30 @@ class TestOtherKinds:
         telops = [e for e in direction_events(project, project.timeline) if e.kind == TELOP]
         assert [e.start_frame for e in telops] == [60]
 
+    def test_a_graded_telop_counts_as_color_but_a_subtitle_does_not(self, work: _Work) -> None:
+        # テロップの色を数え落とすと、色を整えた作品を色 0 回と読む 字幕まで数えると、
+        # 字幕の行数で色の回数が埋まる
+        origin = SubtitleOrigin(media_id=work.video_media.id, stream=0, segment_id=SegmentId("s1"))
+        subtitle = Clip(
+            timeline_start=0,
+            duration=30,
+            source=GeneratedSource("text", params={"text": "字幕"}),
+            subtitle_origin=origin,
+            effects=(Effect("grade"),),
+        )
+        telop = Clip(
+            timeline_start=60,
+            duration=30,
+            source=GeneratedSource("text"),
+            effects=(Effect("grade"),),
+        )
+        project = work.build(text=(subtitle, telop))
+        events = direction_events(project, project.timeline, color_kinds=COLOR_KINDS)
+        assert [(e.kind, e.start_frame) for e in events if e.kind in (TELOP, COLOR)] == [
+            (COLOR, 60),
+            (TELOP, 60),
+        ]
+
     def test_only_short_sound_only_clips_are_sound_effects(self, work: _Work) -> None:
         # 映像の音・BGM・ナレーションを効果音に数えると、話す間ずっと効果音が鳴っているように見える
         sounds = (

@@ -425,8 +425,12 @@ def direction_events(
                 found.append(_event(TRANSITION, track, clip, 0, clip.duration, seconds))
                 continue
             if kind == _TEXT_KIND:
+                # テロップに掛けた色も色に数える 先に抜けると、色を整えたテロップの色が 0 回に
+                # 見える 字幕は色も含めて数えない（字幕の行数で演出の数が埋まるため）
                 if clip.subtitle_origin is None:
                     found.append(_event(TELOP, track, clip, 0, clip.duration))
+                    if _has_color(clip, colors):
+                        found.append(_event(COLOR, track, clip, 0, clip.duration))
                 continue
             if _has_color(clip, colors):
                 found.append(_event(COLOR, track, clip, 0, clip.duration))
