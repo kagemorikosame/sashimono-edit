@@ -28,6 +28,7 @@ runtime）を読む（:func:`load_app_runtime`） 部品の無い機械では字
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import math
@@ -832,6 +833,9 @@ def _publish_set(written: list[tuple[Path, Path]]) -> None:
     本人は 3 本を見比べるので、今回の 1 本と前の回の 2 本が並ぶと、違う回の処理を比べてしまう
     付け替えは、開いたままの書き出しへのアクセス拒否などで途中から落ちる 前の回の物は退避しておき、
     落ちたら今回付け替えた物を消して退避した物を戻す
+    戻す側も同じ理由で 1 本ずつ落ちうるので、1 本ごとに試して残りを続ける 戻せなかった物は
+    退避した名前のまま残し、元の失敗に書き添える 1 本目で止めると、戻せた 2 本まで退避した名前の
+    まま見えなくなる
     """
     backups: list[tuple[Path, Path]] = []
     placed: list[Path] = []
@@ -844,13 +848,24 @@ def _publish_set(written: list[tuple[Path, Path]]) -> None:
         for partial, final in written:
             partial.replace(final)
             placed.append(final)
-    except BaseException:
+    except BaseException as error:
         for final in placed:
-            final.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                final.unlink(missing_ok=True)
+        stuck: list[Path] = []
         for backup, final in backups:
-            backup.replace(final)
+            try:
+                backup.replace(final)
+            except OSError:
+                stuck.append(backup)
         for partial, _final in written:
-            partial.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                partial.unlink(missing_ok=True)
+        if stuck:
+            names = "、".join(backup.name for backup in stuck)
+            error.add_note(
+                f"前の回の書き出しのうち戻せなかった物は、退避した名前のまま残した: {names}"
+            )
         raise
     for backup, _final in backups:
         backup.unlink(missing_ok=True)
