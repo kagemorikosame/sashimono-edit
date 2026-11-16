@@ -649,8 +649,11 @@ class SubtitlePanel(QWidget):
         """再生ヘッドの位置にある字幕を選ぶ"""
         for row, (_, start, end) in enumerate(self._rows):
             if start <= self._frame < end:
-                self._followed = self._rows[row][0]
                 if self._table.currentRow() != row:
+                    # 選び替えたときだけ再生位置の選択として覚える 人が行を選ぶと再生位置が
+                    # そこへ移り、ここへ戻ってくる そのときに覚えると、人の選択を再生位置の
+                    # 選択と取り違え、追いつくときに捨てる（#475 の CodeRabbit）
+                    self._followed = self._rows[row][0]
                     self._updating = True
                     self._table.selectRow(row)
                     item = self._table.item(row, 1)
@@ -1373,6 +1376,11 @@ class SubtitlePanel(QWidget):
         chosen = set(self._chosen_rows())
         if self._followed is not None and chosen == {self._followed}:
             chosen = set()
+        # 今の行も覚えておく 選択と今の行は別に持たれ、作り直しの中の再生位置の選び直しが
+        # 今の行だけを動かす 戻さないと、再生位置がその行の中で動いても選び替えず、
+        # 再生位置と違う字幕が選ばれたまま残る（#475 の CodeRabbit）
+        row = self._table.currentRow()
+        current = self._rows[row][0] if 0 <= row < len(self._rows) else None
         shown, self._shown = self._shown, True
         try:
             self._reload_rows()
@@ -1399,6 +1407,11 @@ class SubtitlePanel(QWidget):
             for row, (segment_id, _start, _end) in enumerate(self._rows):
                 if segment_id in chosen:
                     model.select(self._table.model().index(row, 0), adding)
+                if segment_id == current:
+                    model.setCurrentIndex(
+                        self._table.model().index(row, 0),
+                        QItemSelectionModel.SelectionFlag.NoUpdate,
+                    )
         finally:
             self._updating = False
 

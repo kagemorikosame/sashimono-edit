@@ -229,6 +229,44 @@ class TestListing:
         assert widget.selected_segments() == (widget._rows[1][0],)
         assert widget._table.currentRow() == 1
 
+    def test_a_row_chosen_by_hand_survives_its_own_seek(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、人が行を選んで再生位置がそこへ移ったとき、戻ってきた再生位置の選び直しが
+        # 人の選択を再生位置の選択と取り違え、隠れている間に再生位置が動くと別の字幕を渡す
+        widget, _ = panel
+        widget.seek_requested.connect(widget.set_frame)
+        widget._table.selectRow(1)
+        chosen = widget.selected_segments()
+        assert chosen == (widget._rows[1][0],)
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+        widget.set_frame(200)
+        assert widget.selected_segments() == chosen
+
+    def test_the_current_row_survives_catching_up(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、追いついた後の今の行が作り直しの中で選んだ行のまま残り、再生位置がその行の
+        # 中で動いても選び替えず、再生位置と違う字幕が選ばれたまま残る
+        widget, _ = panel
+        model = widget._table.selectionModel()
+        adding = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        model.clearSelection()
+        for row in (1, 2):
+            model.select(widget._table.model().index(row, 0), adding)
+        model.setCurrentIndex(
+            widget._table.model().index(2, 0), QItemSelectionModel.SelectionFlag.NoUpdate
+        )
+        chosen = widget.selected_segments()
+        widget.set_shown(False)
+        # 頭を 30 フレーム切ると 1 本目が [0,60) になり、作り直しの中で再生位置 0 の行を選ぶ
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+        assert widget.selected_segments() == chosen
+        assert widget._table.currentRow() == 2
+        widget.set_frame(10)
+        assert widget.selected_segments() == (widget._rows[0][0],)
+
     def test_a_failed_rebuild_is_tried_again(
         self,
         panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],

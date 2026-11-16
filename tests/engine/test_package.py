@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import av
 import numpy as np
@@ -327,7 +328,9 @@ class TestCut:
         finally:
             decoder.close()
 
-    def test_aac_with_noise_substitution_is_cut(self, media_dir: Path, tmp_path: Path) -> None:
+    def test_aac_with_noise_substitution_is_cut(
+        self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """壊れると、雑音の置き換え（PNS）を使う AAC の録画を範囲だけ写せず、毎回まるごと入れる
 
         PNS の音は復号器の中の乱数で作るので、同じパケットでも解き始めた所で音が変わる
@@ -346,7 +349,20 @@ class TestCut:
             )  # fmt: skip
         spans = [Span(Fraction(73, 10), Fraction(9)), Span(Fraction(13), Fraction(15))]
         target = tmp_path / "pns.mp4"
+        # 切り出しの中でパケットの比べを通ったことも見る 素材の作り方が変わって解いた音が
+        # 揃うようになると、比べを通らずに通り、この試験が何も確かめなくなる
+        compared: list[bool] = []
+        same_packets = remux._same_packets
+
+        def spy(*arguments: Any) -> bool:
+            answer = same_packets(*arguments)
+            compared.append(answer)
+            return answer
+
+        monkeypatch.setattr(remux, "_same_packets", spy)
         assert cut_media(source, target, spans, muxer="mp4")
+        assert True in compared
+        monkeypatch.undo()
         # 切り出した音のパケットは、使う範囲で元とバイトごとに同じ
         stream = probe_media(source).audio_streams[0]
         for span in spans:
