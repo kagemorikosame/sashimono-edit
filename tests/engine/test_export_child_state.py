@@ -119,6 +119,7 @@ NOT_FOR_THE_CHILD = frozenset(
         "ripple_layers",
         "check_loudness_target",
         "loudness_limiter",
+        "ai_transcribe_model",
         "word_timestamps",
         "subtitle_fit_voice",
         "subtitle_start_offset_ms",
