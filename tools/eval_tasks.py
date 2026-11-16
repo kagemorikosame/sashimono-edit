@@ -834,8 +834,9 @@ def _publish_set(written: list[tuple[Path, Path]]) -> None:
     付け替えは、開いたままの書き出しへのアクセス拒否などで途中から落ちる 前の回の物は退避しておき、
     落ちたら今回付け替えた物を消して退避した物を戻す
     戻す側も同じ理由で 1 本ずつ落ちうるので、1 本ごとに試して残りを続ける 戻せなかった物は
-    退避した名前のまま残し、元の失敗に書き添える 1 本目で止めると、戻せた 2 本まで退避した名前の
-    まま見えなくなる
+    退避した名前のまま残し、名前と戻し方を画面に出す 1 本目で止めると、戻せた 2 本まで退避した
+    名前のまま見えなくなる 画面に出すのは、呼ぶ側（:func:`command_run`）が失敗の型名だけを出し、
+    例外に書き添えても本人に届かないため 名前は番号と処理だけなので、素材の名前は出ない
     """
     backups: list[tuple[Path, Path]] = []
     placed: list[Path] = []
@@ -848,7 +849,7 @@ def _publish_set(written: list[tuple[Path, Path]]) -> None:
         for partial, final in written:
             partial.replace(final)
             placed.append(final)
-    except BaseException as error:
+    except BaseException:
         for final in placed:
             with contextlib.suppress(OSError):
                 final.unlink(missing_ok=True)
@@ -861,10 +862,10 @@ def _publish_set(written: list[tuple[Path, Path]]) -> None:
         for partial, _final in written:
             with contextlib.suppress(OSError):
                 partial.unlink(missing_ok=True)
-        if stuck:
-            names = "、".join(backup.name for backup in stuck)
-            error.add_note(
-                f"前の回の書き出しのうち戻せなかった物は、退避した名前のまま残した: {names}"
+        for backup in stuck:
+            print(
+                f"前の回の書き出しを戻せなかったので {backup.name} のまま残した"
+                f"（開いているアプリを閉じて、名前から .previous を外せば戻る）"
             )
         raise
     for backup, _final in backups:

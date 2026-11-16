@@ -264,7 +264,10 @@ def test_a_failed_swap_brings_back_the_previous_set(
 
 
 def test_a_failed_restore_does_not_stop_the_rest(
-    folder: tuple[ModuleType, Any, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    folder: tuple[ModuleType, Any, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """付け替えで落ち、戻す側でも 1 本目が落ちた
 
@@ -297,6 +300,10 @@ def test_a_failed_restore_does_not_stop_the_rest(
     assert (eval_dir.exports / "E03_seams_none.previous.mp4").read_bytes() == b"old"
     assert not (eval_dir.exports / "E03_seams_none.mp4").exists()
     assert not list(eval_dir.exports.glob("*.partial.mp4"))
+    # 戻せなかった名前と戻し方を本人に見せる 結果の行には失敗の型だけを残す
+    shown = capsys.readouterr().out
+    assert "E03_seams_none.previous.mp4" in shown
+    assert ".previous を外せば戻る" in shown
 
 
 @pytest.mark.parametrize("bad", [-0.5, float("nan")])
