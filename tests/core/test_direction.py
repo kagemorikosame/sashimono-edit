@@ -378,6 +378,22 @@ class TestOtherKinds:
         project = work.build(video=(work.clip(0, 300),), text=(graded,))
         assert _kind(_measure(project), COLOR).coverage == pytest.approx(1.0)
 
+    def test_a_filter_with_its_picture_off_is_not_counted(self, work: _Work) -> None:
+        # 混合トラックで絵を切ったフィルタは描画が外す 数えると出ない色が割合に入る
+        hidden = Clip(
+            timeline_start=0,
+            duration=300,
+            source=GeneratedSource("filter"),
+            effects=(Effect("grade"),),
+            show_picture=False,
+        )
+        project = work.build(video=(work.clip(0, 300),))
+        mixed = Track(kind=TrackKind.MIXED, name="混合", clips=(hidden,))
+        tracks = (*project.timeline.tracks, mixed)
+        project = project.with_timeline(replace(project.timeline, tracks=tracks))
+        color = _kind(_measure(project), COLOR)
+        assert (color.count, color.coverage) == (0, 0)
+
 
 class TestDensity:
     def test_close_zooms_are_reported_against_the_limit(self, work: _Work) -> None:

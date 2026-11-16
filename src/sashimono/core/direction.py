@@ -411,14 +411,14 @@ def direction_events(
                 continue
             if track.id not in shown:
                 continue
+            # フィルタも描画と同じ決まりで選ぶ 混合トラックで絵を切ったフィルタは描画が外す
+            # ここで数えると、書き出しに出ない色や揺れが回数と色の割合に入る
+            if not project.draws_picture(track, clip):
+                continue
             if kind == _FILTER_KIND:
-                # フィルタは自分の絵を持たず下の絵へ掛けるので、絵を描くかの決まりで選ぶと
-                # 落ちることがある 先に見て、フィルタで掛けた色や揺れを数え落とさない
                 if _has_color(clip, colors):
                     found.append(_event(COLOR, track, clip, 0, clip.duration))
                 found.extend(_shake_events(track, clip))
-                continue
-            if not project.draws_picture(track, clip):
                 continue
             if kind == _TRANSITION_KIND:
                 seconds = float(frame_to_seconds(clip.duration, rate))
