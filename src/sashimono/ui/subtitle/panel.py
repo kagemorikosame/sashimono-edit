@@ -1414,6 +1414,9 @@ class SubtitlePanel(QWidget):
                     )
         finally:
             self._updating = False
+        # 戻したのは人の選択 作り直しの中の再生位置の選び直しが覚えた行を残すと、次に
+        # 追いつくときに人の選択を再生位置の選択と見て捨てる（#475 の CodeRabbit）
+        self._followed = None
 
     def _chosen_rows(self) -> tuple[SegmentId, ...]:
         """表で選んでいる行の字幕 上から順"""

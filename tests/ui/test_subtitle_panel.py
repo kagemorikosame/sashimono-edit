@@ -244,6 +244,25 @@ class TestListing:
         widget.set_frame(200)
         assert widget.selected_segments() == chosen
 
+    def test_a_row_chosen_by_hand_survives_catching_up_twice(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、1 回目に追いついたときの作り直しの中で再生位置が人の選んだ行に入り、
+        # その行を再生位置の選択と覚え、2 回目に追いつくときに人の選択を捨てる
+        widget, _ = panel
+        widget.seek_requested.connect(widget.set_frame)
+        widget._table.selectRow(1)
+        chosen = widget.selected_segments()
+        assert chosen == (widget._rows[1][0],)
+        cut = RippleCut(((0, 30),)).apply(placed)
+        widget.set_shown(False)
+        widget.set_project(cut)
+        # 切った後も再生位置 120 は 2 本目の [90,150) に入る
+        assert widget.selected_segments() == chosen
+        widget.set_project(cut)
+        widget.set_frame(200)
+        assert widget.selected_segments() == chosen
+
     def test_the_current_row_survives_catching_up(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
     ) -> None:
