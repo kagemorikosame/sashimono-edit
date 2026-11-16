@@ -216,9 +216,10 @@ def test_a_failed_export_leaves_no_half_set(
     old.write_bytes(b"old")
 
     def export(project: Project, output: Path) -> None:
-        if "crossfade" in output.name:
-            raise RuntimeError("書き出しに失敗した")
         output.write_bytes(b"new")
+        if "crossfade" in output.name:
+            # 途中まで書いてから落ちた 半端な物も残さない
+            raise RuntimeError("書き出しに失敗した")
 
     [record] = tool.command_run(
         eval_dir, book, ["E03"], results=tmp_path / "r.jsonl", commit="", seam_exporter=export

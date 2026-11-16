@@ -815,10 +815,11 @@ def seam_exports(
             metrics[f"skipped_{video}"] = len(plan.skipped)
             final = outputs / f"{material}_seams_{video}.mp4"
             partial = outputs / f"{material}_seams_{video}.partial.mp4"
+            # 書き出す前に覚える 書き出しの途中で落ちた半端な物も、下の後始末で消える
+            written.append((partial, final))
             began = time.perf_counter()
             exporter(plan.project, partial)
             metrics[f"export_seconds_{video}"] = round(time.perf_counter() - began, 2)
-            written.append((partial, final))
     except BaseException:
         for partial, _final in written:
             partial.unlink(missing_ok=True)
