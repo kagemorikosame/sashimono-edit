@@ -87,6 +87,9 @@ OWN_LIBRARY = {
     "subtitle_timing",
     "loudness_limiter",
     "export_bitrate",
+    # AI の字幕起こしのモデルと語の時刻（#469） transcribe が返事の method に載せる
+    "ai_transcribe_model",
+    "word_timestamps",
 }
 #: 作品の中身か、作品と書き出しの場所（伏せ字の表に直に入る）か、作品の外の名前を返す口そのもの
 PROJECT_SIDE = {

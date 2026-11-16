@@ -269,10 +269,11 @@ def _away_spans(
     """どれかの線が休みの値から離れている区間（クリップの頭からのフレーム ``0``〜``length``）
 
     ``curves`` は線と休みの値の組 キーフレームとクリップの両端で区切った間を左を含み右を
-    含まない区間として見て、左端か真ん中が休みから離れていれば「動いている」とする 右端で
-    見ると、HOLD で 30 フレーム目に切り替わる寄りを 0 フレーム目からと読み、頭を 30 にした
-    範囲で数え落とす 休みでない点を挟んで続く間を
-    1 回につなぐ 寄って・止まって・戻すまでを 1 回に数えるため（点ごとに数えると強調 1 回が
+    含まない区間として見て、間の中に休みから離れたフレームが 1 つでもあれば「動いている」と
+    する 左端と真ん中だけで見ると、間の後ろ半分で動き出す曲線（ゆっくり出るベジェ）を
+    「動いていない」と読み、寄りを数え落とす 右端は含めない 含めると、HOLD で 30 フレーム目に
+    切り替わる寄りを 0 フレーム目からと読み、頭を 30 にした範囲で数え落とす 休みでない点を挟んで
+    続く間を 1 回につなぐ 寄って・止まって・戻すまでを 1 回に数えるため（点ごとに数えると強調 1 回が
     3 回に見える） 休みへ戻った点では切る（つなぐと離れた 2 回の強調を 1 回と読み、近すぎるのを
     見逃す） クリップの外に残った点（後からトリムした物）は見ない 映らない所の動きを数えると、
     出ていない演出が回数に入る 最後の点より後も値は止まって続くので、クリップの終わりまで見る
@@ -283,9 +284,12 @@ def _away_spans(
     def away(frame: float) -> bool:
         return any(abs(curve.at(frame) - rest) > _MOVED for curve, rest in curves)
 
+    # 間ごとに同じ数ずつなめる キーの多い曲線でも、なめる数の合計は _SAMPLES の数倍で止まる
+    budget = max(1, _SAMPLES // max(1, len(frames) - 1))
     spans: list[tuple[int, int]] = []
     for left, right in itertools.pairwise(frames):
-        if not (away(left) or away((left + right) / 2)):
+        probes = {right - 1, *range(left, right, max(1, (right - left) // budget))}
+        if not any(away(frame) for frame in probes):
             continue
         if spans and spans[-1][1] == left and away(left):
             spans[-1] = (spans[-1][0], right)
@@ -407,22 +411,26 @@ def direction_events(
                 continue
             if track.id not in shown:
                 continue
+            # フィルタも描画と同じ決まりで選ぶ 混合トラックで絵を切ったフィルタは描画が外す
+            # ここで数えると、書き出しに出ない色や揺れが回数と色の割合に入る
+            if not project.draws_picture(track, clip):
+                continue
             if kind == _FILTER_KIND:
-                # フィルタは自分の絵を持たず下の絵へ掛けるので、絵を描くかの決まりで選ぶと
-                # 落ちることがある 先に見て、フィルタで掛けた色や揺れを数え落とさない
                 if _has_color(clip, colors):
                     found.append(_event(COLOR, track, clip, 0, clip.duration))
                 found.extend(_shake_events(track, clip))
-                continue
-            if not project.draws_picture(track, clip):
                 continue
             if kind == _TRANSITION_KIND:
                 seconds = float(frame_to_seconds(clip.duration, rate))
                 found.append(_event(TRANSITION, track, clip, 0, clip.duration, seconds))
                 continue
             if kind == _TEXT_KIND:
+                # テロップに掛けた色も色に数える 先に抜けると、色を整えたテロップの色が 0 回に
+                # 見える 字幕は色も含めて数えない（字幕の行数で演出の数が埋まるため）
                 if clip.subtitle_origin is None:
                     found.append(_event(TELOP, track, clip, 0, clip.duration))
+                    if _has_color(clip, colors):
+                        found.append(_event(COLOR, track, clip, 0, clip.duration))
                 continue
             if _has_color(clip, colors):
                 found.append(_event(COLOR, track, clip, 0, clip.duration))

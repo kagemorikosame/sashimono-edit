@@ -125,6 +125,7 @@ from sashimono.ai.style_check import COLOR as STYLE_COLOR
 from sashimono.ai.style_check import COLOR_TOLERANCE, checked_guide, style_problems
 from sashimono.ai.style_check import EFFECT as STYLE_EFFECT
 from sashimono.ai.style_check import FONT as STYLE_FONT
+from sashimono.asr.backend import MODELS as ASR_MODELS
 from sashimono.compat.aviutl.catalog import ScriptEntry
 from sashimono.compat.aviutl.custom_object import custom_object_clip
 from sashimono.compat.aviutl.exo import ExoParseError, load_exo
@@ -7638,6 +7639,64 @@ def _transcription_answer(host: EditorHost) -> dict[str, object]:
     return {"status": status, "transcribing": host.transcribing}
 
 
+def _transcribe_method(
+    host: EditorHost, arguments: dict[str, Any], words_only: bool
+) -> tuple[str, bool, SubtitleTiming, str]:
+    """起こしのモデル・語の時刻・時刻の合わせ方と、それを人へ伝える一言（#469）
+
+    省いた物は本人の設定に従い、渡した物はその呼び出しだけ従う 設定は書き換えない
+    AI が速さを気にして自分の判断で方式を下げると、同じ素材でも呼ぶたびに字幕の質が変わる
+    """
+    names = tuple(info.name for info in ASR_MODELS)
+    asked_model = arguments.get("model")
+    if asked_model is None or asked_model == "":
+        model, model_note = host.ai_transcribe_model, "設定の既定"
+    elif isinstance(asked_model, str) and asked_model in names:
+        model, model_note = asked_model, "指示"
+    else:
+        # 知らない名前をそのまま渡すと、裏で起こし始めてから読み込みに失敗し、AI には
+        # 「始めました」しか返らない 窓で選べるのと同じ一覧に絞る
+        raise ToolError(f"model は {'・'.join(names)} のどれかです（{asked_model!r} が来ました）")
+    words_given = arguments.get("word_timestamps") is not None
+    # 語の時刻だけを足す頼みは、設定で語の時刻を切っていても語の時刻を取る頼みそのもの
+    word_timestamps = (
+        _flag_argument(arguments, "word_timestamps", True)
+        if words_given
+        else (words_only or host.word_timestamps)
+    )
+    if words_only and not word_timestamps:
+        # 語の時刻だけを足す頼みで語の時刻を取らないと、何もしない起こしが数分走る
+        raise ToolError(
+            "words_only は語の時刻を足す頼みなので、word_timestamps の false とは一緒に使えません"
+        )
+    timing = host.subtitle_timing
+    fit_given = arguments.get("fit_to_voice") is not None
+    if fit_given:
+        fit = _flag_argument(arguments, "fit_to_voice", True)
+        if words_only and fit:
+            # 語の時刻だけを足す頼みは行の時刻を変えない 寄せたと思わせない
+            raise ToolError(
+                "words_only は今の行の時刻を変えないので、fit_to_voice の true とは一緒に"
+                "使えません 起こした行を声へ寄せ直すときは retime_subtitles を使ってください"
+            )
+        # ずらす量は本人の好みなので残し、寄せるかだけをこの呼び出しで替える
+        timing = replace(timing, fit_to_voice=fit)
+    parts = [f"{model}（{model_note}）"]
+    if words_only:
+        parts.append("語の時刻だけを今の字幕へ足す（行の時刻は変えない）")
+        timing = replace(timing, fit_to_voice=False)
+    else:
+        parts.append(
+            ("語の時刻あり" if word_timestamps else "語の時刻なし")
+            + ("（指示）" if words_given else "（設定）")
+        )
+        parts.append(
+            ("声へ寄せる" if timing.fit_to_voice else "声へ寄せない")
+            + ("（指示）" if fit_given else "（設定）")
+        )
+    return model, word_timestamps, timing, "・".join(parts)
+
+
 def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 待つ秒は始める前に見る 始めてから断ると、AI が直して呼び直したときに「もう起こしている」で
     # 断られる
@@ -7658,17 +7717,26 @@ def _transcribe(host: EditorHost, arguments: dict[str, Any]) -> object:
             " 置き換えるときは replace を true にしてください 語の時刻だけを足すときは"
             " words_only を true にしてください（文言と話者は変わりません）"
         )
+    model, word_timestamps, timing, method = _transcribe_method(host, arguments, words_only)
     try:
         message = host.start_transcription(
             media.id,
-            str(arguments.get("model", "large-v3")),
+            model,
             audio_stream=stream,
             words_only=words_only,
+            word_timestamps=word_timestamps,
+            timing=timing,
         )
     except RuntimeError as exc:
         raise ToolError(str(exc)) from exc
     result = {
         "started": message,
+        # どの方式で起こしたかを AI が人へ答えられるように返す（#469） 返さないと、後で
+        # 「どのモデルで起こした？」と聞かれても AI は推して答えるしかない
+        "model": model,
+        "word_timestamps": word_timestamps,
+        "fit_to_voice": timing.fit_to_voice,
+        "method": method,
         "next": "transcription_status に wait_seconds を付けると終わりを待てます"
         " 終わったら get_subtitles で結果を取れます",
     }
@@ -10660,6 +10728,10 @@ _HIDDEN_IN_VALUES = frozenset({Outbound.TEXT})
 _SCREEN_TEXT = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.TEXT})
 #: アプリ自身の設定 書き出しのフォルダや退避の置き場が入る
 _APP_SETTINGS = frozenset({Outbound.APP_SETTINGS, Outbound.FILES})
+#: 字幕起こし（#469） 素材の名前を返し、省いた引数は本人の設定（AI の起こしのモデル・語の時刻・
+#: 声へ寄せるか）で起こして、使った方式を返事の method に載せる アプリの設定を書かないと、
+#: 設定を送らないと決めた人の所でも本人の設定の値が黙って返事に載る
+_TRANSCRIBE = frozenset({Outbound.PROJECT, Outbound.FILES, Outbound.APP_SETTINGS})
 #: 保存したプリセット・エイリアスで字幕に見た目を着せる道具（#308） 見つからないと断る文に
 #: 保存してある物の名前を並べる（AI が名前を選び直すための唯一の手掛かり） 本人の持ち物の
 #: 名前で、作品の中身でも素材でもないので、アプリの設定と同じく送る 読み込めない理由の文には
@@ -13558,13 +13630,33 @@ OPERATIONS: tuple[Operation, ...] = (
         name="transcribe",
         description=(
             "素材の字幕起こしを始める 終わるまで数分かかる wait_seconds を付けると終わりまで待つ"
-            " 語の時刻は本人の設定で取る（既定は取る） 語の時刻が無い字幕には words_only で足せる"
+            " モデル・語の時刻・声へ寄せるかは、省くと本人の設定で起こす（既定は一番正確な"
+            " large-v3・語の時刻あり・声へ寄せる） ユーザーが速さなどを頼んだときだけ渡す"
+            " 自分の判断で小さいモデルや速い方式を選ばない 渡した値はその起こしだけで、設定は"
+            "変わらない 返事の method に使った方式が出るので、ユーザーに伝える"
+            " 語の時刻が無い字幕には words_only で足せる"
             "（word_boundaries の has_words が false のとき）"
         ),
         schema=_schema(
             {
                 "media_id": _string("素材"),
-                "model": _string("モデル名"),
+                "model": {
+                    **_string(
+                        "モデル名 ユーザーが頼んだときだけ渡す 省くと本人の設定（既定 large-v3）"
+                        " large-v3 が一番正確 large-v3-turbo は速度重視の下書き用"
+                        " medium・small は精度が落ち、base・tiny は確認用"
+                    ),
+                    "enum": [info.name for info in ASR_MODELS],
+                },
+                "word_timestamps": _boolean(
+                    "語の時刻も取るか ユーザーが頼んだときだけ渡す 省くと本人の設定（既定 true）"
+                    " false にすると語の境目で切れず、字幕の文言と音を確かめられない"
+                    " words_only とは false で一緒に使えない"
+                ),
+                "fit_to_voice": _boolean(
+                    "起こした行の頭と終わりを声の出だしと終わりへ寄せるか ユーザーが頼んだときだけ"
+                    "渡す 省くと本人の設定（既定 true） words_only とは true で一緒に使えない"
+                ),
                 "audio": _integer(
                     "起こす音声の番号（1 から タイムラインの「音声 N」と同じ） 省くと 1 本目"
                     " 音声の本数は list_media の audio_count"
@@ -13580,7 +13672,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ["media_id"],
         ),
         handler=_transcribe,
-        sends=_WITH_FILES,
+        sends=_TRANSCRIBE,
         preview=from_arguments(),
         name_keys=frozenset({"started"}),
         writes=True,

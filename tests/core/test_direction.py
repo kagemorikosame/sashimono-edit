@@ -212,6 +212,19 @@ class TestZoom:
         zooms = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
         assert [(e.start_frame, e.end_frame) for e in zooms] == [(30, 60)]
 
+    def test_a_zoom_that_starts_late_in_the_span_is_counted(self, work: _Work) -> None:
+        # 左端と真ん中だけを見ると、間の後ろ半分で動き出す寄りを「動いていない」と読み数え落とす
+        scale = AnimatedValue(
+            keyframes=(
+                Keyframe(0, 100.0, Interpolation.BEZIER, control_points=(0.0, 0.0, 1.0, -1 / 3)),
+                Keyframe(60, 120.0, Interpolation.HOLD),
+                Keyframe(90, 100.0, Interpolation.HOLD),
+            )
+        )
+        project = work.build(video=(work.clip(0, 300, effects=(_transform(scale=scale),)),))
+        zooms = [e for e in direction_events(project, project.timeline) if e.kind == ZOOM]
+        assert [(e.start_frame, e.end_frame) for e in zooms] == [(0, 90)]
+
 
 class TestShake:
     def test_keyframed_width_counts_each_burst(self, work: _Work) -> None:
@@ -283,6 +296,30 @@ class TestOtherKinds:
         telops = [e for e in direction_events(project, project.timeline) if e.kind == TELOP]
         assert [e.start_frame for e in telops] == [60]
 
+    def test_a_graded_telop_counts_as_color_but_a_subtitle_does_not(self, work: _Work) -> None:
+        # テロップの色を数え落とすと、色を整えた作品を色 0 回と読む 字幕まで数えると、
+        # 字幕の行数で色の回数が埋まる
+        origin = SubtitleOrigin(media_id=work.video_media.id, stream=0, segment_id=SegmentId("s1"))
+        subtitle = Clip(
+            timeline_start=0,
+            duration=30,
+            source=GeneratedSource("text", params={"text": "字幕"}),
+            subtitle_origin=origin,
+            effects=(Effect("grade"),),
+        )
+        telop = Clip(
+            timeline_start=60,
+            duration=30,
+            source=GeneratedSource("text"),
+            effects=(Effect("grade"),),
+        )
+        project = work.build(text=(subtitle, telop))
+        events = direction_events(project, project.timeline, color_kinds=COLOR_KINDS)
+        assert [(e.kind, e.start_frame) for e in events if e.kind in (TELOP, COLOR)] == [
+            (COLOR, 60),
+            (TELOP, 60),
+        ]
+
     def test_only_short_sound_only_clips_are_sound_effects(self, work: _Work) -> None:
         # 映像の音・BGM・ナレーションを効果音に数えると、話す間ずっと効果音が鳴っているように見える
         sounds = (
@@ -340,6 +377,22 @@ class TestOtherKinds:
         )
         project = work.build(video=(work.clip(0, 300),), text=(graded,))
         assert _kind(_measure(project), COLOR).coverage == pytest.approx(1.0)
+
+    def test_a_filter_with_its_picture_off_is_not_counted(self, work: _Work) -> None:
+        # 混合トラックで絵を切ったフィルタは描画が外す 数えると出ない色が割合に入る
+        hidden = Clip(
+            timeline_start=0,
+            duration=300,
+            source=GeneratedSource("filter"),
+            effects=(Effect("grade"),),
+            show_picture=False,
+        )
+        project = work.build(video=(work.clip(0, 300),))
+        mixed = Track(kind=TrackKind.MIXED, name="混合", clips=(hidden,))
+        tracks = (*project.timeline.tracks, mixed)
+        project = project.with_timeline(replace(project.timeline, tracks=tracks))
+        color = _kind(_measure(project), COLOR)
+        assert (color.count, color.coverage) == (0, 0)
 
 
 class TestDensity:
