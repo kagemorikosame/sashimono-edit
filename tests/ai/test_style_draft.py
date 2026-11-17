@@ -195,7 +195,11 @@ class TestDraft:
         origin = SubtitleOrigin(media_id=None, stream=0, segment_id=SegmentId("o"))
         plain = _text(1200, "字幕の書体", _WHITE, subtitle_origin=origin)
         assert plain.source is not None
-        params = {**plain.source.params, "border_width": 4.0, "border_color": _YELLOW}
+        params = {
+            **plain.source.params,
+            "border_width": AnimatedValue(4.0),
+            "border_color": _YELLOW,
+        }
         old = replace(plain, source=replace(plain.source, params=params, strokes=()))
         layers = (
             Stroke(params={"color": _WHITE}, enabled=False),
