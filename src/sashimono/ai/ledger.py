@@ -798,6 +798,10 @@ AI_ONLY: dict[str, str] = {
     # 演出のレシピ（#478） 本人は設定画面で強さとジャンルを選ぶ 決まりの一覧を返す入口は
     # 画面に無い 読むだけ
     "get_direction_recipes": READING,
+    # 演出の計画（#479） AI が計画の欄に項目を出し、人が外して〔付ける〕を押す 作品は
+    # 変えない（付けるのは人のボタン） 計画の欄のボタンは台帳で数えない
+    "propose_direction": "AI が演出の計画を AI のパネルの計画の欄へ出す 画面に同じ入口は無い",
+    "get_direction_plan": "人が AI のパネルの演出の計画を見て分かることを読む",
     "transcription_status": READING,
     "select_clip": _GESTURE,
     "select_clips": _GESTURE,

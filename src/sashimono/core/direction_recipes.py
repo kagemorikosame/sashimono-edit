@@ -247,6 +247,9 @@ class Cue:
     end: float
     #: 盛り上がりの強さ（0〜1） 強い所から選ぶ
     score: float
+    #: 手がかりを拾った物の ID（クリップなど） 選び方には使わず、計画の項目へそのまま運ぶ
+    #: 運ばないと、付ける先を時刻から選び直し、拾ったのと別のクリップへ付けることがある
+    source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +263,8 @@ class PlannedDirection:
     end: float
     amount: int | None
     reason: str
+    #: 手がかりの :attr:`Cue.source`
+    source: str | None = None
 
 
 def plan_direction(
@@ -305,6 +310,7 @@ def plan_direction(
                     end=min(cue.start + recipe.seconds, end),
                     amount=rule.amount,
                     reason=recipe.reason,
+                    source=cue.source,
                 )
             )
     chosen.sort(key=lambda item: (item.start, item.kind, item.recipe))
