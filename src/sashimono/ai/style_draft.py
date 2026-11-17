@@ -60,7 +60,7 @@ _COLOR_CATEGORY = "色"
 _SIZE = "size"
 _DEFAULT_SIZE = 64.0
 _FILL_WHERE = "字の塗り"
-_STROKE_WHERE = "縁取りの層 1"
+_STROKE_WHERE = "縁取りの層 "
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +167,9 @@ def _subtitle_look(project: Project) -> SubtitleLook | None:
                         font = value
                     elif kind == COLOR and where == _FILL_WHERE and fill is None:
                         fill = value
-                    elif kind == COLOR and where == _STROKE_WHERE:
+                    elif kind == COLOR and where.startswith(_STROKE_WHERE) and outline is None:
+                        # 切った層は clip_styles が出さないので、最初に出た層が見えている一番内側
+                        # 層 1 だけを見ると、層 1 を切って層 2 で縁を付けた字幕を縁なしと書く
                         outline = value
                     elif kind == EFFECT:
                         effects.setdefault(value, None)

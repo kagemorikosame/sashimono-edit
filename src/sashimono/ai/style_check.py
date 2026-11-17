@@ -23,6 +23,8 @@ from sashimono.core.model import (
     StyleGuide,
     Timeline,
     Track,
+    legacy_in_use,
+    legacy_stroke,
     valid_style_color,
 )
 from sashimono.effects.fills import is_gradient
@@ -169,7 +171,12 @@ def clip_styles(clip: Clip) -> Iterator[tuple[str, str, str]]:
         where = "字の塗り" if definition is TEXT else "図形の塗り"
         for color in _fill_colors(source.params, definition):
             yield COLOR, color, where
-        for number, stroke in enumerate(source.strokes, start=1):
+        strokes = source.strokes
+        if not strokes and source.kind == TEXT.kind and legacy_in_use(source.params):
+            # 層を持たない前からのテキストは、前からの項目（太さと色）で縁を描く 層だけを見ると、
+            # 縁の付いた字幕を縁なしと読み、照らしでも縁の色を見落とす 描画と同じ層に写して読む
+            strokes = (legacy_stroke(source.params),)
+        for number, stroke in enumerate(strokes, start=1):
             if not stroke.enabled:
                 continue
             for color in _fill_colors(stroke.params, STROKE):

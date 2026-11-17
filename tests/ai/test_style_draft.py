@@ -189,6 +189,28 @@ class TestDraft:
         assert "縁取りなし" not in guide.subtitles
         assert "（border）" in guide.subtitles
 
+    def test_old_borders_and_later_layers_are_the_outline(self, work: Project) -> None:
+        # 前からの項目で描く縁や、層 1 を切って層 2 で付けた縁を見落とすと、縁の付いた字幕を
+        # 「縁取りなし」と書き、AI が縁の無い字幕を置く
+        origin = SubtitleOrigin(media_id=None, stream=0, segment_id=SegmentId("o"))
+        plain = _text(1200, "字幕の書体", _WHITE, subtitle_origin=origin)
+        assert plain.source is not None
+        params = {**plain.source.params, "border_width": 4.0, "border_color": _YELLOW}
+        old = replace(plain, source=replace(plain.source, params=params, strokes=()))
+        layers = (
+            Stroke(params={"color": _WHITE}, enabled=False),
+            Stroke(params={"color": _YELLOW}),
+        )
+        later = replace(plain, source=replace(plain.source, strokes=layers))
+        for clip in (old, later):
+            track = Track(kind=TrackKind.VIDEO, name="縁", clips=(clip,))
+            alone = work.with_timeline(
+                replace(work.timeline, tracks=(work.timeline.tracks[0], track))
+            )
+            look = measure_habits(alone).subtitle
+            assert look is not None
+            assert look.outline == "#ffff00"
+
 
 class TestRead:
     def test_reading_does_not_touch_the_file(self, work: Project, tmp_path: Path) -> None:
