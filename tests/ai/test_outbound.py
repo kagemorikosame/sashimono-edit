@@ -301,6 +301,10 @@ READ_EXAMPLES: dict[str, Callable[[str], dict[str, Any]]] = {
         "scenes": [{"from_seconds": 0, "to_seconds": 2, "text": "今日は"}],
     },
     "find_highlights": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
+    # 演出の計画（#479） 項目の型・フレーム・ID と案内の文だけを返す
+    "propose_direction": lambda _media_id: {
+        "cues": [{"signal": "laughter", "start_frame": 30, "end_frame": 60, "score": 0.5}]
+    },
     # 画面の中身（#324） 文字は読めた文を返し、顔は断りの文に素材の名前を書く
     "detect_text": lambda media_id: {"media_id": media_id, "wait_seconds": 0},
     "detect_faces": lambda media_id: {"media_id": media_id, "wait_seconds": 0},

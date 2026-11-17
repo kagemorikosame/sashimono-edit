@@ -2867,7 +2867,10 @@ def _get_direction_plan(host: EditorHost, arguments: dict[str, Any]) -> object:
     del arguments
     view = proposal_for(host.document).view()
     if view is None:
-        return {"state": "none", "note": "演出の計画はありません propose_direction で作ります"}
+        return {
+            "state": "none",
+            "note": "演出の計画はありません 計画は propose_direction で出せます",
+        }
     result = _proposal_result(view)
     result["note"] = {
         "proposed": "ユーザーが外す物を選んでいる所です 〔付ける〕を押すまで待ちます",
