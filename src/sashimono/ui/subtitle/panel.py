@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from fractions import Fraction
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, QPoint, Qt, Signal
 from PySide6.QtGui import QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -172,6 +172,13 @@ class SubtitlePanel(QWidget):
         self._rows: list[tuple[SegmentId, int, int]] = []
         #: 一覧を作ったときの中身の印 同じなら作り直さない
         self._signature: tuple[object, ...] | None = None
+        #: パネルが見えているか（ドックのタブが表か :meth:`set_shown`） 見えていない間は
+        #: 一覧を作り直さず、作り直しが要ることだけ覚える（:attr:`_stale`）
+        self._shown = True
+        self._stale = False
+        #: 再生位置に合わせて選んだ行の字幕（:meth:`_highlight`） 人が選び直したら ``None``
+        #: 追いつくときに人の選択と見分ける 再生位置の行を選び直すと、前の時刻の行が戻る
+        self._followed: SegmentId | None = None
         self._updating = False
         #: 起こしの実行係 バックエンドの読み込みは重いので、初めて使うときに作る
         self._service: TranscriptionService | None = None
@@ -361,6 +368,10 @@ class SubtitlePanel(QWidget):
         if frame == self._frame:
             return
         self._frame = frame
+        if self._stale:
+            # 隠れている間の一覧は前の時刻のまま 選ぶと、切った後に別の字幕へ移った位置で
+            # 前の行を選び、追いついた後もそれが人の選択として残る 作り直すときに選ぶ
+            return
         self._highlight()
 
     @property
@@ -539,11 +550,18 @@ class SubtitlePanel(QWidget):
         2000 本あると作り直しだけで 70ms 掛かる 字幕に関係のない編集
         （クリップの色を変えるなど）でそれを払うのは無駄
         """
+        if not self._shown:
+            # 見えていない間は作り直さない 既定の配置では字幕はメディアの裏のタブにあり、
+            # タイムラインで選び直すたびに見えない一覧を作り直していた 字幕が 739 本ある
+            # 実プロジェクトで、選ぶ 1 回に 50 ms ほど（#455） 見えたときに作り直す
+            self._stale = True
+            return
         signature = self._rows_signature()
         if signature == self._signature and self._table.rowCount() == len(self._segments()):
             # 中身は同じ 幅だけ入れ直す 長さが変わって桁が増えていれば、
             # ここで合図が飛んで折り返しを取り直す（変わっていなければ何も起きない）
             self._table.horizontalHeader().resizeSection(0, self._time_column_width())
+            self._stale = False
             return
         # 印は**作り終えてから**立てる 途中で落ちたのに立てると、同じ
         # プロジェクトを開き直しても作り直さず、半端な表が残ったままになる
@@ -588,6 +606,9 @@ class SubtitlePanel(QWidget):
             self._table.setUpdatesEnabled(True)
             self._updating = False
         self._signature = signature
+        # 遅れの印も作り終えてから下ろす 途中で落ちたのに下ろすと、追いつく所（見えたとき・
+        # 行を読む前）が作り直しを飛ばし、半端な一覧を今の物として読む
+        self._stale = False
 
         self._table.resizeRowsToContents()
         self._update_actions()
@@ -629,6 +650,10 @@ class SubtitlePanel(QWidget):
         for row, (_, start, end) in enumerate(self._rows):
             if start <= self._frame < end:
                 if self._table.currentRow() != row:
+                    # 選び替えたときだけ再生位置の選択として覚える 人が行を選ぶと再生位置が
+                    # そこへ移り、ここへ戻ってくる そのときに覚えると、人の選択を再生位置の
+                    # 選択と取り違え、追いつくときに捨てる（#475 の CodeRabbit）
+                    self._followed = self._rows[row][0]
                     self._updating = True
                     self._table.selectRow(row)
                     item = self._table.item(row, 1)
@@ -642,6 +667,8 @@ class SubtitlePanel(QWidget):
     def _on_row_selected(self) -> None:
         if self._updating:
             return
+        # 人が選んだ 再生位置で選んだ行ではなくなる
+        self._followed = None
         row = self._table.currentRow()
         if 0 <= row < len(self._rows):
             _, start, _ = self._rows[row]
@@ -1324,13 +1351,86 @@ class SubtitlePanel(QWidget):
         dialog.deleteLater()
         return answer if accepted else None
 
-    def selected_segments(self) -> tuple[SegmentId, ...]:
-        """表で選んでいる行の字幕 上から順 AI が人の選択を読む口（#352）"""
+    def set_shown(self, shown: bool) -> None:
+        """パネルが見えるようになった・隠れた（ドックの ``visibilityChanged``）
+
+        見えるようになったら、隠れている間に遅らせた一覧の作り直しを済ませる
+        """
+        self._shown = shown
+        if shown:
+            self._catch_up()
+
+    def _catch_up(self) -> None:
+        """遅らせた一覧の作り直しを済ませる 見えていなくても作る
+
+        見えた時と、行を読む前（AI・メニュー）に呼ぶ 呼ばないと、隠れている間に変わった
+        作品の字幕が前の時刻のまま並び、別の素材の字幕を選んでいると受け取る
+        どちらから呼んでも人の選択を同じに保つ 片方だけで保つと、先に AI が読んだかどうかで
+        見えた後の選択が変わる（#475 の CodeRabbit）
+        """
+        if not self._stale:
+            return
+        # 作り直すと表の選択が消える 人が選んでいた字幕は、今の一覧に残っていれば選び直す
+        # 選び直さないと、隠れている間に作品が変わっただけで AI へ渡す選択が空になる
+        # 再生位置で選んだ行は選び直さない 作り直した一覧で今の時刻の行を選び直す
+        chosen = set(self._chosen_rows())
+        if self._followed is not None and chosen == {self._followed}:
+            chosen = set()
+        # 今の行も覚えておく 選択と今の行は別に持たれ、作り直しの中の再生位置の選び直しが
+        # 今の行だけを動かす 戻さないと、再生位置がその行の中で動いても選び替えず、
+        # 再生位置と違う字幕が選ばれたまま残る（#475 の CodeRabbit）
+        row = self._table.currentRow()
+        current = self._rows[row][0] if 0 <= row < len(self._rows) else None
+        shown, self._shown = self._shown, True
+        try:
+            self._reload_rows()
+        finally:
+            self._shown = shown
+        model = self._table.selectionModel()
+        if not chosen:
+            # 再生位置の行を今の時刻で選び直す 一覧の中身が前と同じだと作り直しを飛ばすので、
+            # 作り直しの中の選び直しを当てにしない 隠れている間に再生位置だけが動いたとき、
+            # 前の時刻の行が残って AI やテキストの配置へ渡る（#475 の CodeRabbit）
+            # 今の行を外してから選ぶ 外さないと、同じ行のときに選び直しを飛ばす
+            self._updating = True
+            try:
+                model.clear()
+            finally:
+                self._updating = False
+            self._highlight()
+            return
+        # 足していく selectRow は前の選択を置き換えるので、何行も選んでいると最後の 1 行だけ残る
+        adding = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        self._updating = True
+        try:
+            model.clearSelection()
+            for row, (segment_id, _start, _end) in enumerate(self._rows):
+                if segment_id in chosen:
+                    model.select(self._table.model().index(row, 0), adding)
+                if segment_id == current:
+                    model.setCurrentIndex(
+                        self._table.model().index(row, 0),
+                        QItemSelectionModel.SelectionFlag.NoUpdate,
+                    )
+        finally:
+            self._updating = False
+        # 戻したのは人の選択 作り直しの中の再生位置の選び直しが覚えた行を残すと、次に
+        # 追いつくときに人の選択を再生位置の選択と見て捨てる（#475 の CodeRabbit）
+        self._followed = None
+
+    def _chosen_rows(self) -> tuple[SegmentId, ...]:
+        """表で選んでいる行の字幕 上から順"""
         rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
         return tuple(self._rows[row][0] for row in rows if 0 <= row < len(self._rows))
 
+    def selected_segments(self) -> tuple[SegmentId, ...]:
+        """表で選んでいる行の字幕 上から順 AI が人の選択を読む口（#352）"""
+        self._catch_up()
+        return self._chosen_rows()
+
     def place_selected_rows(self) -> None:
         """選んだ行（無ければ再生位置の 1 行）をテキストとしてタイムラインへ置く"""
+        self._catch_up()
         media = self._current_media()
         if media is None:
             return

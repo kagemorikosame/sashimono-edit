@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFontComboBox,
     QFormLayout,
     QHBoxLayout,
@@ -27,6 +29,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sashimono.ai.style_draft import draft_guide, read_habits
+from sashimono.core.io.serialize import ProjectFileError
 from sashimono.core.model import StyleGuide
 from sashimono.core.model.style import STYLE_EFFECTS_LIMIT
 from sashimono.effects import registry
@@ -39,6 +43,9 @@ __all__ = ["StyleGuideDialog", "StyleGuideRow", "effect_choices", "guide_summary
 #: 2026-10-18 に Windows で測って窓の高さは 568 3 行にすると欄 5 つで 80 ほど増えて 640 を越える
 #: 長く書いた欄は欄の中で巻物にして読む
 _TEXT_LINES = 2
+
+#: 下書きに読む作品の選び方 書き出した動画は読まない（#477 2026-11-16 利用者の決定）
+_WORK_FILTER = "Sashimono Edit の作品 (*.sme)"
 
 
 def effect_choices() -> list[tuple[str, str]]:
@@ -161,11 +168,22 @@ class StyleGuideDialog(QDialog):
         )
         self._buttons.accepted.connect(self.accept)
         self._buttons.rejected.connect(self.reject)
+        # 下書きのボタンは OK と同じ並びに置く 行を足すと、小さい画面（中身 640）に窓が収まらない
+        draft = self._buttons.addButton("作品から下書き…", QDialogButtonBox.ButtonRole.ActionRole)
+        draft.setToolTip(
+            "仕上げた作品（.sme）を読むだけで開き、書体・色・効果・字幕の見た目・テンポを数えて\n"
+            "欄に入れる 直してから OK で確定 キャンセルで元に戻る 作品のファイルは書き換えない"
+        )
+        draft.clicked.connect(self._ask_draft)
+        self._draft_note = QLabel(self)
+        self._draft_note.setWordWrap(True)
+        self._draft_note.hide()
 
         layout = QVBoxLayout(self)
         layout.addWidget(intro)
         layout.addLayout(form)
         layout.addWidget(self._warning)
+        layout.addWidget(self._draft_note)
         layout.addWidget(self._buttons)
 
         for box in (self._fonts, self._colors, self._subtitles, self._tempo, self._notes):
@@ -215,6 +233,42 @@ class StyleGuideDialog(QDialog):
             if text is not None:
                 box.setPlainText(text)
 
+    @property
+    def draft_note(self) -> str:
+        return self._draft_note.text()
+
+    def load_draft(self, path: Path) -> bool:
+        """作品を測って欄へ下書きを入れる 読めなければ理由を出して欄は変えない
+
+        書体・色・効果・テンポは置き換え、字幕の見た目は作品に字幕があるときだけ置き換える
+        そのほかは触らない（数から書ける事が無く、本人の文を潰さない） 確定は OK
+        """
+        try:
+            guide = draft_guide(read_habits(path))
+        except ProjectFileError:
+            # 読めない理由の文にはファイルの場所や中の値が入る 窓の写しを人へ見せたときに作品の
+            # 名前が出ないよう、場所を伏せた理由だけを出す 落とすと窓ごと閉じて書きかけが消える
+            self._show_note(
+                "下書きを作れませんでした: 作品のファイルを読めません"
+                "（壊れているか、この版で読めない形です）"
+            )
+            return False
+        except ValueError as exc:
+            # 空の作品など、測る側が理由を書いた物 文に場所は入らない
+            self._show_note(f"下書きを作れませんでした: {exc}")
+            return False
+        self.set_fields(
+            fonts="\n".join(guide.fonts),
+            colors="\n".join(guide.colors),
+            subtitles=guide.subtitles or None,
+            tempo=guide.tempo,
+        )
+        self._check_effects(guide.effects)
+        self._show_note(
+            "作品を測った下書きを入れました 直してから OK で確定 キャンセルで元に戻ります"
+        )
+        return True
+
     def add_color(self, color: QColor) -> None:
         """色を 1 行足す 色の窓で選んだ色を #rrggbb で書く（書き方を 1 つにそろえる）"""
         if not color.isValid():
@@ -235,6 +289,30 @@ class StyleGuideDialog(QDialog):
         if name and name not in lines:
             lines.append(name)
             self._fonts.setPlainText("\n".join(lines))
+
+    def _check_effects(self, kinds: Sequence[str]) -> None:
+        """印を ``kinds`` だけに付け直す 一覧に無い種類は「今は無い効果」として足す"""
+        wanted = set(kinds)
+        listed: set[str] = set()
+        for index in range(self._effects.count()):
+            item = self._effects.item(index)
+            if item is None:
+                continue
+            kind = str(item.data(Qt.ItemDataRole.UserRole))
+            listed.add(kind)
+            item.setCheckState(Qt.CheckState.Checked if kind in wanted else Qt.CheckState.Unchecked)
+        for kind in kinds:
+            if kind not in listed:
+                self._add_effect_item(kind, f"（今は無い効果）{kind}", True)
+
+    def _show_note(self, text: str) -> None:
+        self._draft_note.setText(text)
+        self._draft_note.show()
+
+    def _ask_draft(self) -> None:
+        name, _ = QFileDialog.getOpenFileName(self, "下書きにする作品", "", _WORK_FILTER)
+        if name:
+            self.load_draft(Path(name))
 
     def _ask_color(self) -> None:
         self.add_color(QColorDialog.getColor(parent=self, title="使う色を足す"))

@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from fractions import Fraction
+from itertools import accumulate
 
 from sashimono.core.model.ids import SegmentId, new_segment_id
 
@@ -76,11 +78,19 @@ class Transcript:
     language: str = ""
     #: 生成に使ったモデル名 結果の再現性と、再起こしの要否判断のために残す
     model: str = ""
+    #: :meth:`overlapping` の索引 各セグメントの頭と、そこまでの終わりの最大
+    #: 作るときに 1 度だけ求める 選択のたびに字幕パネルがクリップごとに引くので、毎回
+    #: 頭からなめると 1 時間の録画の字幕で 1 回の選択が 100 ms を超えた（#455 の実プロジェクト）
+    _starts: tuple[Fraction, ...] = field(init=False, repr=False, compare=False)
+    _reach: tuple[Fraction, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        starts = [s.start for s in self.segments]
-        if starts != sorted(starts):
+        starts = tuple(s.start for s in self.segments)
+        if list(starts) != sorted(starts):
             raise ValueError("セグメントは開始時刻の昇順でなければならない")
+        # 凍った型なので object.__setattr__ で入れる 比べ・表示・保存には出ない
+        object.__setattr__(self, "_starts", starts)
+        object.__setattr__(self, "_reach", tuple(accumulate((s.end for s in self.segments), max)))
 
     def __len__(self) -> int:
         return len(self.segments)
@@ -89,8 +99,15 @@ class Transcript:
         return iter(self.segments)
 
     def overlapping(self, start: Fraction, end: Fraction) -> Iterator[TranscriptSegment]:
-        """ソース時刻 ``[start, end)`` に重なるセグメントを順に返す"""
-        for segment in self.segments:
+        """ソース時刻 ``[start, end)`` に重なるセグメントを順に返す
+
+        頭が ``end`` 以降の物と、そこまでの終わりの最大が ``start`` 以前の物は重ならないので、
+        その間だけを見る 終わりは並んでいない（長い字幕の後に短い字幕が来る）ので、
+        終わりそのものではなく最大で切る
+        """
+        low = bisect_right(self._reach, start)
+        high = bisect_left(self._starts, end)
+        for segment in self.segments[low:high]:
             if segment.overlaps(start, end):
                 yield segment
 

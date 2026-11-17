@@ -23,6 +23,8 @@ from sashimono.core.model import (
     StyleGuide,
     Timeline,
     Track,
+    legacy_in_use,
+    legacy_stroke,
     valid_style_color,
 )
 from sashimono.effects.fills import is_gradient
@@ -38,8 +40,10 @@ __all__ = [
     "FONT",
     "StyleProblem",
     "checked_guide",
+    "clip_styles",
     "color_hex",
     "style_problems",
+    "track_styles",
 ]
 
 #: 食い違いの種類 値は AI へ返す文字そのまま
@@ -151,37 +155,59 @@ def _effects_of(clip: Clip) -> Iterator[tuple[Effect, str]]:
                     yield effect, f"縁取りの層 {number} の効果"
 
 
-def _clip_problems(guide: StyleGuide, clip: Clip) -> Iterator[tuple[str, str, str]]:
-    """（種類, 値, どこ）"""
+def clip_styles(clip: Clip) -> Iterator[tuple[str, str, str]]:
+    """クリップが使う書体・色・効果（種類, 値, どこ）
+
+    照らしと、過去の作品から方針の下書きを作る所（``ai/style_draft.py`` #477）が同じ物を読む
+    別々に読むと、下書きのまま確定した作品を照らしたときに、下書きが拾わなかった値が
+    「方針の外」と返る
+    """
     source = clip.source
-    if source is not None and source.kind == TEXT.kind and guide.fonts:
+    if source is not None and source.kind == TEXT.kind:
         font = source.params.get("font", "")
-        name = font if isinstance(font, str) and font else DEFAULT_FONT
-        if name not in guide.fonts:
-            yield FONT, name, "書体"
-    if source is not None and source.kind in (TEXT.kind, SHAPE.kind) and guide.colors:
+        yield FONT, font if isinstance(font, str) and font else DEFAULT_FONT, "書体"
+    if source is not None and source.kind in (TEXT.kind, SHAPE.kind):
         definition = TEXT if source.kind == TEXT.kind else SHAPE
+        where = "字の塗り" if definition is TEXT else "図形の塗り"
         for color in _fill_colors(source.params, definition):
-            if not _close(color, guide.colors):
-                yield COLOR, color, "字の塗り" if definition is TEXT else "図形の塗り"
-        for number, stroke in enumerate(source.strokes, start=1):
+            yield COLOR, color, where
+        strokes = source.strokes
+        if not strokes and source.kind == TEXT.kind and legacy_in_use(source.params):
+            # 層を持たない前からのテキストは、前からの項目（太さと色）で縁を描く 層だけを見ると、
+            # 縁の付いた字幕を縁なしと読み、照らしでも縁の色を見落とす 描画と同じ層に写して読む
+            strokes = (legacy_stroke(source.params),)
+        for number, stroke in enumerate(strokes, start=1):
             if not stroke.enabled:
                 continue
             for color in _fill_colors(stroke.params, STROKE):
-                if not _close(color, guide.colors):
-                    yield COLOR, color, f"縁取りの層 {number}"
-    if guide.effects:
-        for effect, where in _effects_of(clip):
-            if effect.kind not in guide.effects:
-                yield EFFECT, effect.kind, where
+                yield COLOR, color, f"縁取りの層 {number}"
+    for effect, where in _effects_of(clip):
+        yield EFFECT, effect.kind, where
+
+
+def track_styles(track: Track) -> Iterator[tuple[str, str, str]]:
+    """トラックに掛かる効果（種類, 値, どこ）"""
+    for effect in track.effects:
+        if not effect.fixed and effect.enabled:
+            yield EFFECT, effect.kind, "トラックのエフェクト"
+
+
+def _outside(guide: StyleGuide, kind: str, value: str) -> bool:
+    """方針の外か 決めていない欄（空）は照らさない"""
+    if kind == FONT:
+        return bool(guide.fonts) and value not in guide.fonts
+    if kind == COLOR:
+        return bool(guide.colors) and not _close(value, guide.colors)
+    return bool(guide.effects) and value not in guide.effects
+
+
+def _clip_problems(guide: StyleGuide, clip: Clip) -> Iterator[tuple[str, str, str]]:
+    """（種類, 値, どこ）"""
+    return (row for row in clip_styles(clip) if _outside(guide, row[0], row[1]))
 
 
 def _track_problems(guide: StyleGuide, track: Track) -> Iterator[tuple[str, str, str]]:
-    if not guide.effects:
-        return
-    for effect in track.effects:
-        if not effect.fixed and effect.enabled and effect.kind not in guide.effects:
-            yield EFFECT, effect.kind, "トラックのエフェクト"
+    return (row for row in track_styles(track) if _outside(guide, row[0], row[1]))
 
 
 def checked_guide(guide: StyleGuide) -> StyleGuide:
@@ -208,6 +234,11 @@ def style_problems(project: Project) -> list[StyleProblem]:
             for kind, value, where in _track_problems(guide, track):
                 found.append(StyleProblem(kind, None, str(track.id), scene_id, 0, value, where))
             for clip in track.clips:
+                if not clip.enabled:
+                    # 切ったクリップは絵に出ない 切ってある効果や縁取りの層を数えないのと同じ
+                    # 数えると、本人が外した物まで直す先に挙がり、
+                    # 過去の作品から作った下書き（#477）も咎める
+                    continue
                 for kind, value, where in _clip_problems(guide, clip):
                     found.append(
                         StyleProblem(
