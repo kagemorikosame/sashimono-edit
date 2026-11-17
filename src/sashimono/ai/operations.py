@@ -251,6 +251,10 @@ from sashimono.core.commands.layers import places_mixed
 from sashimono.core.commands.speed import SPEED_PERCENT_RANGE, ChangeSpeed, speed_members
 from sashimono.core.commands.volume import clip_volume, volume_commands
 from sashimono.core.direction import DirectionEvent, KindDensity, measure_direction
+from sashimono.core.direction_recipes import ACTIONS as DIRECTION_ACTIONS
+from sashimono.core.direction_recipes import GENRES as DIRECTION_GENRES
+from sashimono.core.direction_recipes import STRENGTHS as DIRECTION_STRENGTHS
+from sashimono.core.direction_recipes import DirectionTaste, recipe_book
 from sashimono.core.emphasis import (
     EMPHASIS_EASINGS,
     EMPHASIS_KINDS,
@@ -2666,6 +2670,57 @@ def _measure_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         )
     rows = [_event_row(event) for event in report.events]
     return _paged_after(head, rows, arguments, "events", note)
+
+
+def _get_direction_recipes(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """演出のレシピ（#478）を本人の好みで引く 頼みの文で強さやジャンルを言われたら引数で変える"""
+    taste = host.direction_taste
+    genre = str(arguments.get("genre") or taste.genre)
+    strength = str(arguments.get("strength") or taste.strength)
+    if genre not in DIRECTION_GENRES:
+        raise ToolError(f"genre は {'・'.join(DIRECTION_GENRES)} のどれかです")
+    if strength not in DIRECTION_STRENGTHS:
+        raise ToolError(f"strength は {'・'.join(DIRECTION_STRENGTHS)} のどれかです")
+    # 方針（#343）の使ってよい効果の外を使うレシピは外す 付けてから照らすと本人に直させる
+    book = recipe_book(
+        DirectionTaste(genre=genre, strength=strength), host.document.project.style_guide.effects
+    )
+    return {
+        "genre": genre,
+        "genre_name": DIRECTION_GENRES[genre],
+        "strength": strength,
+        "strength_name": DIRECTION_STRENGTHS[strength],
+        # 設定のままか 上書きしたことを本人へ伝え忘れないよう返す
+        "from_settings": (genre, strength) == (taste.genre, taste.strength),
+        "recipes": [
+            {
+                "key": rule.recipe.key,
+                "name": rule.recipe.name,
+                "cue": rule.recipe.cue,
+                "action": rule.recipe.action,
+                "action_name": DIRECTION_ACTIONS[rule.recipe.action],
+                "kind": rule.recipe.kind,
+                "reason": rule.recipe.reason,
+                "per_minute": rule.per_minute,
+                "min_gap_seconds": rule.min_gap_seconds,
+                "amount": rule.amount,
+                "seconds": rule.recipe.seconds,
+            }
+            for rule in book.rules
+        ],
+        "left_out": [
+            {"key": recipe.key, "name": recipe.name, "reason": reason}
+            for recipe, reason in book.left_out
+        ],
+        "note": (
+            "cue は find_highlights の signals と同じ名前で、その盛り上がりに action を付けます"
+            " per_minute は 1 分あたりの上限、min_gap_seconds は同じ kind どうしをあける秒数"
+            "（レシピをまたいで数えます） amount は寄るなら拡大率の %、揺らすなら幅の画素で、"
+            "emphasis の scale_percent・amplitude_px に渡します 効果音は本人が取り込んだ音の素材"
+            "から選び、無ければ付けずにそう伝えます 付けた後は measure_direction で数えます"
+            " 強さとジャンルは本人の設定で、頼みの文で言われたときだけ引数で変えます"
+        ),
+    }
 
 
 def _author(by: Author | None) -> str | None:
@@ -11743,6 +11798,41 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_check_style_guide,
         # 返すのは書体の名前・色・効果の種類とクリップの在りかだけ 方針の文も本文も返さない
         sends=_STRUCTURE,
+    ),
+    Operation(
+        name="get_direction_recipes",
+        description=(
+            "演出のレシピ（どの盛り上がりに何を付けるか・1 分に何回まで・何秒あけるか・強さ）を"
+            "本人の設定のジャンルと強さで引く（読むだけ） 演出を付ける前に読み、"
+            "find_highlights の盛り上がりへレシピの数と間隔の内で付ける"
+            " 方針の使ってよい効果の外を使うレシピは left_out に外して返す"
+            " 頼みの文で「派手に」「控えめに」などと言われたときだけ strength を渡す"
+        ),
+        schema=_schema(
+            {
+                "strength": {
+                    "type": "string",
+                    "enum": list(DIRECTION_STRENGTHS),
+                    "description": (
+                        "強さ "
+                        + "・".join(f"{k}（{v}）" for k, v in DIRECTION_STRENGTHS.items())
+                        + " 省くと本人の設定"
+                    ),
+                },
+                "genre": {
+                    "type": "string",
+                    "enum": list(DIRECTION_GENRES),
+                    "description": (
+                        "ジャンル "
+                        + "・".join(f"{k}（{v}）" for k, v in DIRECTION_GENRES.items())
+                        + " 省くと本人の設定"
+                    ),
+                },
+            }
+        ),
+        handler=_get_direction_recipes,
+        # 返すのはレシピ（アプリが持つ決まり）と本人の設定の強さ・ジャンルだけ 方針の文は返さない
+        sends=frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS}),
     ),
     Operation(
         name="measure_direction",

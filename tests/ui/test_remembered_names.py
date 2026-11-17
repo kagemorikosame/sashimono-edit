@@ -65,6 +65,8 @@ OWN_LIBRARY = {
     "loudness_target",
     "duck_shape",
     "emphasis_style",
+    # 演出のジャンルと強さ（#478） 使う道具は sends にアプリの設定を書く
+    "direction_taste",
     "seam_style",
     # ナレーション（#335）のエンジンの場所と既定の声 使う道具は sends にアプリの設定を書く
     "narration_settings",

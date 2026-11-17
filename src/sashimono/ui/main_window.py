@@ -122,6 +122,7 @@ from sashimono.core.commands import (
 from sashimono.core.commands.insert import media_alone, with_known_video_end
 from sashimono.core.commands.project_format import retime_frame
 from sashimono.core.commands.speed import ChangeSpeed, can_change_speed
+from sashimono.core.direction_recipes import DirectionTaste
 from sashimono.core.emphasis import (
     PAN_DIRECTIONS,
     EmphasisError,
@@ -4560,6 +4561,10 @@ class MainWindow(QMainWindow):
     @property
     def emphasis_style(self) -> EmphasisStyle:
         return self._preferences.emphasis_style
+
+    @property
+    def direction_taste(self) -> DirectionTaste:
+        return self._preferences.direction_taste
 
     @property
     def seam_style(self) -> SeamStyle:

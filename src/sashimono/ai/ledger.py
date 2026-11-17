@@ -795,6 +795,9 @@ AI_ONLY: dict[str, str] = {
     # 演出の密度（#470 段 1） 人は再生して目で見て、付けすぎ・足りないを感じ取る 型ごとの回数と
     # 間隔を返す入口は画面に無い 読むだけ
     "measure_direction": READING,
+    # 演出のレシピ（#478） 本人は設定画面で強さとジャンルを選ぶ 決まりの一覧を返す入口は
+    # 画面に無い 読むだけ
+    "get_direction_recipes": READING,
     "transcription_status": READING,
     "select_clip": _GESTURE,
     "select_clips": _GESTURE,
