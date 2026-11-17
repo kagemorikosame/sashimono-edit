@@ -2825,6 +2825,7 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         planned,
         [ClipId(p.source) if p.source else None for p in planned],
         sound,
+        end,
     )
     view = proposal_for(host.document).propose(items, dropped, DIRECTION_STRENGTHS[taste.strength])
     result = _proposal_result(view)

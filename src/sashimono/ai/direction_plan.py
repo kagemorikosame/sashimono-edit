@@ -271,8 +271,11 @@ def build_items(
     planned: Sequence[PlannedDirection],
     clips: Sequence[ClipId | None],
     sound: MediaItem | None,
+    limit: int,
 ) -> tuple[list[DirectionItem], list[tuple[str, str]]]:
     """レシピの選んだ演出を、付ける先の決まった計画の項目にする
+
+    ``limit`` は計画した範囲の終わりのフレーム 効果音がこれを越えるなら外す
 
     ``clips`` は ``planned`` と同じ並びの、手がかりを拾ったクリップ（無ければ ``None`` で、
     その時刻に映る素材のクリップを選ぶ） 付けられない物は外して理由を返す
@@ -292,6 +295,11 @@ def build_items(
                 dropped.append((where, "効果音に使う本人の素材が選ばれていません"))
                 continue
             end = start + max(1, seconds_to_frame(sound.duration, rate))
+            if end > limit:
+                # 作品の終わりを越えて置くと、作品が延びて書き出しに絵の無い末尾が付く
+                # 音を途中で切ると笑いや驚きの音として聞こえないので、切り詰めずに外す
+                dropped.append((where, "効果音が範囲の終わりを越えます"))
+                continue
             clip_id: ClipId | None = None
             media_id: MediaId | None = sound.id
         else:

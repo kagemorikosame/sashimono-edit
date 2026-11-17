@@ -39,7 +39,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from fractions import Fraction
 from pathlib import Path
@@ -1057,7 +1057,8 @@ def direction_metrics(project: Project, cues: Sequence[Any]) -> dict[str, float 
     """強さごとに計画を作って付け、付いた演出を段 1 の ``measure_direction`` で数える
 
     数えるのは、強さごとの 1 分あたりの寄る・揺らすの回数・近すぎる所の数（0 であるべき）・
-    手がかりの並びを逆にしても同じ計画になるか（``consistent``）・強いほど多く付くか（``ordered``）
+    手がかりの並びを逆にしても同じ計画になるか（``consistent``）・強いほど多く付くか（``ordered``）・
+    方針の外の効果を付けた数（``off_guide`` 0 であるべき）
     効果音は本人の素材だけを使う決まりで、評価の素材には効果音の素材が無いので数えない
     """
     from sashimono.ai.direction_plan import apply_items, build_items
@@ -1072,7 +1073,7 @@ def direction_metrics(project: Project, cues: Sequence[Any]) -> dict[str, float 
     from sashimono.core.timebase import frame_to_seconds
 
     end = float(frame_to_seconds(project.timeline.duration, project.timeline.rate))
-    metrics: dict[str, float | int | None] = {"cues": len(cues), "too_close": 0}
+    metrics: dict[str, float | int | None] = {"cues": len(cues), "too_close": 0, "off_guide": 0}
     consistent = True
     placed: list[int] = []
     for strength in STRENGTHS:
@@ -1080,9 +1081,14 @@ def direction_metrics(project: Project, cues: Sequence[Any]) -> dict[str, float 
         planned = plan_direction(cues, book, 0.0, end)
         # 手がかりの並びに計画が引きずられると、同じ素材でも回ごとに違う所へ寄る
         consistent = consistent and planned == plan_direction(list(reversed(cues)), book, 0.0, end)
-        items, _ = build_items(project, planned, [None] * len(planned), None)
+        items, _ = build_items(
+            project, planned, [None] * len(planned), None, project.timeline.duration
+        )
         document = Document(project)
         result = apply_items(document, items)
+        metrics["off_guide"] = int(metrics["off_guide"] or 0) + _off_guide(
+            project, cues, strength, end
+        )
         report = measure_direction(document.project, document.project.timeline)
         moves = 0
         for kind in report.kinds:
@@ -1095,6 +1101,38 @@ def direction_metrics(project: Project, cues: Sequence[Any]) -> dict[str, float 
     metrics["consistent"] = int(consistent)
     metrics["ordered"] = int(all(a <= b for a, b in itertools.pairwise(placed)))
     return metrics
+
+
+#: 評価の作品に効果の方針が無いときに照らす使ってよい効果 揺らす効果を許さない
+#: 方針が空だとレシピを外す所を通らないので、評価で方針に合うかを数えられない
+_PROBE_EFFECTS = ("blur",)
+
+
+def _off_guide(project: Project, cues: Sequence[Any], strength: str, end: float) -> int:
+    """方針の使ってよい効果の外の効果を、計画が付けてしまった数
+
+    作品に効果の方針があればそれで、無ければ揺らすを許さない方針（``_PROBE_EFFECTS``）で照らす
+    付けた後の作品を ``style_problems`` で照らすので、レシピの外し方と照らしの食い違いも拾う
+    """
+    from sashimono.ai.direction_plan import apply_items, build_items
+    from sashimono.ai.style_check import EFFECT, style_problems
+    from sashimono.core.direction_recipes import (
+        LETS_PLAY,
+        DirectionTaste,
+        plan_direction,
+        recipe_book,
+    )
+
+    guided = project
+    if not project.style_guide.effects:
+        guided = replace(project, style_guide=replace(project.style_guide, effects=_PROBE_EFFECTS))
+    book = recipe_book(DirectionTaste(LETS_PLAY, strength), guided.style_guide.effects)
+    planned = plan_direction(cues, book, 0.0, end)
+    items, _ = build_items(guided, planned, [None] * len(planned), None, guided.timeline.duration)
+    before = sum(p.kind == EFFECT for p in style_problems(guided))
+    document = Document(guided)
+    apply_items(document, items)
+    return sum(p.kind == EFFECT for p in style_problems(document.project)) - before
 
 
 def direct_with_tools(

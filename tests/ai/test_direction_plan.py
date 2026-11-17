@@ -227,6 +227,24 @@ class TestApply:
         report = measure_direction(project, project.timeline)
         assert next(k for k in report.kinds if k.kind.key == SOUND).count == len(sounds)
 
+    def test_sounds_stay_inside_the_range(self, work: FakeHost) -> None:
+        # 範囲の終わりを越えて置くと作品が延び、書き出しに絵の無い末尾が付く
+        sound = _sound(9)
+        work.document.execute(AddMedia(sound))
+        end = _SECONDS * 30
+        last = {"signal": "laughter", "start_frame": end - 60, "end_frame": end - 30, "score": 1.0}
+        result = run(
+            work,
+            "propose_direction",
+            cues=[last],
+            sound_media_id=str(sound.id),
+            strength="bold",
+        )
+        assert all(row["end_frame"] <= end for row in result["items"])
+        assert any("範囲の終わり" in row["reason"] for row in result["dropped"])
+        proposal_for(work.document).apply(work.document)
+        assert work.document.project.timeline.duration == end
+
     def test_sounds_do_not_go_to_a_silent_sound_track(self, work: FakeHost) -> None:
         # 消音・鍵のトラックへ置くと、付いたことになっても鳴らない（置けない）
         # 人のトラックがソロなら、足すトラックもソロにしないと鳴らない

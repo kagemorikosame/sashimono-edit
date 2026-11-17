@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import Any
 
 import pytest
 
+from sashimono.core import direction_recipes
+from sashimono.core.direction_recipes import DirectionTaste, RecipeBook
 from sashimono.core.model import MediaItem
 from sashimono.engine.highlights import Highlight
 from tests.check_media import write_video
@@ -77,6 +80,7 @@ def test_stronger_settings_place_more_and_never_too_close(
         _project(tool, video_media), tool.direction_cues(_highlights())
     )
     assert metrics["too_close"] == 0
+    assert metrics["off_guide"] == 0
     assert metrics["consistent"] == 1
     assert metrics["ordered"] == 1
     zooms = [metrics[f"zoom_per_minute_{s}"] for s in ("subtle", "normal", "bold")]
@@ -85,6 +89,22 @@ def test_stronger_settings_place_more_and_never_too_close(
     assert zooms[0] <= 1.0
     assert metrics["shake_per_minute_bold"] > metrics["shake_per_minute_subtle"]
     assert all(metrics[f"skipped_{s}"] == 0 for s in ("subtle", "normal", "bold"))
+
+
+def test_off_guide_catches_a_plan_that_ignores_the_guide(
+    tool: ModuleType, video_media: MediaItem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 方針を読まない計画でも 0 と出るなら、方針に合うかを数えていない
+    original = direction_recipes.recipe_book
+
+    def ignore_guide(taste: DirectionTaste, allowed: Iterable[str] = ()) -> RecipeBook:
+        return original(taste)
+
+    monkeypatch.setattr(direction_recipes, "recipe_book", ignore_guide)
+    metrics = tool.direction_metrics(
+        _project(tool, video_media), tool.direction_cues(_highlights())
+    )
+    assert metrics["off_guide"] > 0
 
 
 def test_no_cues_place_nothing(tool: ModuleType, video_media: MediaItem) -> None:

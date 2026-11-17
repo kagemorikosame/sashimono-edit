@@ -163,7 +163,7 @@ Sashimono Edit で開いて直し、上書き保存してから `adopt` で取�
 | 言いよどみを見つける | `f1` 許す幅（`filler_seconds` 既定 0.5 秒）の中で 1 対 1 に組む | `precision` `recall` |
 | 定点のつなぎ目 | `seams` 詰めてできたつなぎ目の数（正解とは比べない） | `removed_seconds` `handled_<処理>` 処理できたつなぎ目 `skipped_<処理>` 断られたつなぎ目 `export_seconds_<処理>` 処理は `none` `crossfade` `zoom` |
 | グループを保つ | `kept_share` 時刻の重なる別のトラックのクリップの組のうち、同じグループに居る組の割合（1.0 が全部残った 前半と後半が 1 つのグループにまとまったら 0） | `merged`（前半と後半がまとまったら 1） `pairs` `groups` `loose_clips` `cuts`（道具の段） AI の段は `removed_seconds`（切って詰めた秒 0 なら `ai-no-cut`） `ungroup_calls`（`ungroup_clips` を呼んだ回数）`ungroup_questions`（解く前の問いが出た回数）`questions` `tool_calls` `refused_irreversible` |
-| 演出 | `too_close` 付けた演出のうち、やりすぎの線（段 1 の型ごとの間隔の下限）より近い所の数（0 であるべき 正解とは比べない） | `zoom_per_minute_<強さ>` `shake_per_minute_<強さ>` 1 分あたりの回数 `skipped_<強さ>` 付けられなかった項目 `cues` 手がかりの数 `consistent`（手がかりの並びを逆にしても同じ計画なら 1） `ordered`（強いほど多く付けば 1） `subtitles`（字幕の笑いの印を使えたら 1） 強さは `subtle` `normal` `bold` |
+| 演出 | `too_close` 付けた演出のうち、やりすぎの線（段 1 の型ごとの間隔の下限）より近い所の数（0 であるべき 正解とは比べない） | `zoom_per_minute_<強さ>` `shake_per_minute_<強さ>` 1 分あたりの回数 `skipped_<強さ>` 付けられなかった項目 `cues` 手がかりの数 `off_guide` 方針の外の効果を付けた数（0 であるべき） `consistent`（手がかりの並びを逆にしても同じ計画なら 1） `ordered`（強いほど多く付けば 1） `subtitles`（字幕の笑いの印を使えたら 1） 強さは `subtle` `normal` `bold` |
 | 字幕を焼き込んで書き出す | `problems` 書き出した動画の検査で見つかった問題の数（正解とは比べない） | `count_<種類>` 種類ごとの数 `loudness` 音量（LUFS） `length_error` 長さのずれ（秒） `subtitle_clips` 焼き込んだ字幕の数 `export_seconds` `check_seconds` |
 
 許す幅は `eval/tasks.json` の `tolerances` で変えられる かかった秒は、道具の処理（波形や
@@ -216,7 +216,7 @@ AI が `propose_direction` へ渡すのと同じ形の手がかりにする 実�
 - 人の手の演出とは比べない 同じ所に寄るかは好みで、合わないのが悪いとは言えない 見るのは、強さの設定どおりの密度か・
   やりすぎの線より詰まっていないか・同じ手がかりで同じ計画になるか
 - 効果音は本人の素材だけを使う決まりで、評価の素材には効果音の素材が無いので数えない
-- 評価の作品には方針（#343）が無いので、方針の外の効果を外す所はここでは働かない（段 3 の試験で確かめる）
+- 評価の作品には方針（#343）が無いので、揺らすを許さない方針（使ってよい効果がぼかしだけ）で同じ計画を付け直し、付いた後の作品を方針の照らし（`check_style_guide` と同じ物）で照らして `off_guide` に数える 作品に効果の方針があればそれで照らす
 - 字幕起こしの部品があれば、字幕の笑いの印も手がかりに使う（見どころの課題と同じ） 無ければ音と動きだけ
 - 見た目の良し悪しは数では測らない マイルストーンごとに、#345 の素材で付けた作品を本人が見て評価する
 
