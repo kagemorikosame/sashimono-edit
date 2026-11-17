@@ -47,7 +47,7 @@ from sashimono.core.model import (
     TrackId,
     TrackKind,
 )
-from sashimono.core.timebase import frame_to_seconds, seconds_to_frame
+from sashimono.core.timebase import Rounding, frame_to_seconds, seconds_to_frame
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands
 
 __all__ = [
@@ -287,8 +287,10 @@ def build_items(
     items: list[DirectionItem] = []
     dropped: list[tuple[str, str]] = []
     for plan, clip_hint in zip(planned, clips, strict=True):
-        start = seconds_to_frame(Fraction(plan.start).limit_denominator(1000), rate)
-        end = max(start + 1, seconds_to_frame(Fraction(plan.end).limit_denominator(1000), rate))
+        # 計画の秒は手がかりのフレームから作った物 切り捨てで戻すと、29.97 fps のように
+        # 秒が割り切れないレートで手がかりより 1 フレーム早くなる
+        start = seconds_to_frame(Fraction(plan.start), rate, Rounding.NEAREST)
+        end = max(start + 1, seconds_to_frame(Fraction(plan.end), rate, Rounding.NEAREST))
         where = _seconds_text(start, project)
         if plan.action == ACTION_SOUND:
             if sound is None:
@@ -400,6 +402,11 @@ def apply_items(document: Document, items: Sequence[DirectionItem]) -> ApplyResu
             except ValueError as exc:  # EmphasisError も ValueError
                 skipped.append((item.number, str(exc)))
                 continue
+            # 文書の側で断る物（持ち出し用パッケージの範囲の外 など）は命令の試しでは分からない
+            refused = document.refusal(trial, by=Author.AI)
+            if refused is not None:
+                skipped.append((item.number, refused))
+                continue
             for command in commands:
                 document.execute(command)
             applied.append(item.number)
@@ -434,17 +441,20 @@ def _sound_commands(project: Project, item: DirectionItem) -> list[Command]:
         duration=item.end_frame - item.start_frame,
         media_id=item.media_id,
     )
-    tracks = project.timeline.tracks
-    # ソロのトラックがあると、ソロでないトラックは鳴らない 足すトラックもソロにそろえる
+    timeline = project.timeline
+    # 音のソロがあると、ソロでない音のトラックは鳴らない 足すトラックもソロにそろえる
+    # ソロは役割の中で決まるので、音を鳴らすトラック（音声と混合）の中だけで見る 映像トラックの
+    # ソロまで見ると、足したトラックのソロで本人の BGM やナレーションが鳴らなくなる
     # 人のトラックのソロや消音は変えない（人が聞き分けのために付けた物）
-    solo = any(track.solo for track in tracks)
-    for track in tracks:
+    solo = any(track.solo and not track.muted for track in timeline.sound_tracks())
+    sounding = {track.id for track in timeline.active_sound_tracks()}
+    for track in timeline.tracks:
         free = all(
             other.timeline_end <= clip.timeline_start or clip.timeline_end <= other.timeline_start
             for other in track.clips
         )
         # 消音・鍵・ソロの外のトラックへ置くと、付いたことになっても鳴らない（置けない）
-        audible = not track.muted and not track.locked and (track.solo or not solo)
+        audible = track.id in sounding and not track.locked
         if track.kind is TrackKind.AUDIO and track.name == SOUND_TRACK_NAME and free and audible:
             return [AddClip(track.id, clip)]
     track = Track(kind=TrackKind.AUDIO, name=SOUND_TRACK_NAME, solo=solo)

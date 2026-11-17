@@ -1064,6 +1064,7 @@ def direction_metrics(project: Project, cues: Sequence[Any]) -> dict[str, float 
     from sashimono.ai.direction_plan import apply_items, build_items
     from sashimono.core.direction import SHAKE, ZOOM, measure_direction
     from sashimono.core.direction_recipes import (
+        ACTION_SOUND,
         LETS_PLAY,
         STRENGTHS,
         DirectionTaste,
@@ -1081,8 +1082,10 @@ def direction_metrics(project: Project, cues: Sequence[Any]) -> dict[str, float 
         planned = plan_direction(cues, book, 0.0, end)
         # 手がかりの並びに計画が引きずられると、同じ素材でも回ごとに違う所へ寄る
         consistent = consistent and planned == plan_direction(list(reversed(cues)), book, 0.0, end)
-        items, _ = build_items(
-            project, planned, [None] * len(planned), None, project.timeline.duration
+        # 効果音は数えないので先に分ける 残る項目の外した数と付けられなかった数は合わせて数える
+        moved = [p for p in planned if p.action != ACTION_SOUND]
+        items, dropped = build_items(
+            project, moved, [None] * len(moved), None, project.timeline.duration
         )
         document = Document(project)
         result = apply_items(document, items)
@@ -1096,7 +1099,7 @@ def direction_metrics(project: Project, cues: Sequence[Any]) -> dict[str, float 
             if kind.kind.key in (ZOOM, SHAKE):
                 metrics[f"{kind.kind.key}_per_minute_{strength}"] = round(kind.per_minute, 4)
                 moves += kind.count
-        metrics[f"skipped_{strength}"] = len(result.skipped)
+        metrics[f"skipped_{strength}"] = len(dropped) + len(result.skipped)
         placed.append(moves)
     metrics["consistent"] = int(consistent)
     metrics["ordered"] = int(all(a <= b for a, b in itertools.pairwise(placed)))
@@ -2263,7 +2266,11 @@ def command_run(
                         status="ok",
                         seconds=round(time.perf_counter() - began, 2),
                         metrics=finite_metrics(directed),
-                        params={"genre": "lets_play"},
+                        # 字幕起こしを使ったら、手がかりが変わるのでモデルの指定も書く
+                        params={
+                            "genre": "lets_play",
+                            **(resolved.record(SUBTITLES) if directed.get("subtitles") else {}),
+                        },
                     )
                 elif truth is None:
                     record.update(status="skipped", reason="no-answer")

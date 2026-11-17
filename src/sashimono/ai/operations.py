@@ -2828,60 +2828,61 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         end,
     )
     view = proposal_for(host.document).propose(items, dropped, DIRECTION_STRENGTHS[taste.strength])
-    result = _proposal_result(view)
-    result["note"] = (
+    note = (
         "計画の欄に出しました まだ何も付けていません ユーザーが要らない項目を外して"
         "〔付ける〕を押すと、残りを取り消し 1 回で戻せるまとまりとして付けます "
         "〔付ける〕を押せることを伝えて応答を終えます（応えている間は押せません） "
         "押した後に頼まれたら、付いたかは get_direction_plan で読みます "
         "項目が少なければ、手がかりが少ないか強さの上限に当たっています"
+        " 項目の続き（next_offset）は get_direction_plan に offset を渡して読みます"
     )
     if any(rule.recipe.action == "sound" for rule in book.rules) and sound is None:
-        result["note"] += (
-            " 効果音は sound_media_id に本人が取り込んだ短い音の素材を渡すと計画に入ります"
-        )
-    return result
+        note += " 効果音は sound_media_id に本人が取り込んだ短い音の素材を渡すと計画に入ります"
+    return _proposal_result(view, {}, note)
 
 
-def _proposal_result(view: ProposalView) -> dict[str, Any]:
-    result: dict[str, Any] = {
+def _proposal_result(view: ProposalView, arguments: dict[str, Any], note: str) -> dict[str, Any]:
+    """計画の様子 項目の一覧（items）はページに分ける
+
+    計画の欄は全項目を持つ 長い作品で項目が多いと、AI へ返す一覧だけで返事の上限を越え、
+    打ち切られて後半の項目も付けた結果も読めない
+    """
+    head: dict[str, Any] = {
         "state": view.state.value,
         "strength_name": view.strength_name,
-        "items": [
-            {
-                "number": item.number,
-                "recipe": item.recipe,
-                "action": item.action,
-                "kind": item.kind,
-                "start_frame": item.start_frame,
-                "end_frame": item.end_frame,
-                "amount": item.amount,
-                "clip_id": str(item.clip_id) if item.clip_id is not None else None,
-                "media_id": str(item.media_id) if item.media_id is not None else None,
-                "excluded": item.number in view.excluded,
-            }
-            for item in view.items
-        ],
         "dropped": [{"at": at, "reason": reason} for at, reason in view.dropped],
     }
     if view.result is not None:
-        result["applied"] = list(view.result.applied)
-        result["skipped"] = [
+        head["applied"] = list(view.result.applied)
+        head["skipped"] = [
             {"number": number, "reason": reason} for number, reason in view.result.skipped
         ]
-    return result
+    rows = [
+        {
+            "number": item.number,
+            "recipe": item.recipe,
+            "action": item.action,
+            "kind": item.kind,
+            "start_frame": item.start_frame,
+            "end_frame": item.end_frame,
+            "amount": item.amount,
+            "clip_id": str(item.clip_id) if item.clip_id is not None else None,
+            "media_id": str(item.media_id) if item.media_id is not None else None,
+            "excluded": item.number in view.excluded,
+        }
+        for item in view.items
+    ]
+    return _paged_after(head, rows, arguments, "items", note)
 
 
 def _get_direction_plan(host: EditorHost, arguments: dict[str, Any]) -> object:
-    del arguments
     view = proposal_for(host.document).view()
     if view is None:
         return {
             "state": "none",
             "note": "演出の計画はありません 計画は propose_direction で出せます",
         }
-    result = _proposal_result(view)
-    result["note"] = {
+    note = {
         "proposed": (
             "ユーザーが外す物を選んでいる所です 〔付ける〕を押せることを伝えて応答を"
             "終えます（応えている間は押せません）"
@@ -2892,7 +2893,7 @@ def _get_direction_plan(host: EditorHost, arguments: dict[str, Any]) -> object:
         ),
         "cancelled": "ユーザーが計画をやめました 何も付けていません",
     }[view.state.value]
-    return result
+    return _proposal_result(view, arguments, note)
 
 
 def _author(by: Author | None) -> str | None:
@@ -12064,9 +12065,9 @@ OPERATIONS: tuple[Operation, ...] = (
         name="get_direction_plan",
         description=(
             "演出の計画の今の様子（出している・付けた・やめた）と、ユーザーが外した項目、"
-            "付けた項目と付けられなかった項目を読む"
+            "付けた項目と付けられなかった項目を読む 項目の一覧（items）は" + PAGING_NOTE
         ),
-        schema=_schema({}),
+        schema=_schema(_paging()),
         handler=_get_direction_plan,
         sends=frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS}),
     ),

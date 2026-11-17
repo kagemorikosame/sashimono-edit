@@ -17,9 +17,10 @@ from typing import Any
 
 import pytest
 
+from sashimono.ai import direction_plan
 from sashimono.core import direction_recipes
 from sashimono.core.direction_recipes import DirectionTaste, RecipeBook
-from sashimono.core.model import MediaItem
+from sashimono.core.model import MediaItem, Transcript
 from sashimono.engine.highlights import Highlight
 from tests.check_media import write_video
 from tests.test_eval_tasks_tool import tool
@@ -107,6 +108,24 @@ def test_off_guide_catches_a_plan_that_ignores_the_guide(
     assert metrics["off_guide"] > 0
 
 
+def test_items_left_out_while_building_count_as_skipped(
+    tool: ModuleType, video_media: MediaItem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 組み立てで外した項目（同じ型の動きと重なる など）を数えないと、付かなくても 0 と出る
+    original = direction_plan.build_items
+
+    def drop_all(*args: Any) -> tuple[list[Any], list[tuple[str, str]]]:
+        items, dropped = original(*args)
+        return [], dropped + [(item.at, "外した") for item in items]
+
+    monkeypatch.setattr(direction_plan, "build_items", drop_all)
+    metrics = tool.direction_metrics(
+        _project(tool, video_media), tool.direction_cues(_highlights())
+    )
+    assert metrics["skipped_bold"] > 0
+    assert metrics["zoom_per_minute_bold"] == 0
+
+
 def test_no_cues_place_nothing(tool: ModuleType, video_media: MediaItem) -> None:
     # 盛り上がりの無い素材で何かが付くと、手がかりに無い所へ演出を置いている
     metrics = tool.direction_metrics(_project(tool, video_media), [])
@@ -116,10 +135,14 @@ def test_no_cues_place_nothing(tool: ModuleType, video_media: MediaItem) -> None
     assert metrics["consistent"] == 1
 
 
-def test_the_direction_task_runs_without_an_answer(tool: ModuleType, tmp_path: Path) -> None:
+@pytest.mark.parametrize("words", [None, Transcript(segments=())])
+def test_the_direction_task_runs_without_an_answer(
+    tool: ModuleType, tmp_path: Path, words: Transcript | None
+) -> None:
     """正解の無いまま台本を 1 周させ、結果の行に数と値を書く
 
     正解を求めると「no-answer」で飛ばされ、演出の課題は 1 度も数えられない
+    字幕起こしを使ったら、手がかりが変わるのでモデルの指定も書く
     """
     media = tmp_path / "ひみつの素材置き場"
     media.mkdir()
@@ -140,15 +163,19 @@ def test_the_direction_task_runs_without_an_answer(tool: ModuleType, tmp_path: P
         ["E07"],
         results=results,
         commit="",
-        transcriber=lambda path, params: None,
+        transcriber=lambda path, params: words,
     )
     assert record["status"] == "ok", record
     assert "provisional" not in record
-    assert record["params"] == {"genre": "lets_play"}
+    used = words is not None
+    expected = {"genre": "lets_play"}
+    if used:
+        expected.update(tool.ToolParams().record(tool.SUBTITLES))
+    assert record["params"] == expected
     metrics = record["metrics"]
     assert metrics["too_close"] == 0
     assert metrics["consistent"] == 1
-    assert metrics["subtitles"] == 0
+    assert metrics["subtitles"] == int(used)
     # 素材の名前や置き場は結果の行に入らない
     written = results.read_text(encoding="utf-8")
     assert "ひみつ" not in written and "じっきょう" not in written

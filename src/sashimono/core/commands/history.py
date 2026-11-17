@@ -206,6 +206,21 @@ class Document:
         self._set_project(updated)
         return updated
 
+    def refusal(self, updated: Project, *, by: Author | None = None) -> str | None:
+        """今の作品を ``updated`` に変える頼みを :meth:`execute` が断るなら、その理由
+
+        命令の ``apply`` だけで試すと、文書の側で断る物（持ち出し用パッケージの範囲の外・
+        開き直した後の AI の変更）を見落とす 見落としたまま段の中で実行すると、その例外で
+        段ごと戻り、先に通した変更まで消える
+        """
+        refusal = packed_refusal(self._project, updated, self._sound_history)
+        if refusal is not None:
+            return refusal
+        author = by or (self._checkpoint_by if self._checkpoint_depth else Author.PERSON)
+        if self._replaced and author is Author.AI:
+            return REPLACED_REFUSAL
+        return None
+
     @contextmanager
     def checkpoint(
         self, label: str, *, merge: bool = False, by: Author | None = None

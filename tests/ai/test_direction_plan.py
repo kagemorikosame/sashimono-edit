@@ -18,15 +18,16 @@ from sashimono.ai.direction_plan import (
     APPLY_LABEL,
     SOUND_TRACK_NAME,
     ProposalState,
+    build_items,
     proposal_for,
 )
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddMedia, Command, RemoveClip
+from sashimono.core.commands import AddMedia, Command, RemoveClip, history
 from sashimono.core.direction import SHAKE, SOUND, ZOOM, measure_direction
-from sashimono.core.direction_recipes import BOLD, DirectionTaste
+from sashimono.core.direction_recipes import ACTION_ZOOM, BOLD, DirectionTaste, PlannedDirection
 from sashimono.core.model import (
     AudioStreamInfo,
     Clip,
@@ -37,6 +38,7 @@ from sashimono.core.model import (
     Track,
     TrackKind,
 )
+from sashimono.core.timebase import FrameRate, frame_to_seconds
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands
 from tests.ai.conftest import FakeHost
 from tests.ai.test_operations import run
@@ -176,6 +178,49 @@ class TestPropose:
         with pytest.raises(ToolError, match="ナレーション"):
             run(work, "propose_direction", cues=_cues(work), sound_media_id=str(voice.id))
 
+    @pytest.mark.parametrize("rate", [RATE_30, FrameRate(30000, 1001)])
+    def test_items_keep_the_frame_of_the_cue(self, video_media: MediaItem, rate: FrameRate) -> None:
+        # 秒から戻すときに切り捨てると、29.97 fps で手がかりより 1 フレーム早くなる
+        project = Project.create(ProjectSettings(frame_rate=rate))
+        project = AddMedia(video_media).apply(project)
+        clip = Clip(timeline_start=0, duration=600, media_id=video_media.id)
+        track = Track(kind=TrackKind.VIDEO, name="V1", clips=(clip,))
+        project = project.with_timeline(replace(project.timeline, tracks=(track,)))
+        planned = [
+            PlannedDirection(
+                recipe="r",
+                action=ACTION_ZOOM,
+                kind=ZOOM,
+                start=float(frame_to_seconds(frame, rate)),
+                end=float(frame_to_seconds(frame + 30, rate)),
+                amount=None,
+                reason="",
+            )
+            for frame in (4, 301)
+        ]
+        items, dropped = build_items(project, planned, [None, None], None, 600)
+        assert dropped == []
+        assert [(i.start_frame, i.end_frame) for i in items] == [(4, 34), (301, 331)]
+
+    def test_long_plans_come_in_pages(self, work: FakeHost) -> None:
+        # 項目が多いと、一覧だけで返事の上限を越えて打ち切られ、後半を読めない
+        sound = _sound(1)
+        work.document.execute(AddMedia(sound))
+        first = run(
+            work,
+            "propose_direction",
+            cues=_cues(work),
+            sound_media_id=str(sound.id),
+        )
+        total = first["total"]
+        view = proposal_for(work.document).view()
+        assert view is not None
+        assert total == len(view.items) > 2
+        page = run(work, "get_direction_plan", offset=1, limit=2)
+        assert [row["number"] for row in page["items"]] == [2, 3]
+        assert page["next_offset"] == 3 or total == 3
+        assert page["state"] == "proposed" and "dropped" in page
+
     def test_refuses_while_a_scene_is_open(self, work: FakeHost) -> None:
         # シーンの時刻とクリップで計画しても、〔付ける〕はメインへ当たり、別の素材へ寄る
         work.scene = SceneId("開いたシーン")
@@ -265,6 +310,48 @@ class TestApply:
         placed = [t for t in after[3:] if t.name == SOUND_TRACK_NAME]
         assert len(placed) == 1 and placed[0].clips
         assert placed[0].solo is True and placed[0].muted is False
+
+    def test_a_picture_solo_does_not_silence_the_other_sounds(self, work: FakeHost) -> None:
+        # 映像トラックのソロは音に効かない それを見て足すトラックをソロにすると、
+        # 本人の BGM やナレーションが鳴らなくなる
+        sound = _sound(1)
+        work.document.execute(AddMedia(sound))
+        project = work.document.project
+        tracks = (
+            replace(project.timeline.tracks[0], solo=True),
+            Track(kind=TrackKind.AUDIO, name="BGM"),
+        )
+        work.document.reset(project.with_timeline(replace(project.timeline, tracks=tracks)))
+        run(work, "propose_direction", cues=_cues(work), sound_media_id=str(sound.id))
+        proposal_for(work.document).apply(work.document)
+        timeline = work.document.project.timeline
+        placed = [t for t in timeline.tracks if t.name == SOUND_TRACK_NAME]
+        assert len(placed) == 1 and placed[0].clips and placed[0].solo is False
+        assert "BGM" in {t.name for t in timeline.active_sound_tracks()}
+
+    def test_an_item_the_document_refuses_is_skipped_alone(
+        self, work: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 持ち出し用パッケージの範囲の外のように文書の側で断る物は、命令の試しでは通る
+        # 実行で断られると段ごと戻り、先に付けた項目まで消える
+        sound = _sound(1)
+        work.document.execute(AddMedia(sound))
+        items = run(work, "propose_direction", cues=_cues(work), sound_media_id=str(sound.id))[
+            "items"
+        ]
+
+        def refuse_new_tracks(before: Project, after: Project, _sounds: object) -> str | None:
+            grew = len(after.timeline.tracks) > len(before.timeline.tracks)
+            return "パッケージの範囲の外です" if grew else None
+
+        monkeypatch.setattr(history, "packed_refusal", refuse_new_tracks)
+        result = proposal_for(work.document).apply(work.document)
+        assert result is not None
+        sounds = [row["number"] for row in items if row["kind"] == SOUND]
+        assert sounds
+        assert [number for number, _ in result.skipped] == sounds
+        assert len(result.applied) == len(items) - len(sounds) > 0
+        assert work.document.undo_label == APPLY_LABEL
 
     def test_an_item_that_cannot_run_is_skipped_alone(
         self, work: FakeHost, monkeypatch: pytest.MonkeyPatch
