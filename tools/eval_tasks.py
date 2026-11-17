@@ -1647,7 +1647,10 @@ def draft_project(
             document.execute(SetTranscript(media.id, transcript))
         key, label = ("boundaries", "区切り") if task == TALK else ("points", "言いよどみ")
         points = [_span(item)[0] for item in answer[key]]
-        frames = sorted({round(moment * float(rate.fps)) for moment in points})
+        # 終わり際の時刻は丸めると作品の終わり（クリップの外）に出る 外の目印は取り込むときに
+        # どの素材の時刻にも当たらず正解から落ちるので、最後のフレームに収める
+        last = max(document.project.duration - 1, 0)
+        frames = sorted({min(round(moment * float(rate.fps)), last) for moment in points})
         # 話の区切りは素材の頭を区切りに数えない 言いよどみは頭からでも言うので残す
         markers = tuple(
             Marker(frame=frame, label=label) for frame in frames if frame > 0 or task == FILLERS

@@ -142,6 +142,34 @@ def test_the_filler_answer_comes_from_the_fixed_markers(
     assert tool.HEADLINE[tool.FILLERS] == "f1"
 
 
+def test_a_filler_at_the_very_end_stays_in_the_answer(
+    folder: tuple[ModuleType, Any, Any],
+) -> None:
+    """素材の終わり際で言った言いよどみ
+
+    壊れると、目印が作品の終わり（クリップの外）に置かれ、直さずに取り込んでも正解から消える
+    """
+    tool, eval_dir, book = folder
+
+    def late(path: Path, params: object) -> Transcript:
+        words = tuple(
+            Word(F(a).limit_denominator(1000), F(b).limit_denominator(1000), text)
+            # 語の終わりは素材の終わりを越えることがある（短すぎる語は言いよどみに数えない）
+            for text, a, b in (("え", 7.99, 8.03), ("ー", 8.03, 8.06), ("と", 8.06, 8.1))
+        )
+        return Transcript(
+            segments=(TranscriptSegment(words[0].start, words[-1].end, "えーと", words=words),),
+            language="ja",
+        )
+
+    tool.command_draft(eval_dir, book, ["E02"], word_transcriber=late)
+    project = load_project(eval_dir.draft_path("E02", "fillers"))
+    assert [marker.frame for marker in project.timeline.markers] == [project.duration - 1]
+    tool.command_adopt(eval_dir, "E02", "fillers")
+    answer = eval_dir.read_answer("E02")["tasks"]["fillers"]
+    assert answer["points"] == pytest.approx([7.99], abs=0.05)
+
+
 def _clips(project: Project) -> int:
     return sum(len(track.clips) for track in project.timeline.tracks)
 
