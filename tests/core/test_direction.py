@@ -339,6 +339,23 @@ class TestOtherKinds:
         (event,) = direction_events(project, project.timeline)
         assert (event.kind, event.strength) == (TRANSITION, 0.5)
 
+    def test_color_and_shake_on_a_transition_count(self, work: _Work) -> None:
+        # 描画は前の場面に effects、後の場面に after_effects を掛ける 切り替えだけを数えると、
+        # 切り替えに積んだ色と揺れが回数から落ちる
+        shake = Effect(
+            "random_move", params={"range_x": AnimatedValue(6.0), "range_y": AnimatedValue(0.0)}
+        )
+        transition = Clip(
+            timeline_start=285,
+            duration=15,
+            source=GeneratedSource("transition"),
+            effects=(shake,),
+            after_effects=(Effect("grade"),),
+        )
+        project = work.build(text=(transition,))
+        events = direction_events(project, project.timeline, color_kinds=COLOR_KINDS)
+        assert sorted(e.kind for e in events) == sorted([TRANSITION, COLOR, SHAKE])
+
     def test_color_counts_given_kinds_and_its_coverage(self, work: _Work) -> None:
         # 覆う割合を返さないと、1 本だけ色を整えた作品と全部整えた作品の区別が付かない
         graded = work.clip(0, 300, effects=(Effect("grade"),))
@@ -447,6 +464,14 @@ class TestDensity:
         report = _measure(stacked)
         cuts = [e for e in report.events if e.kind == CUT]
         assert (_kind(report, CUT).count, len(cuts)) == (1, 1)
+
+    def test_shot_lengths_leave_out_frames_without_picture(self, work: _Work) -> None:
+        # 頭の間をそのまま長さにすると、映像の後ろに文字や音だけが続く作品の最後のカットを、
+        # 作品の終わりまでの長さと読む 空いた間も同じ
+        clips = (work.clip(0, 300), work.clip(600, 300))
+        late = Clip(timeline_start=1700, duration=100, source=GeneratedSource("text"))
+        cut = _kind(_measure(work.build(video=clips, text=(late,))), CUT)
+        assert (cut.min_gap_seconds, cut.median_gap_seconds) == (10.0, 10.0)
 
     def test_sound_only_range_has_no_shot_lengths(self, work: _Work) -> None:
         # 絵の無い範囲をカットの長さとして測ると、無いカットを短すぎると返す
