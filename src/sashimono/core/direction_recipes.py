@@ -287,10 +287,11 @@ def plan_direction(
         budget = math.floor(rule.per_minute * minutes + 0.5)
         if budget <= 0:
             continue
-        # 強い順 同じ強さは早い順にして、何度呼んでも同じ物を選ぶ
+        # 強い順 同じ強さは早い順にして、何度呼んでも同じ物を選ぶ 拾ったクリップまで比べる
+        # のは、時刻と強さが同じでクリップだけ違う手がかりで、渡した順に付ける先が変わるため
         candidates = sorted(
             (c for c in cues if c.signal == recipe.cue and start <= c.start < end),
-            key=lambda c: (-c.score, c.start, c.end),
+            key=lambda c: (-c.score, c.start, c.end, c.source is None, c.source or ""),
         )
         placed = taken.setdefault(recipe.kind, [])
         count = 0

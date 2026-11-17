@@ -2791,6 +2791,13 @@ def _is_int(value: object) -> bool:
 
 def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
     """演出の計画（#479）を作って計画の欄に出す 作品は変えない 付けるのは人の〔付ける〕"""
+    if host.active_scene is not None:
+        # 開いたシーンの時刻とクリップで計画しても、計画と〔付ける〕はメインへ当たる
+        # シーンのクリップが見つからず、同じ時刻に映るメインの素材へ寄ってしまう
+        raise ToolError(
+            "シーンを開いたままでは演出の計画を立てられません"
+            " set_active_scene でメインに戻してから頼んでください"
+        )
     project = host.document.project
     taste = _direction_taste(host, arguments)
     cues = _direction_cues(project, arguments)
@@ -2823,9 +2830,10 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
     result = _proposal_result(view)
     result["note"] = (
         "計画の欄に出しました まだ何も付けていません ユーザーが要らない項目を外して"
-        "〔付ける〕を押すと、残りを取り消し 1 回で戻せるまとまりとして付けます 押すまで待ち、"
-        "付いたかは get_direction_plan で読みます 項目が少なければ、手がかりが少ないか"
-        "強さの上限に当たっています"
+        "〔付ける〕を押すと、残りを取り消し 1 回で戻せるまとまりとして付けます "
+        "〔付ける〕を押せることを伝えて応答を終えます（応えている間は押せません） "
+        "押した後に頼まれたら、付いたかは get_direction_plan で読みます "
+        "項目が少なければ、手がかりが少ないか強さの上限に当たっています"
     )
     if any(rule.recipe.action == "sound" for rule in book.rules) and sound is None:
         result["note"] += (
@@ -2873,7 +2881,10 @@ def _get_direction_plan(host: EditorHost, arguments: dict[str, Any]) -> object:
         }
     result = _proposal_result(view)
     result["note"] = {
-        "proposed": "ユーザーが外す物を選んでいる所です 〔付ける〕を押すまで待ちます",
+        "proposed": (
+            "ユーザーが外す物を選んでいる所です 〔付ける〕を押せることを伝えて応答を"
+            "終えます（応えている間は押せません）"
+        ),
         "applied": (
             "applied の項目を付けました 取り消し 1 回で全部戻ります measure_direction・"
             "preview_range・check_output で確かめ、方針の外ややりすぎがあれば直します"
@@ -12056,7 +12067,7 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         schema=_schema({}),
         handler=_get_direction_plan,
-        sends=_STRUCTURE,
+        sends=frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS}),
     ),
     Operation(
         name="measure_direction",

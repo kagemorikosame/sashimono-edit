@@ -118,6 +118,22 @@ class TestPlan:
         assert first == plan_direction(list(reversed(_cues())), book, 0, _SECONDS)
         assert [item.start for item in first] == sorted(item.start for item in first)
 
+    def test_ties_do_not_depend_on_the_order(self) -> None:
+        # 時刻と強さが同じでクリップだけ違う手がかりで、渡した順に付ける先が変わると、
+        # 同じ頼みでも回ごとに別のクリップへ寄る
+        book = recipe_book(DirectionTaste(strength=NORMAL))
+        twins = [
+            Cue(signal=CUE_LAUGHTER, start=10.0, end=11.0, score=0.9, source=name)
+            for name in ("b", None, "a")
+        ]
+        chosen = {
+            p.source
+            for order in itertools.permutations(twins)
+            for p in plan_direction(list(order), book, 0, _SECONDS)
+        }
+        # 笑いには寄ると効果音の 2 つのレシピがある どちらも同じクリップを選ぶ
+        assert chosen == {"a"}
+
     def test_the_count_and_gap_follow_the_strength(self) -> None:
         # 強さを上げても数が増えなければ、設定を変えた意味が無い
         counts = []

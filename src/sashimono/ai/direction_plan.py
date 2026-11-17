@@ -23,7 +23,13 @@ from fractions import Fraction
 
 from sashimono.core.commands import AddClip, AddTrack, Command
 from sashimono.core.commands.history import Author, Document
-from sashimono.core.direction import SHAKE, SOUND_EFFECT_MAX_SECONDS, ZOOM, direction_events
+from sashimono.core.direction import (
+    NARRATION_FOLDER,
+    SHAKE,
+    SOUND_EFFECT_MAX_SECONDS,
+    ZOOM,
+    direction_events,
+)
 from sashimono.core.direction_recipes import (
     ACTION_SHAKE,
     ACTION_SOUND,
@@ -254,6 +260,9 @@ def sound_problem(media: MediaItem) -> str | None:
         return "音の無い素材は効果音に使えません"
     if media.duration > SOUND_EFFECT_MAX_SECONDS:
         return f"効果音に使えるのは {SOUND_EFFECT_MAX_SECONDS} 秒以下の音です"
+    if media.path.parent.name == NARRATION_FOLDER:
+        # 段 1 はナレーションの録音を効果音に数えない 置けても数えられず、計画と数が食い違う
+        return "ナレーションの録音は効果音に使えません 効果音の素材を選んでください"
     return None
 
 
@@ -374,6 +383,12 @@ def apply_items(document: Document, items: Sequence[DirectionItem]) -> ApplyResu
         for item in items:
             try:
                 commands = _commands(document.project, item)
+                # 先に写しへ当てて、項目の命令がすべて通るかを見る 通らない物（鍵の掛かった
+                # トラックへ置く など）を途中まで実行すると、その例外で外の段ごと戻り、
+                # 先に付けた項目まで消える
+                trial = document.project
+                for command in commands:
+                    trial = command.apply(trial)
             except ValueError as exc:  # EmphasisError も ValueError
                 skipped.append((item.number, str(exc)))
                 continue
@@ -411,12 +426,18 @@ def _sound_commands(project: Project, item: DirectionItem) -> list[Command]:
         duration=item.end_frame - item.start_frame,
         media_id=item.media_id,
     )
-    for track in project.timeline.tracks:
+    tracks = project.timeline.tracks
+    # ソロのトラックがあると、ソロでないトラックは鳴らない 足すトラックもソロにそろえる
+    # 人のトラックのソロや消音は変えない（人が聞き分けのために付けた物）
+    solo = any(track.solo for track in tracks)
+    for track in tracks:
         free = all(
             other.timeline_end <= clip.timeline_start or clip.timeline_end <= other.timeline_start
             for other in track.clips
         )
-        if track.kind is TrackKind.AUDIO and track.name == SOUND_TRACK_NAME and free:
+        # 消音・鍵・ソロの外のトラックへ置くと、付いたことになっても鳴らない（置けない）
+        audible = not track.muted and not track.locked and (track.solo or not solo)
+        if track.kind is TrackKind.AUDIO and track.name == SOUND_TRACK_NAME and free and audible:
             return [AddClip(track.id, clip)]
-    track = Track(kind=TrackKind.AUDIO, name=SOUND_TRACK_NAME)
+    track = Track(kind=TrackKind.AUDIO, name=SOUND_TRACK_NAME, solo=solo)
     return [AddTrack(track), AddClip(track.id, clip)]

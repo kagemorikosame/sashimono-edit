@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from sashimono.ai import direction_plan
 from sashimono.ai.direction_plan import (
     APPLY_LABEL,
     SOUND_TRACK_NAME,
@@ -23,7 +24,7 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddMedia, RemoveClip
+from sashimono.core.commands import AddMedia, Command, RemoveClip
 from sashimono.core.direction import SHAKE, SOUND, ZOOM, measure_direction
 from sashimono.core.direction_recipes import BOLD, DirectionTaste
 from sashimono.core.model import (
@@ -32,6 +33,7 @@ from sashimono.core.model import (
     MediaItem,
     Project,
     ProjectSettings,
+    SceneId,
     Track,
     TrackKind,
 )
@@ -58,6 +60,17 @@ def work(video_media: MediaItem) -> FakeHost:
 
 def _clip(host: FakeHost) -> Clip:
     return host.document.project.timeline.tracks[0].clips[0]
+
+
+class _Refused(Command):
+    """当てると断る命令"""
+
+    @property
+    def label(self) -> str:
+        return "断る"
+
+    def apply(self, project: Project) -> Project:
+        raise ValueError("この命令は通りません")
 
 
 def _cues(host: FakeHost) -> list[dict[str, Any]]:
@@ -104,9 +117,8 @@ class TestPropose:
             operation = find_operation(name)
             assert operation is not None
             assert operation.safety is Safety.READ_ONLY
-        propose = find_operation("propose_direction")
-        assert propose is not None
-        assert propose.sends == {Outbound.PROJECT, Outbound.APP_SETTINGS}
+            # 計画を読む道具も本人の設定から決まった強さを返す
+            assert operation.sends == {Outbound.PROJECT, Outbound.APP_SETTINGS}
 
     def test_proposes_without_changing_the_work(self, work: FakeHost) -> None:
         # 出しただけで付くと、人が外す前に演出が入り、外したい 1 つのために全部を取り消す
@@ -158,6 +170,18 @@ class TestPropose:
         work.document.execute(AddMedia(long))
         with pytest.raises(ToolError, match="秒以下"):
             run(work, "propose_direction", cues=_cues(work), sound_media_id=str(long.id))
+        # 段 1 はナレーションの録音を効果音に数えない 置けても計画と数が食い違う
+        voice = replace(_sound(1), path=Path("C:/作品/narration/001.wav"))
+        work.document.execute(AddMedia(voice))
+        with pytest.raises(ToolError, match="ナレーション"):
+            run(work, "propose_direction", cues=_cues(work), sound_media_id=str(voice.id))
+
+    def test_refuses_while_a_scene_is_open(self, work: FakeHost) -> None:
+        # シーンの時刻とクリップで計画しても、〔付ける〕はメインへ当たり、別の素材へ寄る
+        work.scene = SceneId("開いたシーン")
+        with pytest.raises(ToolError, match="シーン"):
+            run(work, "propose_direction", cues=_cues(work))
+        assert proposal_for(work.document).view() is None
 
 
 class TestApply:
@@ -202,6 +226,51 @@ class TestApply:
         assert len(tracks[0].clips) == len(sounds)
         report = measure_direction(project, project.timeline)
         assert next(k for k in report.kinds if k.kind.key == SOUND).count == len(sounds)
+
+    def test_sounds_do_not_go_to_a_silent_sound_track(self, work: FakeHost) -> None:
+        # 消音・鍵のトラックへ置くと、付いたことになっても鳴らない（置けない）
+        # 人のトラックがソロなら、足すトラックもソロにしないと鳴らない
+        sound = _sound(1)
+        work.document.execute(AddMedia(sound))
+        project = work.document.project
+        tracks = (
+            replace(project.timeline.tracks[0], solo=True),
+            Track(kind=TrackKind.AUDIO, name=SOUND_TRACK_NAME, muted=True, solo=True),
+            Track(kind=TrackKind.AUDIO, name=SOUND_TRACK_NAME, locked=True, solo=True),
+        )
+        work.document.reset(project.with_timeline(replace(project.timeline, tracks=tracks)))
+        run(work, "propose_direction", cues=_cues(work), sound_media_id=str(sound.id))
+        result = proposal_for(work.document).apply(work.document)
+        assert result is not None and result.skipped == ()
+        after = work.document.project.timeline.tracks
+        assert [len(t.clips) for t in after[1:3]] == [0, 0]
+        placed = [t for t in after[3:] if t.name == SOUND_TRACK_NAME]
+        assert len(placed) == 1 and placed[0].clips
+        assert placed[0].solo is True and placed[0].muted is False
+
+    def test_an_item_that_cannot_run_is_skipped_alone(
+        self, work: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 途中で通らない命令を実行すると、その例外で段ごと戻り、先に付けた項目まで消える
+        # 組んだ命令の 2 つ目で断られる項目を作る（鍵の掛かったトラックへ置く などの形）
+        items = run(work, "propose_direction", cues=_cues(work))["items"]
+        broken = items[1]["number"]
+        original = direction_plan._commands
+
+        def commands(project: Project, item: Any) -> list[Command]:
+            built = original(project, item)
+            return [*built, _Refused()] if item.number == broken else built
+
+        monkeypatch.setattr(direction_plan, "_commands", commands)
+        result = proposal_for(work.document).apply(work.document)
+        assert result is not None
+        assert [number for number, _ in result.skipped] == [broken]
+        assert len(result.applied) == len(items) - 1
+        assert work.document.undo_label == APPLY_LABEL
+        # 断られた項目は途中まで付いていない 付いた数は付けた項目の分だけ
+        report = measure_direction(work.document.project, work.document.project.timeline)
+        counts = {k.kind.key: k.count for k in report.kinds}
+        assert counts[ZOOM] + counts[SHAKE] == len(items) - 1
 
     def test_items_whose_clip_went_away_are_skipped(self, work: FakeHost) -> None:
         # 1 つ付けられないだけで全部をやめると、外さなかった残りまで付かない
