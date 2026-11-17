@@ -792,6 +792,9 @@ AI_ONLY: dict[str, str] = {
     # （台帳はメニュー・右クリック・パネルのボタンだけ） 方針を変える道具は置かない
     "get_style_guide": READING,
     "check_style_guide": READING,
+    # 演出の密度（#470 段 1） 人は再生して目で見て、付けすぎ・足りないを感じ取る 型ごとの回数と
+    # 間隔を返す入口は画面に無い 読むだけ
+    "measure_direction": READING,
     "transcription_status": READING,
     "select_clip": _GESTURE,
     "select_clips": _GESTURE,
