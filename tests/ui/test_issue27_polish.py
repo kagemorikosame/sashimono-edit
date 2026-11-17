@@ -307,6 +307,19 @@ class TestDockTabs:
         window = shown_window
         assert _tab_positions(window) == {QTabBar.Shape.RoundedNorth}
 
+    def test_the_subtitle_list_follows_its_tab(self, shown_window: MainWindow) -> None:
+        # 壊れると、字幕のタブを表に出しても一覧が隠れていた間の古いまま残るか、裏のタブの
+        # ままでも選ぶたびに一覧を作り直して止まる（#455）
+        window = shown_window
+        window._pool_dock.raise_()
+        QApplication.processEvents()
+        assert not window._subtitles._shown
+        window._subtitles._stale = True
+        window._subtitle_dock.raise_()
+        QApplication.processEvents()
+        assert window._subtitles._shown
+        assert not window._subtitles._stale
+
     def test_the_preference_puts_them_back_at_the_bottom(self, shown_window: MainWindow) -> None:
         # 下が見慣れた人が戻せないと、設定がある意味が無い
         window = shown_window

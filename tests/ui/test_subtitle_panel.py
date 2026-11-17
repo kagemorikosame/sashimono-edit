@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, QItemSelectionModel
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
 from sashimono.core.commands import (
@@ -37,6 +37,7 @@ from sashimono.core.model import (
     Track,
     TrackKind,
     Transcript,
+    TranscriptSegment,
 )
 from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.effects.sources import TEXT
@@ -128,6 +129,186 @@ class TestListing:
         item = widget._table.item(0, 0)
         assert item is not None
         assert item.text() == "00:00:00:00"
+
+    def test_a_hidden_panel_rebuilds_when_shown(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、メディアの裏のタブにある字幕の一覧を、タイムラインで選び直すたびに作り直して
+        # 選ぶ操作が止まる（#455） 逆に見えたときに作り直さないと、前の時刻のまま残る
+        widget, _ = panel
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+        item = widget._table.item(0, 0)
+        assert item is not None and item.text() == "00:00:01:00", "隠れている間に作り直した"
+        widget.set_shown(True)
+        item = widget._table.item(0, 0)
+        assert item is not None and item.text() == "00:00:00:00"
+
+    def test_rows_are_read_from_the_current_media_while_hidden(
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        video_media: MediaItem,
+    ) -> None:
+        # 壊れると、隠れている間に残った前の一覧の行を、AI が人の選んだ字幕として受け取る
+        widget, _ = panel
+        widget._table.selectRow(1)
+        before = set(widget.selected_segments())
+        assert before
+        widget.set_shown(False)
+        fresh = Transcript(
+            segments=(TranscriptSegment(start=Fraction(1), end=Fraction(2), text="新しい"),)
+        )
+        widget.set_project(SetTranscript(video_media.id, fresh).apply(placed))
+        # 前の字幕の ID はもう一覧に無い 読む前に今の一覧へ合わせ、前の ID を返さない
+        assert not set(widget.selected_segments()) & before
+        widget._table.selectAll()
+        assert widget.selected_segments() == (fresh.segments[0].id,)
+
+    @pytest.mark.parametrize("shown_first", [False, True])
+    def test_the_chosen_rows_survive_catching_up(
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        shown_first: bool,
+    ) -> None:
+        # 壊れると、隠れている間に作品が変わっただけで、人が選んでいた字幕が AI から見えなくなる
+        # タブを表に出して追いついたときも同じ 先に AI が読んだかどうかで選択が変わらない
+        widget, _ = panel
+        model = widget._table.selectionModel()
+        adding = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        model.clearSelection()
+        for row in (1, 2):
+            model.select(widget._table.model().index(row, 0), adding)
+        chosen = widget.selected_segments()
+        assert len(chosen) == 2
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+        if shown_first:
+            widget.set_shown(True)
+        assert widget.selected_segments() == chosen
+
+    @pytest.mark.parametrize("shown_first", [False, True])
+    def test_the_playhead_row_is_chosen_again_after_catching_up(
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        shown_first: bool,
+    ) -> None:
+        # 壊れると、隠れている間に再生位置が動くと前の時刻の一覧で行を選び、追いついた後も
+        # 再生位置と違う字幕を AI やテキストの配置へ渡す
+        # 一覧は [30,90) [120,180) [210,270) 頭の 60 フレームを切ると [60,120) [150,210)
+        # 165 は前の一覧なら 2 本目、今の一覧なら 3 本目
+        widget, _ = panel
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 60),)).apply(placed))
+        widget.set_frame(165)
+        if shown_first:
+            widget.set_shown(True)
+        assert widget.selected_segments() == (widget._rows[2][0],)
+        assert widget._table.currentRow() == 2
+
+    @pytest.mark.parametrize("shown_first", [False, True])
+    def test_the_playhead_row_follows_when_only_the_playhead_moved(
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        shown_first: bool,
+    ) -> None:
+        # 壊れると、隠れている間に字幕も配置も変わらず再生位置だけが動いたとき、作り直しを
+        # 飛ばして前の位置の行が残り、AI やテキストの配置が前の字幕を受け取る
+        widget, _ = panel
+        widget.set_frame(45)
+        first = widget._rows[0][0]
+        assert widget.selected_segments() == (first,)
+        widget.set_shown(False)
+        widget.set_project(placed)
+        widget.set_frame(135)
+        if shown_first:
+            widget.set_shown(True)
+        assert widget.selected_segments() == (widget._rows[1][0],)
+        assert widget._table.currentRow() == 1
+
+    def test_a_row_chosen_by_hand_survives_its_own_seek(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、人が行を選んで再生位置がそこへ移ったとき、戻ってきた再生位置の選び直しが
+        # 人の選択を再生位置の選択と取り違え、隠れている間に再生位置が動くと別の字幕を渡す
+        widget, _ = panel
+        widget.seek_requested.connect(widget.set_frame)
+        widget._table.selectRow(1)
+        chosen = widget.selected_segments()
+        assert chosen == (widget._rows[1][0],)
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+        widget.set_frame(200)
+        assert widget.selected_segments() == chosen
+
+    def test_a_row_chosen_by_hand_survives_catching_up_twice(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、1 回目に追いついたときの作り直しの中で再生位置が人の選んだ行に入り、
+        # その行を再生位置の選択と覚え、2 回目に追いつくときに人の選択を捨てる
+        widget, _ = panel
+        widget.seek_requested.connect(widget.set_frame)
+        widget._table.selectRow(1)
+        chosen = widget.selected_segments()
+        assert chosen == (widget._rows[1][0],)
+        cut = RippleCut(((0, 30),)).apply(placed)
+        widget.set_shown(False)
+        widget.set_project(cut)
+        # 切った後も再生位置 120 は 2 本目の [90,150) に入る
+        assert widget.selected_segments() == chosen
+        widget.set_project(cut)
+        widget.set_frame(200)
+        assert widget.selected_segments() == chosen
+
+    def test_the_current_row_survives_catching_up(
+        self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project
+    ) -> None:
+        # 壊れると、追いついた後の今の行が作り直しの中で選んだ行のまま残り、再生位置がその行の
+        # 中で動いても選び替えず、再生位置と違う字幕が選ばれたまま残る
+        widget, _ = panel
+        model = widget._table.selectionModel()
+        adding = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        model.clearSelection()
+        for row in (1, 2):
+            model.select(widget._table.model().index(row, 0), adding)
+        model.setCurrentIndex(
+            widget._table.model().index(2, 0), QItemSelectionModel.SelectionFlag.NoUpdate
+        )
+        chosen = widget.selected_segments()
+        widget.set_shown(False)
+        # 頭を 30 フレーム切ると 1 本目が [0,60) になり、作り直しの中で再生位置 0 の行を選ぶ
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+        assert widget.selected_segments() == chosen
+        assert widget._table.currentRow() == 2
+        widget.set_frame(10)
+        assert widget.selected_segments() == (widget._rows[0][0],)
+
+    def test_a_failed_rebuild_is_tried_again(
+        self,
+        panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]],
+        placed: Project,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 壊れると、作り直しの途中で落ちたのに追いついた扱いになり、半端な一覧が残り続ける
+        widget, _ = panel
+        widget.set_shown(False)
+        widget.set_project(RippleCut(((0, 30),)).apply(placed))
+
+        def broken(_media: MediaItem) -> dict[object, tuple[int, int]]:
+            raise RuntimeError("途中で落ちた")
+
+        monkeypatch.setattr(widget, "_placement", broken)
+        with pytest.raises(RuntimeError):
+            widget.set_shown(True)
+        assert widget._stale
+        monkeypatch.undo()
+        widget.set_shown(True)
+        assert not widget._stale
+        item = widget._table.item(0, 0)
+        assert item is not None and item.text() == "00:00:00:00"
 
     def test_subtitles_outside_the_timeline_are_marked(
         self, panel: tuple[SubtitlePanel, list[tuple[list[Command], str]]], placed: Project

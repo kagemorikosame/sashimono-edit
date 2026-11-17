@@ -619,13 +619,110 @@ def _same_sound(
             new = copied.read_seconds(moment, length)
             if old.shape != new.shape:
                 return False
-            if old.size and float(np.max(np.abs(old - new))) > _SOUND_TOLERANCE:
+            # 解いた音がずれても、パケットが時刻も中身も元と同じなら写し漏れではない
+            # AAC の雑音の置き換え（PNS）は復号器の中の乱数で音を作り、乱数は解き始めた
+            # 所から進むので、同じパケットでも元と写しで違う音になる（-28 dB ほど）
+            # 実物の録画（音声 4 本の OBS）で 1 本がこれに当たり、3.1 GB の素材を範囲だけ
+            # 写せずにまるごと入れた（#455）
+            if (
+                old.size
+                and float(np.max(np.abs(old - new))) > _SOUND_TOLERANCE
+                and not _same_packets(source, target, index, moment, moment + length, cancelled)
+            ):
                 return False
         # 解けなかった所は読み手が無音で埋める 両方が無音なら同じに見えるので、解けなかったら
         # 確かめられなかったとして切り出さない（#449 の CodeRabbit の指摘）
         if original.decode_error is not None or copied.decode_error is not None:
             return False
     return True
+
+
+#: 1 つのパケットが持つ音の長さを読めないときに比べない印（:func:`_decoding_setup`）
+_UNKNOWN_LENGTH = Fraction(0)
+
+#: パケットが同じなら音の違いを認める符号 解き始めで音が変わる理由（PNS の乱数）が分かって
+#: いる物だけにする MP3 は前のパケットの残り（bit reservoir 最大 511 バイト）を引くので、比べる
+#: 窓の外の欠けを見落とす 理由の分からない符号の違いは写し漏れとして扱う（#475 の CodeRabbit）
+_PACKET_TRUSTED_CODECS = frozenset({"aac"})
+
+#: パケットの時刻・中身・付け足しの情報（区間の頭で飛ばす標本の数など 解いた音を変える）
+_PacketKey = tuple[Fraction, bytes, tuple[tuple[str, bytes], ...]]
+
+
+def _same_packets(
+    source: Path,
+    target: Path,
+    index: int,
+    start: Fraction,
+    end: Fraction,
+    cancelled: Callable[[], bool],
+) -> bool:
+    """道 ``index`` の、``start`` を含むパケットとその 1 つ前から ``end`` までが元と同じか
+
+    同じなら、解いた音の違いは復号器の中の状態（PNS の乱数）から来ていて、写し漏れではない
+    AAC は 1 つ前のパケットと重ね合わせて頭の音を作るので、その 1 つ前まで比べないと、
+    頭の手前が欠けて頭の音が変わった切り出しを、後ろが同じだけで認めてしまう
+    さかのぼる長さはパケット 2 つぶん 決め打ちにすると、1 パケットが長い形（8 kHz の AAC は
+    128 ms）で 1 つ前まで届かない 復号の設定（符号の名前・標本の速さ・チャンネル・頭の設定）も
+    比べる 設定が違えば同じパケットでも違う音になる
+    パケットの長さを読めない・1 つも無い・AAC でないときは確かめられなかったとして偽（まるごと入る）
+    区間の外を無音に置き換えた PCM（:func:`_hush`）は中身が変わるので偽になる
+    """
+    old_setup, length = _decoding_setup(source, index)
+    new_setup, _ = _decoding_setup(target, index)
+    if (
+        length == _UNKNOWN_LENGTH
+        or old_setup != new_setup
+        or old_setup[0] not in _PACKET_TRUSTED_CODECS
+    ):
+        return False
+    begin = start - 2 * length
+    old = _packets(source, index, begin, end, cancelled)
+    return bool(old) and old == _packets(target, index, begin, end, cancelled)
+
+
+def _decoding_setup(path: Path, index: int) -> tuple[tuple[object, ...], Fraction]:
+    """道 ``index`` の復号の設定と、1 つのパケットの音の長さ（秒 読めなければ 0）"""
+    with av.open(str(path)) as container:
+        stream = container.streams[index]
+        codec = stream.codec_context
+        # 音の道でなければ速さとチャンネルを持たない（0 にして、長さを読めない側へ倒す）
+        rate = int(getattr(codec, "sample_rate", 0) or 0)
+        size = int(getattr(codec, "frame_size", 0) or 0)
+        channels = int(getattr(codec, "channels", 0) or 0)
+        setup = (str(codec.name), rate, channels, bytes(codec.extradata or b""))
+        return setup, Fraction(size, rate) if size > 0 and rate > 0 else _UNKNOWN_LENGTH
+
+
+def _packets(
+    path: Path, index: int, start: Fraction, end: Fraction, cancelled: Callable[[], bool]
+) -> list[_PacketKey]:
+    """素材の原点から数えた ``[start, end]`` に表示の時刻があるパケット
+
+    時刻は原点から数える 入れ物によって原点の書き方が違い、生の時刻では同じパケットでも
+    食い違う 付け足しの情報も持つ 頭で飛ばす標本の数が違えば、同じ中身でも鳴る音が変わる
+    """
+    with av.open(str(path)) as container:
+        stream = container.streams[index]
+        origin = media_origin(container)
+        time_base = as_fraction(stream.time_base) if stream.time_base else Fraction(1, 1000)
+        # 索引の粗い入れ物でも手前に着くよう、1 秒前へ戻ってから読む
+        container.seek(max(0, int((origin + start - 1) / time_base)), stream=stream, backward=True)
+        found: list[_PacketKey] = []
+        for packet in container.demux(stream):
+            if cancelled():
+                raise Cancelled
+            shown = _seconds(packet)
+            if shown is None:
+                continue
+            if shown > origin + end:
+                break
+            if shown >= origin + start:
+                extra = tuple(
+                    sorted((str(side.data_type), bytes(side)) for side in packet.iter_sidedata())
+                )
+                found.append((shown - origin, bytes(packet), extra))
+        return found
 
 
 # --- 編集用の大きな形式を符号にし直す（#446） --------------------------------------

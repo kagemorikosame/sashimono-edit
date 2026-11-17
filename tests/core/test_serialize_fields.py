@@ -54,7 +54,13 @@ from sashimono.core.timebase import FrameRate
 
 #: 型の項目のうち、わざと保存に書かない物と、その理由
 #: 一覧に無いのに書いていない項目があれば落ちる 足すときは、書かないと何が起きるかを添える
-NOT_WRITTEN: dict[type, dict[str, str]] = {}
+NOT_WRITTEN: dict[type, dict[str, str]] = {
+    # 字幕を引く索引 読んだ字幕から作るときに求め直すので、書くと同じ物を 2 度持つ（#455）
+    Transcript: {
+        "_starts": "字幕の頭の並びから作る索引",
+        "_reach": "字幕の終わりの最大の並びから作る索引",
+    },
+}
 
 #: 型の項目ではないが書く鍵（ファイルの形式の名前と版）
 EXTRA_KEYS: dict[type, frozenset[str]] = {Project: frozenset({"format", "version"})}

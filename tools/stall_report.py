@@ -12,10 +12,11 @@ r"""画面の止まりの記録を数え、原因ごとに分ける（#455）
 分け方（上から順に当てはめる）
 
 - ごみ集め 止まりの間のごみ集めの合計が、止まりの半分以上
-- 設定パネル 画面のスレッドの並びに ``ui/inspector/`` がある
+- 設定パネル 画面のスレッドの並びでいちばん内側の画面の部品（``ui/``）が ``ui/inspector/``
 - 描画 画面のスレッドの並びに ``paintGL`` ``paintEvent`` か
   ``engine/render/`` ``engine/gpu/`` がある
-- タイムライン ``ui/timeline/`` がある（描画でない物 選ぶ・動かすの計算）
+- タイムライン いちばん内側の画面の部品が ``ui/timeline/``（描画でない物 選ぶ・動かすの計算）
+  選んだ知らせを受けたほかのパネル（字幕パネルの一覧など）は、その場所で「その他」に数える
 - 裏のスレッド 画面のスレッドが本体の処理の中にいない（イベントループで GIL を待っている）のに、
   ほかのスレッドが Python を動かしていた
 - その他 上のどれでもない 画面のスレッドのいちばん深い本体の場所で数える
@@ -190,7 +191,11 @@ def classify(stall: Stall) -> str:
     if not stall.threads:
         return UNSAMPLED
     main = _main_thread(stall)
-    if any(_inside(line, "ui/inspector/") for line in main):
+    # 画面の部品はいちばん内側の物で決める タイムラインで選ぶと、選択の知らせを受けた
+    # 字幕パネルが一覧を作り直す 外側の選んだ所で数えると、字幕パネルの重さがタイムラインに
+    # 付いて、どこを直すか読み違える（#455 の実プロジェクトで 19 回が字幕パネルだった）
+    panel = next((line for line in reversed(main) if _inside(line, "ui/")), None)
+    if panel is not None and _inside(panel, "ui/inspector/"):
         return INSPECTOR
     if any(
         _function(line) in ("paintGL", "paintEvent")
@@ -198,7 +203,7 @@ def classify(stall: Stall) -> str:
         for line in main
     ):
         return PAINT
-    if any(_inside(line, "ui/timeline/") for line in main):
+    if panel is not None and _inside(panel, "ui/timeline/"):
         return TIMELINE
     inside = [line for line in main if _ours(line) and _file(line) not in _LOOP]
     if not inside and busy_threads(stall):
