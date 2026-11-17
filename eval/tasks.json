@@ -7,10 +7,10 @@
  },
  "materials": [
   {"id": "E04", "tasks": ["silence", "subtitles", "export", "groups"]},
-  {"id": "E05", "tasks": ["silence", "talk", "subtitles", "highlights", "groups"]},
+  {"id": "E05", "tasks": ["silence", "talk", "subtitles", "highlights", "groups", "direction"]},
   {"id": "E09", "tasks": ["silence", "scenes", "export", "seams"]},
   {"id": "E11", "tasks": ["scenes"]},
-  {"id": "E12", "tasks": ["highlights", "fillers"]},
-  {"id": "E13", "tasks": ["highlights", "fillers"]}
+  {"id": "E12", "tasks": ["highlights", "fillers", "direction"]},
+  {"id": "E13", "tasks": ["highlights", "fillers", "direction"]}
  ]
 }
