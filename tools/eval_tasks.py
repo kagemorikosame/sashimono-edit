@@ -811,7 +811,10 @@ def seam_exports(
             plan = plan_smoothing(
                 document.project, frames, style, seam_transition(style), SeamScope(jumps_only=True)
             )
-            metrics[f"handled_{video}"] = len(plan.handled)
+            # 音のフェードだけ付いて映像の処理を断られたつなぎ目は、処理した側にも入って来る
+            # 両方に数えると、処理できた数が断られた分だけ多く見える 断られた物は外す
+            refused = {frame for frame, _reason in plan.skipped}
+            metrics[f"handled_{video}"] = len(set(plan.handled) - refused)
             metrics[f"skipped_{video}"] = len(plan.skipped)
             final = outputs / f"{material}_seams_{video}.mp4"
             partial = outputs / f"{material}_seams_{video}.partial.mp4"
@@ -869,8 +872,15 @@ def _publish_set(written: list[tuple[Path, Path]]) -> None:
                 f"（開いているアプリを閉じて、名前から .previous を外せば戻る）"
             )
         raise
+    # 3 本はもう本人が開く名前に揃っている 退避した物を消せなくても書き出しは済んでいるので、
+    # 失敗にせず残して知らせる 失敗にすると、その回の数と値が結果に残らない
     for backup, _final in backups:
-        backup.unlink(missing_ok=True)
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            print(
+                f"前の回の書き出しを消せなかったので {backup.name} を残した（要らなければ手で消す）"
+            )
 
 
 # --- グループを保つ（#437） ---

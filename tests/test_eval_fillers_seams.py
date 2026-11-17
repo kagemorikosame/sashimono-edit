@@ -307,6 +307,61 @@ def test_a_failed_restore_does_not_stop_the_rest(
     assert ".previous を外せば戻る" in shown
 
 
+def test_a_refused_seam_is_not_counted_as_handled(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """音のフェードだけ付いて映像の処理を断られたつなぎ目
+
+    壊れると、処理できた数と断られた数の両方に入り、処理できた数が多く見える
+    """
+    import dataclasses
+
+    from sashimono.core import seams
+
+    real = seams.plan_smoothing
+
+    def refusing(*args: Any, **kwargs: Any) -> Any:
+        plan = real(*args, **kwargs)
+        refused = tuple((frame, "クリップが短い") for frame in plan.handled)
+        return dataclasses.replace(plan, skipped=plan.skipped + refused)
+
+    monkeypatch.setattr(seams, "plan_smoothing", refusing)
+    tool, eval_dir, book = folder
+    record, _written = _seam_run(tool, eval_dir, book, tmp_path, "E03")
+    metrics = record["metrics"]
+    assert (metrics["handled_crossfade"], metrics["skipped_crossfade"]) == (0, 1)
+    assert (metrics["handled_zoom"], metrics["skipped_zoom"]) == (0, 1)
+
+
+def test_a_backup_left_behind_does_not_fail_the_run(
+    folder: tuple[ModuleType, Any, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """3 本を付け替えた後に、退避した前の回の物を消せなかった
+
+    壊れると、書き出しは済んだのに失敗と記録され、その回の数と値が結果に残らない
+    """
+    tool, eval_dir, book = folder
+    eval_dir.exports.mkdir(parents=True, exist_ok=True)
+    (eval_dir.exports / "E03_seams_none.mp4").write_bytes(b"old")
+    real_unlink = Path.unlink
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.name.endswith(".previous.mp4"):
+            raise PermissionError("開いたままの書き出しは消せない")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    record, _written = _seam_run(tool, eval_dir, book, tmp_path, "E03")
+    assert record["metrics"]["seams"] == 1
+    assert record["params"]["keep_speech"] is False
+    assert (eval_dir.exports / "E03_seams_none.mp4").read_bytes() == b""
+    assert (eval_dir.exports / "E03_seams_none.previous.mp4").read_bytes() == b"old"
+    assert "E03_seams_none.previous.mp4" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("bad", [-0.5, float("nan")])
 def test_a_broken_tolerance_is_refused(tool: ModuleType, tmp_path: Path, bad: float) -> None:
     """負か有限でない許す幅 壊れると、当たりを 1 つも数えない誤った f1 が ok のまま残る"""
