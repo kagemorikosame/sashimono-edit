@@ -302,6 +302,14 @@ def build_items(
                 # 音を途中で切ると笑いや驚きの音として聞こえないので、切り詰めずに外す
                 dropped.append((where, "効果音が範囲の終わりを越えます"))
                 continue
+            if any(
+                e.kind == plan.kind and e.start_frame < end and start < e.end_frame
+                for e in existing
+            ):
+                # 前に付けた効果音や人が置いた効果音と重ねると、同じ音が二重に鳴って大きくなる
+                # 計画を出し直すたびに増えないよう、寄る・揺らすと同じく上書きせず外す
+                dropped.append((where, "その時刻にはもう効果音があるので重ねません"))
+                continue
             clip_id: ClipId | None = None
             media_id: MediaId | None = sound.id
         else:

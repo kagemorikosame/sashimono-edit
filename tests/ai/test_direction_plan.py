@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from sashimono.ai import direction_plan
+from sashimono.ai import direction_plan, operations
 from sashimono.ai.direction_plan import (
     APPLY_LABEL,
     SOUND_TRACK_NAME,
@@ -28,6 +28,7 @@ from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddMedia, Command, RemoveClip, history
 from sashimono.core.direction import SHAKE, SOUND, ZOOM, measure_direction
 from sashimono.core.direction_recipes import ACTION_ZOOM, BOLD, DirectionTaste, PlannedDirection
+from sashimono.core.io.serialize import json_text
 from sashimono.core.model import (
     AudioStreamInfo,
     Clip,
@@ -73,6 +74,11 @@ class _Refused(Command):
 
     def apply(self, project: Project) -> Project:
         raise ValueError("この命令は通りません")
+
+
+def _without_ids(project: Project) -> list[tuple[str, object]]:
+    clip = project.timeline.tracks[0].clips[0]
+    return [(effect.kind, effect.params) for effect in clip.effects]
 
 
 def _cues(host: FakeHost) -> list[dict[str, Any]]:
@@ -202,24 +208,28 @@ class TestPropose:
         assert dropped == []
         assert [(i.start_frame, i.end_frame) for i in items] == [(4, 34), (301, 331)]
 
-    def test_long_plans_come_in_pages(self, work: FakeHost) -> None:
+    def test_long_plans_come_in_pages(
+        self, work: FakeHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # 項目が多いと、一覧だけで返事の上限を越えて打ち切られ、後半を読めない
+        # 上限を小さくして、件数を指定しなくても上限で切れ、続きを最後まで読める所を作る
+        monkeypatch.setattr(operations, "MAX_RESULT_CHARS", 1500)
         sound = _sound(1)
         work.document.execute(AddMedia(sound))
-        first = run(
-            work,
-            "propose_direction",
-            cues=_cues(work),
-            sound_media_id=str(sound.id),
-        )
-        total = first["total"]
+        page = run(work, "propose_direction", cues=_cues(work), sound_media_id=str(sound.id))
         view = proposal_for(work.document).view()
         assert view is not None
-        assert total == len(view.items) > 2
-        page = run(work, "get_direction_plan", offset=1, limit=2)
-        assert [row["number"] for row in page["items"]] == [2, 3]
-        assert page["next_offset"] == 3 or total == 3
-        assert page["state"] == "proposed" and "dropped" in page
+        total = len(view.items)
+        assert page["total"] == total and "next_offset" in page
+        numbers: list[int] = []
+        while True:
+            assert len(json_text(page)) <= 1500
+            assert page["state"] == "proposed" and "dropped" in page
+            numbers += [row["number"] for row in page["items"]]
+            if "next_offset" not in page:
+                break
+            page = run(work, "get_direction_plan", offset=page["next_offset"])
+        assert numbers == list(range(1, total + 1))
 
     def test_refuses_while_a_scene_is_open(self, work: FakeHost) -> None:
         # シーンの時刻とクリップで計画しても、〔付ける〕はメインへ当たり、別の素材へ寄る
@@ -253,6 +263,33 @@ class TestApply:
         state = run(work, "get_direction_plan")
         assert state["state"] == "applied"
         assert state["applied"] == list(result.applied)
+        # 付けた後は AI が段 1 の道具と絵と書き出しの検査で確かめ、方針の外ややりすぎを直す
+        for tool in ("measure_direction", "preview_range", "check_output"):
+            assert tool in state["note"]
+
+    def test_moves_are_the_same_as_emphasize(self, work: FakeHost) -> None:
+        # 計画で付けた寄りは emphasize と同じ命令で付く 別の作り方をすると、書き出しで
+        # 今までの道を通らない動きが混ざる
+        before = work.document.project
+        items = run(work, "propose_direction", cues=_cues(work))["items"]
+        proposal = proposal_for(work.document)
+        zoom = next(row for row in items if row["kind"] == ZOOM)
+        for row in items:
+            proposal.exclude(row["number"], row["number"] != zoom["number"])
+        proposal.apply(work.document)
+        clip = before.timeline.tracks[0].clips[0]
+        request = EmphasisRequest(
+            kind=ZOOM,
+            start=zoom["start_frame"],
+            end=zoom["end_frame"],
+            strength=float(zoom["amount"]),
+        )
+        commands, _ = emphasis_commands(clip, request, RATE_30)
+        expected = before
+        for command in commands:
+            expected = command.apply(expected)
+        # 効果の ID は付けるたびに新しく振られるので、比べるのは中身
+        assert _without_ids(work.document.project) == _without_ids(expected)
 
     def test_puts_sound_effects_on_their_own_track(self, work: FakeHost) -> None:
         # 本人の音声トラックへ混ぜると BGM やナレーションと重なる 効果音のトラックへ置く
@@ -271,6 +308,17 @@ class TestApply:
         assert len(tracks[0].clips) == len(sounds)
         report = measure_direction(project, project.timeline)
         assert next(k for k in report.kinds if k.kind.key == SOUND).count == len(sounds)
+
+    def test_sounds_are_not_planned_twice(self, work: FakeHost) -> None:
+        # 付けた後に同じ頼みで計画し直すと、同じ時刻の効果音が二重に鳴って大きくなる
+        sound = _sound(1)
+        work.document.execute(AddMedia(sound))
+        run(work, "propose_direction", cues=_cues(work), sound_media_id=str(sound.id))
+        first = proposal_for(work.document).apply(work.document)
+        assert first is not None and first.applied
+        again = run(work, "propose_direction", cues=_cues(work), sound_media_id=str(sound.id))
+        assert SOUND not in [row["kind"] for row in again["items"]]
+        assert any("もう効果音" in row["reason"] for row in again["dropped"])
 
     def test_sounds_stay_inside_the_range(self, work: FakeHost) -> None:
         # 範囲の終わりを越えて置くと作品が延び、書き出しに絵の無い末尾が付く
