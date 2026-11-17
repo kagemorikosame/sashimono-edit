@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import itertools
 import statistics
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
@@ -34,6 +33,8 @@ from sashimono.core.direction import (
     TRANSITION,
     ZOOM,
     DirectionReport,
+    cut_lengths,
+    direction_events,
     measure_direction,
 )
 from sashimono.core.io.serialize import load_project
@@ -123,14 +124,16 @@ def _shot_seconds(report: DirectionReport, project: Project) -> tuple[float, flo
 
     中央だけだと、短く詰める癖と長く見せる癖の幅が分からない
     """
-    cut = next(k for k in report.kinds if k.kind.key == CUT)
-    if cut.median_gap_seconds is None:
+    # 測る道具と同じ数え方で長さを出す 別に数えると、映像の後ろに音だけが続く作品で最後の
+    # カットを音の終わりまでの長さと読み、方針のテンポが本人の作品より長くなる
+    every = direction_events(project, project.timeline)
+    cuts = [e for e in every if e.kind == CUT]
+    spans = cut_lengths(cuts, report.start_frame, report.end_frame)
+    if not spans:
         # 絵の無い作品 カットの長さを書くと、無いカットの長さを方針に入れる
         return None
-    starts = sorted({e.start_frame for e in report.events if e.kind == CUT})
-    bounds = [report.start_frame, *starts, report.end_frame]
     rate = project.timeline.rate
-    lengths = [float(frame_to_seconds(b - a, rate)) for a, b in itertools.pairwise(bounds)]
+    lengths = [float(frame_to_seconds(shown, rate)) for _, _, shown in spans]
     if len(lengths) == 1:
         return lengths[0], lengths[0], lengths[0]
     low, middle, high = statistics.quantiles(lengths, n=4, method="inclusive")

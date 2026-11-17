@@ -245,8 +245,16 @@ class StyleGuideDialog(QDialog):
         """
         try:
             guide = draft_guide(read_habits(path))
-        except (ProjectFileError, ValueError) as exc:
-            # 落とすと窓ごと閉じて、書きかけの方針が消える
+        except ProjectFileError:
+            # 読めない理由の文にはファイルの場所や中の値が入る 窓の写しを人へ見せたときに作品の
+            # 名前が出ないよう、場所を伏せた理由だけを出す 落とすと窓ごと閉じて書きかけが消える
+            self._show_note(
+                "下書きを作れませんでした: 作品のファイルを読めません"
+                "（壊れているか、この版で読めない形です）"
+            )
+            return False
+        except ValueError as exc:
+            # 空の作品など、測る側が理由を書いた物 文に場所は入らない
             self._show_note(f"下書きを作れませんでした: {exc}")
             return False
         self.set_fields(

@@ -120,6 +120,14 @@ class TestHabits:
         )
         assert (look.count, look.total) == (2, 2)
 
+    def test_shot_lengths_stop_where_the_picture_ends(self, work: Project) -> None:
+        # 映像の後ろに文字だけが続く作品で最後のカットを作品の終わりまでと読むと、方針のテンポが
+        # 本人の作品より長くなる
+        late = Track(kind=TrackKind.VIDEO, name="後", clips=(_text(3570, "見出しの書体", _WHITE),))
+        tracks = (*work.timeline.tracks, late)
+        longer = work.with_timeline(replace(work.timeline, tracks=tracks))
+        assert measure_habits(longer).shot_seconds == pytest.approx((10, 10, 15))
+
     def test_scenes_count_for_styles(self, work: Project) -> None:
         # シーンの中のテロップの書体を数えないと、確定した方針で照らしたときにシーンの中が外れる
         scene = new_scene(work, "オープニング")

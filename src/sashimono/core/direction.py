@@ -27,6 +27,7 @@ from fractions import Fraction
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
+    Effect,
     ParamValue,
     Project,
     Timeline,
@@ -53,6 +54,7 @@ __all__ = [
     "DirectionKind",
     "DirectionReport",
     "KindDensity",
+    "cut_lengths",
     "direction_events",
     "measure_direction",
 ]
@@ -331,8 +333,11 @@ def _zoom_events(track: Track, clip: Clip) -> Iterator[DirectionEvent]:
         yield _event(ZOOM, track, clip, *span, strength, pan_only=strength is None)
 
 
-def _shake_events(track: Track, clip: Clip) -> Iterator[DirectionEvent]:
-    for effect in clip.effects:
+def _shake_events(
+    track: Track, clip: Clip, effects: Sequence[Effect] | None = None
+) -> Iterator[DirectionEvent]:
+    """``effects`` を省けばクリップのエフェクト 場面切り替えは前と後の場面の両方を渡す"""
+    for effect in clip.effects if effects is None else effects:
         if effect.kind != SHAKE_EFFECT_KIND or not effect.enabled:
             continue
         # 固定の幅の軸も線として一緒に見る 動く軸だけを見ると、横は 8px でずっと揺れているのに
@@ -380,8 +385,11 @@ def _is_sound_effect(project: Project, track: Track, clip: Clip, rate: FrameRate
     return frame_to_seconds(clip.duration, rate) <= SOUND_EFFECT_MAX_SECONDS
 
 
-def _has_color(clip: Clip, color_kinds: frozenset[str]) -> bool:
-    return any(e.enabled and not e.fixed and e.kind in color_kinds for e in clip.effects)
+def _has_color(
+    clip: Clip, color_kinds: frozenset[str], effects: Sequence[Effect] | None = None
+) -> bool:
+    chosen = clip.effects if effects is None else effects
+    return any(e.enabled and not e.fixed and e.kind in color_kinds for e in chosen)
 
 
 def direction_events(
@@ -423,6 +431,12 @@ def direction_events(
             if kind == _TRANSITION_KIND:
                 seconds = float(frame_to_seconds(clip.duration, rate))
                 found.append(_event(TRANSITION, track, clip, 0, clip.duration, seconds))
+                # 描画は前の場面に effects、後の場面に after_effects を掛ける 切り替えだけを
+                # 数えると、切り替えに積んだ色や揺れが回数から落ちる
+                sides = (*clip.effects, *clip.after_effects)
+                if _has_color(clip, colors, sides):
+                    found.append(_event(COLOR, track, clip, 0, clip.duration))
+                found.extend(_shake_events(track, clip, sides))
                 continue
             if kind == _TEXT_KIND:
                 # テロップに掛けた色も色に数える 先に抜けると、色を整えたテロップの色が 0 回に
@@ -464,19 +478,19 @@ def _density(
     starts = [e.start_frame for e in events]
     count = len(events)
     if kind.key == CUT:
-        # カットの長さは、範囲の頭・各カットの頭・範囲の終わりの間 最後のカットも長さに入れる
-        # 絵が 1 本も無い範囲（音だけ）では測らない 測ると、無いカットを短すぎると返す
-        bounds = [start, *starts, end] if overlapping else []
-        pairs = [(a, b) for a, b in itertools.pairwise(bounds) if b > a]
+        spans = cut_lengths(overlapping, start, end)
+        pairs = [(a, b) for a, b, _ in spans]
+        gaps = [shown for _, _, shown in spans]
     else:
         pairs = list(itertools.pairwise(starts))
-    gap_seconds = [_seconds(b - a, rate) for a, b in pairs]
+        gaps = [b - a for a, b in pairs]
+    gap_seconds = [_seconds(gap, rate) for gap in gaps]
     close: list[CloseCall] = []
     if limit is not None:
         close = [
-            CloseCall(a, b, round(_seconds(b - a, rate), 3))
-            for a, b in pairs
-            if _seconds(b - a, rate) < limit
+            CloseCall(a, b, round(seconds, 3))
+            for (a, b), seconds in zip(pairs, gap_seconds, strict=True)
+            if seconds < limit
         ]
     strengths = [e.strength for e in events if e.strength is not None]
     coverage = None
@@ -497,6 +511,23 @@ def _density(
         limit_seconds=limit,
         coverage=round(coverage, 3) if coverage is not None else None,
     )
+
+
+def cut_lengths(cuts: Sequence[DirectionEvent], start: int, end: int) -> list[tuple[int, int, int]]:
+    """カットごとの（頭・次の頭・絵が映るフレームの数） ``cuts`` は絵のクリップの出来事
+
+    カットの長さは、範囲の頭・各カットの頭・範囲の終わりの間のうち、絵が映る長さ
+    頭の間をそのまま長さにすると、映像の後ろに音だけが続く作品の最後のカットを、音の終わりまでの
+    長さと読む 絵の無い間（音だけ・空き）は長さに入れず、絵が 1 フレームも無い間は外す
+    絵が 1 本も無い範囲では空を返す 測ると、無いカットを短すぎると返す
+    """
+    heads = sorted({c.start_frame for c in cuts if start < c.start_frame < end})
+    spans: list[tuple[int, int, int]] = []
+    for left, right in itertools.pairwise([start, *heads, end]):
+        shown = _covered(cuts, left, right)
+        if shown > 0:
+            spans.append((left, right, shown))
+    return spans
 
 
 def _covered(events: Sequence[DirectionEvent], start: int, end: int) -> int:

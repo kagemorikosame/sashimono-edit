@@ -257,6 +257,9 @@ class TestDraft:
         assert not dialog.load_draft(broken)
         assert dialog.guide() == GUIDE
         assert "作れませんでした" in dialog.draft_note
+        # 窓の写しを人へ見せたときに作品の名前が出ないよう、場所は書かない
+        assert "壊れた" not in dialog.draft_note
+        assert str(tmp_path) not in dialog.draft_note
         dialog.deleteLater()
 
     def test_the_button_asks_for_a_work(
