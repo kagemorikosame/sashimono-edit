@@ -37,7 +37,7 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from fractions import Fraction
@@ -88,9 +88,15 @@ HIGHLIGHTS = "highlights"
 #: グループを保ったままカットする（#437） 正解は持たず、カットの後にグループが残ったかと、
 #: AI の段では ``ungroup_clips`` を呼んだ・尋ねた回数を数える
 GROUPS = "groups"
-TASKS = (SILENCE, TALK, SCENES, SUBTITLES, EXPORT, HIGHLIGHTS, GROUPS)
+#: 言いよどみを見つける（#414） 正解は言いよどみの頭の時刻 ``cut_fillers`` と同じ探し方の頭と比べる
+FILLERS = "fillers"
+#: 定点の映像のつなぎ目（#414） 正解は持たず、無音を詰めたつなぎ目を処理の仕方ごとに書き出して
+#: 人が見比べる 跳びが隠れたかは見た目の判断で、絵の差の数では測れない（寄りは差が大きく出るのに
+#: 跳びは隠れる）
+SEAMS = "seams"
+TASKS = (SILENCE, TALK, SCENES, SUBTITLES, EXPORT, HIGHLIGHTS, GROUPS, FILLERS, SEAMS)
 #: 正解を持つ課題 下書きと取り込みはこれだけ
-ANSWERED = (SILENCE, TALK, SCENES, SUBTITLES, HIGHLIGHTS)
+ANSWERED = (SILENCE, TALK, SCENES, SUBTITLES, HIGHLIGHTS, FILLERS)
 #: 道具の下書きを仮の正解にせず、人が素材の全体を見て一から付ける課題（#345 の決まり）
 #: 下書きから直すと、直し忘れがそのまま正解になって正解が道具の癖に寄る
 BLANK_SHEETS = (SCENES, HIGHLIGHTS)
@@ -191,6 +197,8 @@ class Tolerances:
     talk_seconds: float = 1.0
     #: 字幕の切れ目（秒）
     subtitle_seconds: float = 0.5
+    #: 言いよどみの頭（秒） 人が聞いて置く目印は語の頭から少しずれるので、語 1 つ分ほどを許す
+    filler_seconds: float = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,7 +233,14 @@ def load_tasks(path: Path = TASKS_FILE) -> TaskBook:
         scene_frames=int(raw.get("scene_frames", default.scene_frames)),
         talk_seconds=float(raw.get("talk_seconds", default.talk_seconds)),
         subtitle_seconds=float(raw.get("subtitle_seconds", default.subtitle_seconds)),
+        filler_seconds=float(raw.get("filler_seconds", default.filler_seconds)),
     )
+    # 負の幅や有限でない幅は、組む窓が逆さか空になって当たりを 1 つも数えず、誤った f1 が ok の
+    # まま残る 読む所で止める
+    for name in ("scene_frames", "talk_seconds", "subtitle_seconds", "filler_seconds"):
+        value = getattr(tolerances, name)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"tolerances の {name} は 0 以上の有限の数にする: {value!r}")
     materials: list[Material] = []
     for entry in data.get("materials", []):
         identifier = str(entry.get("id", ""))
@@ -404,7 +419,7 @@ class ToolParams:
         min_scene = DEFAULT_MIN_SCENE if self.min_scene is None else self.min_scene
         return threshold, min_scene
 
-    def record(self, task: str) -> dict[str, float | str]:
+    def record(self, task: str) -> dict[str, float | str | bool]:
         """結果の行に残す値 課題に関係する物だけ"""
         if task == SILENCE:
             return {
@@ -415,13 +430,29 @@ class ToolParams:
         if task == SCENES:
             threshold, min_scene = self.scene_values
             return {"threshold": threshold, "min_scene": min_scene}
-        if task == SUBTITLES:
+        if task in (SUBTITLES, FILLERS):
             from sashimono.asr.backend import DEFAULT_MODEL
 
             if self.asr_model is None:
                 return {"model": DEFAULT_MODEL}
             # 手元の置き場は場所を伏せて印だけ書く 書くと本人のフォルダ名が公開の結果に載る
             return {"model": LOCAL_MODEL if _is_local_model(self.asr_model) else self.asr_model}
+        if task == SEAMS:
+            from sashimono.core.seams import (
+                DEFAULT_SEAM_AUDIO_FADE_MS,
+                DEFAULT_SEAM_CROSSFADE_MS,
+                DEFAULT_SEAM_ZOOM_PERCENT,
+            )
+
+            # 書き出しを変える値はすべて残す 残さないと、後で既定を変えたときに前の 3 本が
+            # どの値で作られたか分からない 字幕で話を守らない（作品に字幕が無い）ことも書く
+            return {
+                **self.record(SILENCE),
+                "keep_speech": False,
+                "crossfade_ms": DEFAULT_SEAM_CROSSFADE_MS,
+                "zoom_percent": DEFAULT_SEAM_ZOOM_PERCENT,
+                "audio_fade_ms": DEFAULT_SEAM_AUDIO_FADE_MS,
+            }
         return {}
 
 
@@ -533,6 +564,36 @@ def transcribe_with_app(path: Path, params: ToolParams) -> Transcript | None:
     )
     transcript = backend.transcribe(path, options)
     return None if transcript is None else clean_transcript(transcript)
+
+
+def transcribe_words_with_app(path: Path, params: ToolParams) -> Transcript | None:
+    """アプリの字幕起こしと同じ形で、語の時刻を付けて起こす 整形は掛けない
+
+    言いよどみを探す道具（``cut_fillers``）は語の時刻を読む アプリは起こしたままの字幕を作品に
+    置き、整形は本人が頼んだときだけ掛ける 整形を掛けると「えーと」だけの行が丸ごと落ち、
+    その語の時刻も消えるので、道具が見る物より少ない言いよどみで数えることになる
+    """
+    from sashimono.asr import TranscribeOptions, activate_runtime
+    from sashimono.asr import default_backend as asr_backend
+
+    activate_runtime()
+    load_app_runtime()
+    backend = asr_backend()
+    if not backend.is_available():
+        return None
+    options = (
+        TranscribeOptions(word_timestamps=True)
+        if params.asr_model is None
+        else TranscribeOptions(model=params.asr_model, word_timestamps=True)
+    )
+    return backend.transcribe(path, options)
+
+
+def filler_points(transcript: Transcript | None) -> list[float]:
+    """言いよどみの頭（素材の秒） ``cut_fillers`` と同じ語の一覧と同じ探し方"""
+    from sashimono.core.fillers import filler_spans
+
+    return [round(float(span.start), 3) for span in filler_spans(transcript)]
 
 
 def app_runtime_dir() -> Path:
@@ -681,6 +742,165 @@ def export_and_check(
     for kind in KINDS:
         metrics[f"count_{kind}"] = counts.get(kind, 0)
     return metrics
+
+
+# --- 定点の映像のつなぎ目（#414 の 5） ---
+
+#: つなぎ目を処理した作品を書き出す物 試験では GPU の無い CI でも回るよう偽物に差し替えられる
+type SeamExporter = Callable[[Project, Path], None]
+
+
+def export_plain(project: Project, output: Path) -> None:
+    """作品をそのまま書き出す 字幕も検査も無し（人が見比べるための物）"""
+    from sashimono.engine.encode.exporter import ExportSettings, export_project
+
+    _application()
+    export_project(project, ExportSettings(path=output))
+
+
+def seam_exports(
+    path: Path, params: ToolParams, outputs: Path, material: str, exporter: SeamExporter
+) -> dict[str, float | int | None]:
+    """無音を詰めたつなぎ目を、映像の処理の仕方ごとに書き出す（``jet_cut`` の ``smooth`` と同じ形）
+
+    処理の仕方は設定画面で選べる 3 通り（何もしない・クロスフェード・寄り） 長さと寄りの割合と
+    音のフェードは既定のまま 跳びが隠れたかは人が見比べる 数えるのは、つなぎ目の数と処理できた数と
+    書き出しの秒 処理できなかった数が増えたら、短いクリップで断られる所が増えたと読める
+
+    作品には字幕を付けないので、``jet_cut`` の字幕で話を守る所（``keep_speech``）は効かない 字幕の
+    無い素材に ``jet_cut`` を掛けたのと同じ詰め方で、結果の行にもそう書く
+    3 本は書き終えてから名前を付け替える 途中で落ちたときに、前の回の書き出しと混ざって残らない
+    付け替えの途中で落ちたときも、前の回の 3 本へ戻す（:func:`_publish_set`）
+    """
+    from sashimono.core.seams import (
+        SEAM_VIDEOS,
+        SeamScope,
+        SeamStyle,
+        plan_smoothing,
+        seams_after_cuts,
+    )
+    from sashimono.effects.seams import seam_transition
+    from sashimono.engine.decode.probe import probe_media
+
+    media = probe_media(path)
+    document = _project_for(media, f"{material} seams")
+    silences = [
+        (Fraction(a).limit_denominator(1000), Fraction(b).limit_denominator(1000))
+        for a, b in find_silences(path, params)
+    ]
+    ranges = plan_cuts(document.project, media.id, silences)
+    if ranges:
+        document.execute(RippleCut(ranges))
+    rate = document.project.rate
+    # 末尾の無音を削った所は作品の終わりで、後ろに絵が続かないのでつなぎ目ではない 数えると
+    # つなぎ目の数が増え、処理した数とも食い違う
+    frames = tuple(frame for frame in seams_after_cuts(ranges) if frame < document.project.duration)
+    metrics: dict[str, float | int | None] = {
+        "seams": len(frames),
+        "removed_seconds": round(
+            float(sum(end - start for start, end in ranges) * rate.frame_duration), 2
+        ),
+    }
+    outputs.mkdir(parents=True, exist_ok=True)
+    written: list[tuple[Path, Path]] = []
+    try:
+        for video in SEAM_VIDEOS:
+            style = SeamStyle(video=video)
+            # 詰めてできたつなぎ目（同じ素材を飛び飛びにつないだ対）だけ ``jet_cut`` と同じ決まり
+            plan = plan_smoothing(
+                document.project, frames, style, seam_transition(style), SeamScope(jumps_only=True)
+            )
+            # 音のフェードだけ付いて映像の処理を断られたつなぎ目は、処理した側にも入って来る
+            # 両方に数えると、処理できた数が断られた分だけ多く見える 断られた物は外す
+            refused = {frame for frame, _reason in plan.skipped}
+            metrics[f"handled_{video}"] = len(set(plan.handled) - refused)
+            metrics[f"skipped_{video}"] = len(plan.skipped)
+            final = outputs / f"{material}_seams_{video}.mp4"
+            partial = outputs / f"{material}_seams_{video}.partial.mp4"
+            # 書き出す前に覚える 書き出しの途中で落ちた半端な物も、下の後始末で消える
+            written.append((partial, final))
+            began = time.perf_counter()
+            exporter(plan.project, partial)
+            metrics[f"export_seconds_{video}"] = round(time.perf_counter() - began, 2)
+    except BaseException:
+        _discard(partial for partial, _final in written)
+        raise
+    _publish_set(written)
+    return metrics
+
+
+def _discard(paths: Iterable[Path]) -> None:
+    """今回書いた物を 1 本ずつ消す 消せなかった物は名前を出して残し、残りを続ける
+
+    後始末は落ちた後に走るので、ここで止まると元の失敗が消せなかった失敗に置き換わり、
+    残りの物も試されずに残る 開いたままの書き出しへのアクセス拒否は ``missing_ok`` では避けられない
+    """
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            print(f"今回の書き出しを消せなかったので {path.name} を残した（要らなければ手で消す）")
+
+
+def _backup_name(final: Path) -> Path:
+    """前の回の物の退避先 前に戻せずに残った退避と重ならない名前を選ぶ
+
+    同じ名前に退避すると、前に戻せなかった前々回の物を上書きし、今回も落ちたときに戻す物が無くなる
+    """
+    backup = final.with_name(f"{final.stem}.previous{final.suffix}")
+    number = 2
+    while backup.exists():
+        backup = final.with_name(f"{final.stem}.previous-{number}{final.suffix}")
+        number += 1
+    return backup
+
+
+def _publish_set(written: list[tuple[Path, Path]]) -> None:
+    """書き終えた 3 本を本人が開く名前へ付け替える 1 本でも付け替えられなければ前の回の 3 本へ戻す
+
+    本人は 3 本を見比べるので、今回の 1 本と前の回の 2 本が並ぶと、違う回の処理を比べてしまう
+    付け替えは、開いたままの書き出しへのアクセス拒否などで途中から落ちる 前の回の物は退避しておき、
+    落ちたら今回付け替えた物を消して退避した物を戻す
+    戻す側も同じ理由で 1 本ずつ落ちうるので、1 本ごとに試して残りを続ける 戻せなかった物は
+    退避した名前のまま残し、名前と戻し方を画面に出す 1 本目で止めると、戻せた 2 本まで退避した
+    名前のまま見えなくなる 画面に出すのは、呼ぶ側（:func:`command_run`）が失敗の型名だけを出し、
+    例外に書き添えても本人に届かないため 名前は番号と処理だけなので、素材の名前は出ない
+    """
+    backups: list[tuple[Path, Path]] = []
+    placed: list[Path] = []
+    try:
+        for _partial, final in written:
+            if final.exists():
+                backup = _backup_name(final)
+                final.replace(backup)
+                backups.append((backup, final))
+        for partial, final in written:
+            partial.replace(final)
+            placed.append(final)
+    except BaseException:
+        _discard(placed)
+        stuck: list[tuple[Path, Path]] = []
+        for backup, final in backups:
+            try:
+                backup.replace(final)
+            except OSError:
+                stuck.append((backup, final))
+        _discard(partial for partial, _final in written)
+        for backup, final in stuck:
+            print(
+                f"前の回の書き出しを戻せなかったので {backup.name} のまま残した"
+                f"（開いているアプリを閉じて、名前を {final.name} に変えれば戻る）"
+            )
+        raise
+    # 3 本はもう本人が開く名前に揃っている 退避した物を消せなくても書き出しは済んでいるので、
+    # 失敗にせず残して知らせる 失敗にすると、その回の数と値が結果に残らない
+    for backup, _final in backups:
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            print(
+                f"前の回の書き出しを消せなかったので {backup.name} を残した（要らなければ手で消す）"
+            )
 
 
 # --- グループを保つ（#437） ---
@@ -1388,7 +1608,13 @@ def _project_for(media: MediaItem, name: str) -> Document:
     return document
 
 
-def draft_project(media_path: Path, material: str, task: str, answer: Mapping[str, Any]) -> Project:
+def draft_project(
+    media_path: Path,
+    material: str,
+    task: str,
+    answer: Mapping[str, Any],
+    transcript: Transcript | None = None,
+) -> Project:
     """正解を直すための作品 課題ごとに 1 つ作る（1 つにまとめると直す所が混ざる）
 
     - 無音: 無音を詰めた後のタイムライン 人はクリップの端を直す
@@ -1398,6 +1624,8 @@ def draft_project(media_path: Path, material: str, task: str, answer: Mapping[st
       道具を良くしても数が上がらない）
     - 見どころ: 場面と同じ決まりで素材をそのまま置くだけ 人が見どころでない所を消して残す
     - 字幕: 素材に字幕を付ける 人は字幕のパネルで文と時刻を直す
+    - 言いよどみ: 素材に語の時刻付きの字幕（``transcript``）を付け、道具が見つけた所に目印を置く
+      人は聞いて、目印を足す・消す・動かす 字幕は探す手がかりで、正解には入れない
     """
     from sashimono.engine.decode.probe import probe_media
 
@@ -1414,10 +1642,19 @@ def draft_project(media_path: Path, material: str, task: str, answer: Mapping[st
         ranges = plan_cuts(document.project, media.id, silences)
         if ranges:
             document.execute(RippleCut(ranges))
-    elif task == TALK:
-        points = [_span(item)[0] for item in answer["boundaries"]]
-        frames = sorted({round(moment * float(rate.fps)) for moment in points})
-        markers = tuple(Marker(frame=frame, label="区切り") for frame in frames if frame > 0)
+    elif task in (TALK, FILLERS):
+        if task == FILLERS and transcript is not None and transcript.segments:
+            document.execute(SetTranscript(media.id, transcript))
+        key, label = ("boundaries", "区切り") if task == TALK else ("points", "言いよどみ")
+        points = [_span(item)[0] for item in answer[key]]
+        # 終わり際の時刻は丸めると作品の終わり（クリップの外）に出る 外の目印は取り込むときに
+        # どの素材の時刻にも当たらず正解から落ちるので、最後のフレームに収める
+        last = max(document.project.duration - 1, 0)
+        frames = sorted({min(round(moment * float(rate.fps)), last) for moment in points})
+        # 話の区切りは素材の頭を区切りに数えない 言いよどみは頭からでも言うので残す
+        markers = tuple(
+            Marker(frame=frame, label=label) for frame in frames if frame > 0 or task == FILLERS
+        )
         if markers:
             document.execute(AddMarkers(markers))
     elif task == SUBTITLES:
@@ -1485,13 +1722,14 @@ def answer_from_project(project: Project, media_path: Path, task: str) -> dict[s
                 merged.append([start, end])
         rounded = [[round(a, 3), round(b, 3)] for a, b in merged]
         return {"kept" if task == SILENCE else "ranges": rounded}
-    if task in (SCENES, TALK):
+    if task in (SCENES, TALK, FILLERS):
         moments = [
             moment
             for marker in project.timeline.markers
             if (moment := _source_seconds(clips, marker.frame, rate)) is not None
         ]
-        return {"cuts" if task == SCENES else "boundaries": sorted(moments)}
+        key = {SCENES: "cuts", TALK: "boundaries", FILLERS: "points"}[task]
+        return {key: sorted(moments)}
     if task == SUBTITLES:
         transcript = media.transcript_for(None)
         return {"segments": [] if transcript is None else segments_of(transcript)}
@@ -1521,10 +1759,24 @@ class Prediction:
 
 
 def predict(
-    task: str, path: Path, params: ToolParams, transcriber: Transcriber, facts: MediaFacts
+    task: str,
+    path: Path,
+    params: ToolParams,
+    transcriber: Transcriber,
+    facts: MediaFacts,
+    word_transcriber: Transcriber = transcribe_words_with_app,
 ) -> Prediction:
-    """道具を走らせて、正解と同じ形の答えを作る かかった秒も測る"""
+    """道具を走らせて、正解と同じ形の答えを作る かかった秒も測る
+
+    言いよどみは ``word_transcriber``（語の時刻付き・整形なし）で起こす 字幕の課題の起こし
+    （整形あり）を使い回すと、言いよどみだけの行が落ちた後の字幕で探すことになる
+    """
     began = time.perf_counter()
+    if task == FILLERS:
+        words = word_transcriber(path, params)
+        if words is None:
+            return Prediction(None, 0.0, "asr-missing")
+        return Prediction({"points": filler_points(words)}, round(time.perf_counter() - began, 2))
     if task == SILENCE:
         value: dict[str, Any] | None = {
             "kept": kept_ranges(find_silences(path, params), facts.duration)
@@ -1576,8 +1828,10 @@ def score(
         return point_scores(value["boundaries"], answer["boundaries"], tolerances.talk_seconds)
     if task == HIGHLIGHTS:
         return range_scores(value["ranges"], answer["ranges"], float(answer["duration"]))
-    if task == GROUPS:
-        raise ValueError("グループの課題は正解と比べない")
+    if task == FILLERS:
+        return point_scores(value["points"], answer["points"], tolerances.filler_seconds)
+    if task in (GROUPS, SEAMS):
+        raise ValueError("グループとつなぎ目の課題は正解と比べない")
     return subtitle_scores(value["segments"], answer["segments"], tolerances.subtitle_seconds)
 
 
@@ -1656,6 +1910,7 @@ def command_draft(
     force: bool = False,
     params: ToolParams | None = None,
     transcriber: Transcriber = transcribe_with_app,
+    word_transcriber: Transcriber = transcribe_words_with_app,
 ) -> list[str]:
     """道具の下書きから仮の正解と直す用の .sme を作る 作った物の一覧（番号と課題）を返す
 
@@ -1696,10 +1951,15 @@ def command_draft(
             # 1 つの課題の道具が落ちても、同じ素材のほかの課題とあとの素材の下書きは作る
             # 止めると、それまでに作った仮の正解もこの素材の分は書かれずに消える
             try:
+                words: Transcript | None = None
                 if task == TALK:
                     if silences is None:
                         silences = find_silences(path, resolved)
                     value: dict[str, Any] | None = {"boundaries": talk_from_silences(silences)}
+                elif task == FILLERS:
+                    # 直す人が探せるよう、目印と一緒に語の時刻付きの字幕も置く
+                    words = word_transcriber(path, resolved)
+                    value = None if words is None else {"points": filler_points(words)}
                 else:
                     value = predict(task, path, resolved, transcriber, facts).value
                 if value is None:
@@ -1707,7 +1967,7 @@ def command_draft(
                     continue
                 draft = {"provisional": True, "source": "draft", **value}
                 folder.drafts.mkdir(parents=True, exist_ok=True)
-                project = draft_project(path, material.id, task, with_facts(draft, facts))
+                project = draft_project(path, material.id, task, with_facts(draft, facts), words)
                 save_project(project, folder.draft_path(material.id, task))
             except Exception as error:
                 print(f"{material.id} {task}: 下書きを作れなかった（{type(error).__name__}）")
@@ -1780,10 +2040,13 @@ def command_run(
     transcriber: Transcriber = transcribe_with_app,
     exporter: Exporter | None = None,
     commit: str | None = None,
+    word_transcriber: Transcriber = transcribe_words_with_app,
+    seam_exporter: SeamExporter | None = None,
 ) -> list[dict[str, object]]:
     """道具の段を回して正解と比べ、結果を足す 足した行を返す"""
     resolved = params or ToolParams()
     export = exporter if exporter is not None else export_and_check
+    export_seams = seam_exporter if seam_exporter is not None else export_plain
     # 途中の行が壊れた結果のファイルには足せない 道具を数分走らせてから止まらないように先に見る
     if results.exists():
         _parse_results(_raw_text(results))
@@ -1803,6 +2066,7 @@ def command_run(
         answer, facts = opened.answer, opened.facts
         # 字幕と書き出しの両方を持つ素材で、字幕起こしを 2 回走らせない（長い素材で数分かかる）
         once = _remembered(transcriber)
+        once_words = _remembered(word_transcriber)
         for task in material.tasks:
             record: dict[str, object] = {**stamp, "material": material.id, "task": task}
             truth = answer.get("tasks", {}).get(task)
@@ -1842,10 +2106,20 @@ def command_run(
                         metrics=finite_metrics(kept),
                         params=resolved.record(SILENCE),
                     )
+                elif task == SEAMS:
+                    # 正解は持たない 処理の仕方ごとに書き出して人が見比べる
+                    began = time.perf_counter()
+                    seams = seam_exports(path, resolved, folder.exports, material.id, export_seams)
+                    record.update(
+                        status="ok",
+                        seconds=round(time.perf_counter() - began, 2),
+                        metrics=finite_metrics(seams),
+                        params=resolved.record(SEAMS),
+                    )
                 elif truth is None:
                     record.update(status="skipped", reason="no-answer")
                 else:
-                    prediction = predict(task, path, resolved, once, facts)
+                    prediction = predict(task, path, resolved, once, facts, once_words)
                     if prediction.value is None:
                         record.update(status="skipped", reason=prediction.reason)
                     else:
@@ -1866,7 +2140,8 @@ def command_run(
             except Exception as error:
                 print(f"{material.id} {task}: 失敗した（{type(error).__name__}）")
                 record.update(
-                    status="failed", reason="export-error" if task == EXPORT else "tool-error"
+                    status="failed",
+                    reason="export-error" if task in (EXPORT, SEAMS) else "tool-error",
                 )
             records.append(record)
     append_results(results, records, names)
@@ -1974,6 +2249,8 @@ HEADLINE = {
     EXPORT: "problems",
     HIGHLIGHTS: "f1_iou",
     GROUPS: "kept_share",
+    FILLERS: "f1",
+    SEAMS: "seams",
 }
 
 
