@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import av
 import numpy as np
@@ -37,6 +38,7 @@ from sashimono.core.model import (
 )
 from sashimono.effects.spec import FileSpec
 from sashimono.engine.decode import AudioDecoder, VideoDecoder, probe_media
+from sashimono.engine.decode.rational import as_fraction
 from sashimono.engine.package import archive, plan, remux
 from sashimono.engine.package.archive import (
     PACKAGE_SUFFIX,
@@ -48,7 +50,12 @@ from sashimono.engine.package.archive import (
 from sashimono.engine.package.plan import fonts_used, media_spans, scripts_used
 from sashimono.engine.package.remux import Cancelled, Span, cut_media, output_format
 from sashimono.engine.package.scrub import scrub_image
-from tests.media_fixtures import libx264_available, make_delayed, make_rotated
+from tests.media_fixtures import (
+    encoder_available,
+    libx264_available,
+    make_delayed,
+    make_rotated,
+)
 
 
 def _ffmpeg(*arguments: str) -> None:
@@ -320,6 +327,133 @@ class TestCut:
             assert decoder.decode_error is not None and "壊れた" in decoder.decode_error
         finally:
             decoder.close()
+
+    def test_aac_with_noise_substitution_is_cut(
+        self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、雑音の置き換え（PNS）を使う AAC の録画を範囲だけ写せず、毎回まるごと入れる
+
+        PNS の音は復号器の中の乱数で作るので、同じパケットでも解き始めた所で音が変わる
+        解いた音だけで比べると、正しく写した切り出しを違うと見て捨てていた（#455 の実物は
+        3.1 GB の録画がまるごと入った） パケットが時刻も中身も同じなら写し漏れではない
+        """
+        if not libx264_available():
+            pytest.skip("ffmpeg に libx264 が無いので実素材のテストを飛ばす")
+        source = media_dir / "package-pns.mp4"
+        if not source.exists():
+            _ffmpeg(
+                "-f", "lavfi", "-i", "anoisesrc=d=20:c=white:r=48000:a=0.3:seed=455",
+                "-f", "lavfi", "-i", "testsrc=d=20:s=96x64:r=30",
+                "-ac", "2", "-c:a", "aac", "-aac_pns", "1", "-b:a", "48k",
+                "-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p", "-shortest", str(source),
+            )  # fmt: skip
+        spans = [Span(Fraction(73, 10), Fraction(9)), Span(Fraction(13), Fraction(15))]
+        target = tmp_path / "pns.mp4"
+        # 切り出しの中でパケットの比べを通ったことも見る 素材の作り方が変わって解いた音が
+        # 揃うようになると、比べを通らずに通り、この試験が何も確かめなくなる
+        compared: list[bool] = []
+        same_packets = remux._same_packets
+
+        def spy(*arguments: Any) -> bool:
+            answer = same_packets(*arguments)
+            compared.append(answer)
+            return answer
+
+        monkeypatch.setattr(remux, "_same_packets", spy)
+        assert cut_media(source, target, spans, muxer="mp4")
+        assert True in compared
+        monkeypatch.undo()
+        # 切り出した音のパケットは、使う範囲で元とバイトごとに同じ
+        stream = probe_media(source).audio_streams[0]
+        for span in spans:
+            assert remux._same_packets(
+                source, target, stream.index, span.start, span.end, lambda: False
+            )
+
+    def test_changed_packets_are_not_trusted(self, media_dir: Path, tmp_path: Path) -> None:
+        """壊れると、中身の違うパケットを比べても同じと見て、別の音の切り出しを入れる"""
+        source = _video(media_dir)
+        other = tmp_path / "other.mp4"
+        _ffmpeg("-i", str(source), "-af", "volume=0.5", "-c:v", "copy", "-c:a", "aac", str(other))
+        stream = probe_media(source).audio_streams[0]
+        span = (Fraction(2), Fraction(3))
+        assert remux._same_packets(source, source, stream.index, *span, lambda: False)
+        assert not remux._same_packets(source, other, stream.index, *span, lambda: False)
+        # 解いた音がずれたときにパケットで認め直す道を通しても、中身の違う音は拒む
+        assert not remux._same_sound(
+            source, other, stream.index, stream.sample_rate, stream.channels,
+            [Span(*span)], lambda: False,
+        )  # fmt: skip
+        # 範囲にパケットが無ければ確かめられないとする（空どうしを同じと見ない）
+        assert not remux._same_packets(
+            source, source, stream.index, Fraction(100), Fraction(101), lambda: False
+        )
+
+    def test_a_missing_packet_before_a_long_aac_packet_is_noticed(self, tmp_path: Path) -> None:
+        """壊れると、1 パケットが長い音（8 kHz の AAC は 128 ms）で頭の 1 つ前が欠けても認める
+
+        AAC は 1 つ前のパケットと重ね合わせて頭の音を作る 比べる所を決め打ちの長さで
+        さかのぼると、長いパケットでは 1 つ前まで届かず、頭の音が変わった切り出しを入れる
+        """
+        if shutil.which("ffmpeg") is None:
+            pytest.skip("ffmpeg が無いので素材を作れない")
+        source = tmp_path / "slow.mka"
+        _ffmpeg(
+            "-f", "lavfi", "-i", "sine=frequency=300:duration=6:sample_rate=8000",
+            "-c:a", "aac", "-ar", "8000", str(source),
+        )  # fmt: skip
+        moment = Fraction(3)
+        with av.open(str(source)) as reader:
+            stream = reader.streams.audio[0]
+            length = Fraction(stream.codec_context.frame_size, stream.codec_context.sample_rate)
+            stamps = [
+                packet.pts * as_fraction(packet.time_base)
+                for packet in reader.demux(stream)
+                if packet.pts is not None
+            ]
+        assert length > Fraction(1, 10)
+        # 頭を含むパケットの 1 つ前（頭の音を作るのに要る物）
+        holding = max(stamp for stamp in stamps if stamp <= moment)
+        before = max(stamp for stamp in stamps if stamp < holding)
+        whole = tmp_path / "whole.mka"
+        missing = tmp_path / "missing.mka"
+        for target, dropped in ((whole, None), (missing, before)):
+            with av.open(str(source)) as reader, av.open(str(target), "w", format="matroska") as w:
+                stream = reader.streams.audio[0]
+                copy = w.add_stream_from_template(stream)
+                for packet in reader.demux(stream):
+                    if packet.dts is None:
+                        continue
+                    if (
+                        packet.pts is not None
+                        and packet.pts * as_fraction(packet.time_base) == dropped
+                    ):
+                        continue
+                    packet.stream = copy
+                    w.mux(packet)
+        index = probe_media(source).audio_streams[0].index
+        end = moment + Fraction(1, 4)
+        assert remux._same_packets(source, whole, index, moment, end, lambda: False)
+        assert not remux._same_packets(source, missing, index, moment, end, lambda: False)
+
+    def test_matching_mp3_packets_are_not_trusted(self, tmp_path: Path) -> None:
+        """壊れると、MP3 でもパケットが同じなら認め、比べる窓の外の欠けを見落とす
+
+        MP3 は前のパケットの残り（bit reservoir）を引くので、窓の中が同じでも頭の音が
+        変わりうる 解き始めで音が変わる理由の分かっている AAC だけを認める
+        """
+        # libmp3lame は ffmpeg を組むときに入れないと無い 無い組み方では素材を作れずに落ちる
+        if shutil.which("ffmpeg") is None or not encoder_available("libmp3lame"):
+            pytest.skip("ffmpeg か libmp3lame が無いので MP3 の素材を作れない")
+        source = tmp_path / "tone.mp3"
+        _ffmpeg(
+            "-f", "lavfi", "-i", "sine=frequency=300:duration=4:sample_rate=44100",
+            "-c:a", "libmp3lame", str(source),
+        )  # fmt: skip
+        index = probe_media(source).audio_streams[0].index
+        assert not remux._same_packets(
+            source, source, index, Fraction(1), Fraction(2), lambda: False
+        )
 
     def test_unreadable_pictures_are_not_trusted(
         self, media_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
