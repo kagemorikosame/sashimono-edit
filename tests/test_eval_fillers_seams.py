@@ -304,7 +304,7 @@ def test_a_failed_restore_does_not_stop_the_rest(
     # 戻せなかった名前と戻し方を本人に見せる 結果の行には失敗の型だけを残す
     shown = capsys.readouterr().out
     assert "E03_seams_none.previous.mp4" in shown
-    assert ".previous を外せば戻る" in shown
+    assert "名前を E03_seams_none.mp4 に変えれば戻る" in shown
 
 
 def test_a_refused_seam_is_not_counted_as_handled(
@@ -360,6 +360,70 @@ def test_a_backup_left_behind_does_not_fail_the_run(
     assert (eval_dir.exports / "E03_seams_none.mp4").read_bytes() == b""
     assert (eval_dir.exports / "E03_seams_none.previous.mp4").read_bytes() == b"old"
     assert "E03_seams_none.previous.mp4" in capsys.readouterr().out
+
+
+def test_a_stuck_partial_does_not_stop_the_cleanup(
+    folder: tuple[ModuleType, Any, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """2 本目の書き出しで落ち、後始末で 1 本目の半端な物を消せなかった
+
+    壊れると、後始末がそこで止まって 2 本目の半端な物が残り、元の失敗も消せなかった失敗に変わる
+    """
+    tool, eval_dir, book = folder
+
+    def export(project: Project, output: Path) -> None:
+        output.write_bytes(b"new")
+        if "crossfade" in output.name:
+            raise RuntimeError("書き出しに失敗した")
+
+    real_unlink = Path.unlink
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.name == "E03_seams_none.partial.mp4":
+            raise PermissionError("開いたままの書き出しは消せない")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    [record] = tool.command_run(
+        eval_dir, book, ["E03"], results=tmp_path / "r.jsonl", commit="", seam_exporter=export
+    )
+    assert (record["status"], record["reason"]) == ("failed", "export-error")
+    assert [path.name for path in eval_dir.exports.iterdir()] == ["E03_seams_none.partial.mp4"]
+    assert "E03_seams_none.partial.mp4" in capsys.readouterr().out
+
+
+def test_a_backup_left_from_before_is_not_overwritten(
+    folder: tuple[ModuleType, Any, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """前に戻せずに退避の名前で残った物がある所で回し直し、また付け替えで落ちた
+
+    壊れると、前々回の物を同じ退避の名前で上書きし、戻す物が無くなる
+    """
+    tool, eval_dir, book = folder
+    eval_dir.exports.mkdir(parents=True, exist_ok=True)
+    (eval_dir.exports / "E03_seams_none.mp4").write_bytes(b"before")
+    (eval_dir.exports / "E03_seams_none.previous.mp4").write_bytes(b"stuck")
+
+    def export(project: Project, output: Path) -> None:
+        output.write_bytes(b"new")
+
+    real_replace = Path.replace
+
+    def replace(self: Path, target: Path) -> Path:
+        if self.name == "E03_seams_crossfade.partial.mp4":
+            raise PermissionError("開いたままの書き出しは置き換えられない")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    [record] = tool.command_run(
+        eval_dir, book, ["E03"], results=tmp_path / "r.jsonl", commit="", seam_exporter=export
+    )
+    assert record["status"] == "failed"
+    assert (eval_dir.exports / "E03_seams_none.mp4").read_bytes() == b"before"
+    assert (eval_dir.exports / "E03_seams_none.previous.mp4").read_bytes() == b"stuck"
 
 
 @pytest.mark.parametrize("bad", [-0.5, float("nan")])

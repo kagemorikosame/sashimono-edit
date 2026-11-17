@@ -28,7 +28,6 @@ runtime）を読む（:func:`load_app_runtime`） 部品の無い機械では字
 from __future__ import annotations
 
 import argparse
-import contextlib
 import io
 import json
 import math
@@ -38,7 +37,7 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from fractions import Fraction
@@ -824,11 +823,36 @@ def seam_exports(
             exporter(plan.project, partial)
             metrics[f"export_seconds_{video}"] = round(time.perf_counter() - began, 2)
     except BaseException:
-        for partial, _final in written:
-            partial.unlink(missing_ok=True)
+        _discard(partial for partial, _final in written)
         raise
     _publish_set(written)
     return metrics
+
+
+def _discard(paths: Iterable[Path]) -> None:
+    """今回書いた物を 1 本ずつ消す 消せなかった物は名前を出して残し、残りを続ける
+
+    後始末は落ちた後に走るので、ここで止まると元の失敗が消せなかった失敗に置き換わり、
+    残りの物も試されずに残る 開いたままの書き出しへのアクセス拒否は ``missing_ok`` では避けられない
+    """
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            print(f"今回の書き出しを消せなかったので {path.name} を残した（要らなければ手で消す）")
+
+
+def _backup_name(final: Path) -> Path:
+    """前の回の物の退避先 前に戻せずに残った退避と重ならない名前を選ぶ
+
+    同じ名前に退避すると、前に戻せなかった前々回の物を上書きし、今回も落ちたときに戻す物が無くなる
+    """
+    backup = final.with_name(f"{final.stem}.previous{final.suffix}")
+    number = 2
+    while backup.exists():
+        backup = final.with_name(f"{final.stem}.previous-{number}{final.suffix}")
+        number += 1
+    return backup
 
 
 def _publish_set(written: list[tuple[Path, Path]]) -> None:
@@ -847,29 +871,25 @@ def _publish_set(written: list[tuple[Path, Path]]) -> None:
     try:
         for _partial, final in written:
             if final.exists():
-                backup = final.with_name(f"{final.stem}.previous{final.suffix}")
+                backup = _backup_name(final)
                 final.replace(backup)
                 backups.append((backup, final))
         for partial, final in written:
             partial.replace(final)
             placed.append(final)
     except BaseException:
-        for final in placed:
-            with contextlib.suppress(OSError):
-                final.unlink(missing_ok=True)
-        stuck: list[Path] = []
+        _discard(placed)
+        stuck: list[tuple[Path, Path]] = []
         for backup, final in backups:
             try:
                 backup.replace(final)
             except OSError:
-                stuck.append(backup)
-        for partial, _final in written:
-            with contextlib.suppress(OSError):
-                partial.unlink(missing_ok=True)
-        for backup in stuck:
+                stuck.append((backup, final))
+        _discard(partial for partial, _final in written)
+        for backup, final in stuck:
             print(
                 f"前の回の書き出しを戻せなかったので {backup.name} のまま残した"
-                f"（開いているアプリを閉じて、名前から .previous を外せば戻る）"
+                f"（開いているアプリを閉じて、名前を {final.name} に変えれば戻る）"
             )
         raise
     # 3 本はもう本人が開く名前に揃っている 退避した物を消せなくても書き出しは済んでいるので、
