@@ -65,7 +65,7 @@ from sashimono import __version__  # noqa: E402
 from sashimono.addon_check import ADD_ON_PACKS, INSTALL_TIMEOUT  # noqa: E402
 from sashimono.app import ADD_ON_CHECK_FLAG, SELF_CHECK_FLAG  # noqa: E402
 from sashimono.compat.aviutl.catalog import PORTABLE_SCRIPTS_DIR  # noqa: E402
-from sashimono.links import REPORT_URL  # noqa: E402
+from sashimono.links import INSTALL_URL, REPORT_URL  # noqa: E402
 from sashimono.runtime import python_abi  # noqa: E402
 from sashimono.selfcheck import UPDATE_CHECK_NAME  # noqa: E402
 from sashimono.update.package import BUILD_INFO_NAME, write_build_info  # noqa: E402
@@ -414,6 +414,11 @@ README_TEXT = f"""Sashimono Edit {__version__}
 
 起動: Sashimono.exe
 
+Sashimono.exe だけを取り出さないでください 隣の _internal フォルダに Python などの部品が
+入っていて、exe はそれを読んで起動します このフォルダごと置き、デスクトップには
+Sashimono.exe を右クリック →〔送る〕→〔デスクトップ（ショートカットを作成）〕で
+ショートカットを置いてください（Windows 11 では〔送る〕が〔その他のオプションを確認〕の中）
+
 置き場: %LOCALAPPDATA%\\Programs\\Sashimono へ展開するのがおすすめです 新しい版が出ると、
 ソフトが自分で落として確かめ、尋ねてから入れ替えます（〔表示〕→〔設定…〕で切れます）
 Program Files のように管理者でないと書けない場所では、自動では入れ替えられません
@@ -461,6 +466,49 @@ AviUtl2 が入っている機械では、AviUtl2 の Script フォルダも同�
 （こちらへ写す必要はありません）
 
 動いているか確かめるには Sashimono.exe {SELF_CHECK_FLAG}
+"""
+
+#: zip の一番上（``Sashimono\`` の隣）に置く入れ方の説明 展開した人が最初に目にする所
+#: exe だけを取り出してデスクトップへ置くと、隣の ``_internal`` の Python が読めずに
+#: PyInstaller の起動処理が止まる（#485） アプリのコードより前で止まるので、アプリの中では
+#: 知らせられない README も Wiki も開かない人に届くよう、zip を開いたときに見える所に置く
+INSTALL_NOTE_NAME = "はじめにお読みください.txt"
+
+#: exe が読む Python の DLL の名前 組み立てに使った Python がそのまま入るので、その版から作る
+#: 版を上げたときに説明書きだけ古い名前で残ると、エラーの文言と見比べられない
+#: エラーの最後の行の句点は、文言で検索できるよう前の部分だけを載せて落とす
+PYTHON_DLL_NAME = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+
+INSTALL_NOTE_TEXT = f"""Sashimono Edit {__version__} の入れ方
+
+1. この zip の中の {APP_NAME} フォルダを、フォルダごと置きます
+   おすすめの置き場は %LOCALAPPDATA%\\Programs です（エクスプローラーのアドレス欄に
+   打つと開きます 無ければ Programs というフォルダを作ります）
+2. {APP_NAME} フォルダの中の {APP_NAME}.exe を起動します
+3. デスクトップから起動したいときは、{APP_NAME}.exe を右クリック →〔送る〕→
+   〔デスクトップ（ショートカットを作成）〕でショートカットを置きます
+   （Windows 11 では〔送る〕が〔その他のオプションを確認〕の中にあります）
+
+{APP_NAME}.exe だけを取り出さないでください
+exe は起動するだけの小さな物で、Python などの部品は隣の _internal フォルダにあります
+exe だけをデスクトップなどへ写すと、次のエラーが出て起動しません
+
+    Failed to load Python DLL
+    '...\\_internal\\{PYTHON_DLL_NAME}'.
+    LoadLibrary: 指定されたモジュールが見つかりません
+
+このエラーが出たら、次を確かめてください
+
+- {APP_NAME}.exe の隣に _internal フォルダがあるか 無ければ、exe だけを取り出しています
+  写した exe を消し、{APP_NAME} フォルダごと置き直してください
+- _internal フォルダの中に {PYTHON_DLL_NAME} があるか 無ければ展開が途中で終わったか、
+  ウイルス対策ソフトが隔離しています Windows セキュリティの〔保護の履歴〕を見て、
+  zip を展開し直してください
+- OneDrive の中に置いていないか 同期の途中や「オンラインのみ」のファイルがあると読めません
+  OneDrive の外（上のおすすめの置き場）へ置き直してください
+
+詳しい入れ方: {INSTALL_URL}
+不具合・質問: {REPORT_URL}
 """
 
 #: 使用許諾の写しを置くフォルダ exe の隣とリポジトリの直下で同じ名前にする
@@ -871,6 +919,9 @@ def make_zip(bundle: Path, target: Path) -> Path:
     temporary = target.with_name(target.name + ".writing")
     try:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            # 入れ方の説明は一番上に置く 展開したフォルダの外なので、自動更新は読まない
+            # （update/package.py の extract_package は exe のあるフォルダだけを選ぶ）
+            archive.writestr(INSTALL_NOTE_NAME, INSTALL_NOTE_TEXT.encode("utf-8"))
             for path in sorted(bundle.rglob("*")):
                 if path.is_file():
                     archive.write(path, Path(APP_NAME) / path.relative_to(bundle))
@@ -1022,6 +1073,7 @@ def smoke_test(archive: Path, notices: Mapping[str, str]) -> int:
         if checked.stderr.strip():
             print(checked.stderr.rstrip())
         failures = [] if checked.returncode == 0 else ["自己診断"]
+        failures += install_note_failures(Path(folder))
         failures += [f"使用許諾が入っていない: {name}" for name in missing_notices(home)]
         failures += [f"使用許諾の写しが{change}" for change in changed_notices(home, notices)]
 
@@ -1050,6 +1102,19 @@ def smoke_test(archive: Path, notices: Mapping[str, str]) -> int:
         for failure in failures:
             print(f"[NG] {failure}")
         return 1 if failures else 0
+
+
+def install_note_failures(unpacked: Path) -> list[str]:
+    """展開した zip の一番上に、入れ方の説明がこの版の中身で入っているか
+
+    無いと、exe だけを取り出して起動できない人に、zip を開いた所で注意が届かない（#485）
+    """
+    note = unpacked / INSTALL_NOTE_NAME
+    if not note.is_file():
+        return [f"zip の一番上に {INSTALL_NOTE_NAME} が無い"]
+    if note.read_text(encoding="utf-8") != INSTALL_NOTE_TEXT:
+        return [f"zip の一番上の {INSTALL_NOTE_NAME} の中身が違う"]
+    return []
 
 
 def update_failures(home: Path, self_check_output: str) -> list[str]:

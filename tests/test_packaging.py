@@ -39,6 +39,7 @@ from sashimono.runtime import (
     run_pip_here,
 )
 from sashimono.selfcheck import CheckResult, format_results, run_self_check
+from sashimono.update.package import extract_package
 from tests.fake_python_dll import just_below, minimum_python, python_dll_bytes
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -635,8 +636,52 @@ class TestTheZip:
         archive = builder.make_zip(bundle, tmp_path / "out.zip")
         with zipfile.ZipFile(archive) as opened:
             names = opened.namelist()
-        assert all(name.startswith("Sashimono/") for name in names)
+        # 一番上に置くのは入れ方の説明 1 つだけ（#485）
+        assert all(
+            name.startswith("Sashimono/") for name in names if name != builder.INSTALL_NOTE_NAME
+        )
         assert "Sashimono/Sashimono.exe" in names
+
+    def test_the_install_note_is_on_top(self, builder: ModuleType, tmp_path: Path) -> None:
+        """exe だけを取り出すと隣の _internal の Python が読めず、アプリより前で止まる（#485）
+        zip を開いた所に注意が無いと、README も Wiki も開かない人に届かない"""
+        bundle = tmp_path / "bundle"
+        bundle.mkdir()
+        builder.assemble(bundle)
+        archive = builder.make_zip(bundle, tmp_path / "out.zip")
+        with zipfile.ZipFile(archive) as opened:
+            text = opened.read(builder.INSTALL_NOTE_NAME).decode("utf-8")
+        assert text == builder.INSTALL_NOTE_TEXT
+        # エラーの文言で見比べられるよう、この版の DLL の名前と文言の頭を載せる
+        assert "Failed to load Python DLL" in text
+        assert f"python{sys.version_info.major}{sys.version_info.minor}.dll" in text
+        assert "_internal" in text and "OneDrive" in text
+
+    def test_the_check_finds_a_missing_or_old_install_note(
+        self, builder: ModuleType, tmp_path: Path
+    ) -> None:
+        """zip から確かめる段で見ないと、作り方を変えた日に黙って説明が抜ける"""
+        assert builder.install_note_failures(tmp_path) == [
+            f"zip の一番上に {builder.INSTALL_NOTE_NAME} が無い"
+        ]
+        (tmp_path / builder.INSTALL_NOTE_NAME).write_text("前の版の説明", encoding="utf-8")
+        assert builder.install_note_failures(tmp_path) == [
+            f"zip の一番上の {builder.INSTALL_NOTE_NAME} の中身が違う"
+        ]
+        (tmp_path / builder.INSTALL_NOTE_NAME).write_text(
+            builder.INSTALL_NOTE_TEXT, encoding="utf-8"
+        )
+        assert builder.install_note_failures(tmp_path) == []
+
+    def test_the_update_still_finds_the_folder(self, builder: ModuleType, tmp_path: Path) -> None:
+        """一番上に説明を足しても、自動更新は exe のあるフォルダだけを選ぶ"""
+        bundle = tmp_path / "bundle"
+        bundle.mkdir()
+        (bundle / "Sashimono.exe").write_bytes(b"MZ")
+        builder.assemble(bundle)
+        archive = builder.make_zip(bundle, tmp_path / "out.zip")
+        folder = extract_package(archive, tmp_path / "unpacked")
+        assert folder.name == "Sashimono" and (folder / "Sashimono.exe").is_file()
 
     def test_the_script_folder_is_already_there(self, builder: ModuleType, tmp_path: Path) -> None:
         """空でも置き場を作っておく 無いと、どこへ置けばいいのかが分からない

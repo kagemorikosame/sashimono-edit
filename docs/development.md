@@ -4616,6 +4616,11 @@ YMM4 互換を、実配布の .ymmt に合わせて書き直す
   （読み込みは遅延で、呼んだ時点で初めて DLL を探しに行く）
 - 使う人の機械で動かないと言われたら、zip の中の `README.txt` にあるとおり
   `Sashimono.exe --self-check | more` の結果を貼ってもらう
+- zip の一番上（`Sashimono\` の隣）に入れ方の説明 `はじめにお読みください.txt`（`INSTALL_NOTE_TEXT`）を
+  置く exe だけを取り出すと隣の `_internal` の Python が読めず、アプリより前の PyInstaller の起動処理が
+  `Failed to load Python DLL` で止まる（#485） アプリの中では知らせられないので、zip を開いた所に置く
+  zip から確かめる段で、一番上にこの版の中身で入っているかも見る（`install_note_failures`）
+  自動更新は exe のあるフォルダだけを選ぶので、一番上の説明は読まない
 - 字幕起こしと AI 連携は積まない（合わせて 2 GB を超える） 開発機に入っていても
   拾わないよう、`tools/build_package.py` の `EXCLUDED_MODULES` で外している 画面の解析
   （onnxruntime と winrt の包み #324）も同じく外し、`--add-on-check` で入れて読む 顔の検出の
