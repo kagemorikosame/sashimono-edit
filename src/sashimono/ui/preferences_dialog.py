@@ -35,6 +35,7 @@ from sashimono.ai.models import find_model
 from sashimono.ai.outbound import ASKED, DESTINATION, Outbound, SendChoice
 from sashimono.ai.send_log import KEEP_DAYS, SendLog
 from sashimono.asr.backend import MODELS as ASR_MODELS
+from sashimono.core.direction_recipes import GENRES, STRENGTHS
 from sashimono.core.emphasis import (
     EMPHASIS_EASING_NAMES,
     EMPHASIS_EASINGS,
@@ -1341,6 +1342,7 @@ class PreferencesDialog(QDialog):
         )
         form.addRow("BGM が戻る速さ", self._duck_release)
         self._add_emphasis_rows(form, preferences)
+        self._add_direction_rows(form, preferences)
         self._add_seam_rows(form, preferences)
         self._add_narration_rows(form, preferences)
         self._add_auto_fix_rows(form, preferences)
@@ -1663,6 +1665,8 @@ class PreferencesDialog(QDialog):
             emphasis_pan_px=self._emphasis_pan.value(),
             emphasis_ramp_ms=self._emphasis_ramp.value(),
             emphasis_easing=str(self._emphasis_easing.currentData()),
+            direction_genre=str(self._direction_genre.currentData()),
+            direction_strength=str(self._direction_strength.currentData()),
             seam_video=str(self._seam_video.currentData()),
             seam_crossfade_ms=self._seam_crossfade.value(),
             seam_zoom_percent=self._seam_zoom.value(),
@@ -1814,6 +1818,32 @@ class PreferencesDialog(QDialog):
             "動き出しと止まり方 行き過ぎて戻る・ばね・弾むは、着いた所で跳ねる"
         )
         form.addRow("強調の動き: 動き方", self._emphasis_easing)
+
+    def _add_direction_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """演出（#470 #478）のジャンルと強さ どれだけ付けるかは人と作品で違う
+        頼みの文で「派手に」などと言えば、その回だけ変えられる
+        """
+        self._direction_genre = QComboBox(self)
+        for key, name in GENRES.items():
+            self._direction_genre.addItem(name, key)
+        self._direction_genre.setCurrentIndex(
+            max(0, self._direction_genre.findData(preferences.direction_genre))
+        )
+        self._direction_genre.setToolTip(
+            "AI アシスタントが演出を付けるときに使う、ジャンルごとの決まりのひとそろい"
+        )
+        form.addRow("演出: ジャンル", self._direction_genre)
+        self._direction_strength = QComboBox(self)
+        for key, name in STRENGTHS.items():
+            self._direction_strength.addItem(name, key)
+        self._direction_strength.setCurrentIndex(
+            max(0, self._direction_strength.findData(preferences.direction_strength))
+        )
+        self._direction_strength.setToolTip(
+            "AI アシスタントが付ける演出の多さと強さ 控えめは 1 分に寄る 1 回ほど、派手は 3 回ほど"
+            " 付けすぎた演出は 1 つずつ外す手間が要るので、迷ったら控えめから"
+        )
+        form.addRow("演出: 強さ", self._direction_strength)
 
     def _add_seam_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """ジャンプカットのつなぎ目（#332）の既定 溶かすか寄るか・どれだけの長さかは人と作品で違う

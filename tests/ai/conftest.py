@@ -35,6 +35,7 @@ from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.clipboard import ClipboardContent
 from sashimono.core.commands import AddClip, Author, Command, Document, InScene
+from sashimono.core.direction_recipes import DirectionTaste
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.library import Library
@@ -151,6 +152,7 @@ class FakeHost:
         self.duck = DuckShape()
         #: 強調の動き（#331）の本人の設定 既定は設定と同じ
         self.emphasis = EmphasisStyle()
+        self.taste = DirectionTaste()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
         #: ナレーション（#335）の本人の設定 エンジンの場所は誰も待ち受けていない番号へ向ける
@@ -498,6 +500,10 @@ class FakeHost:
     @property
     def emphasis_style(self) -> EmphasisStyle:
         return self.emphasis
+
+    @property
+    def direction_taste(self) -> DirectionTaste:
+        return self.taste
 
     @property
     def seam_style(self) -> SeamStyle:

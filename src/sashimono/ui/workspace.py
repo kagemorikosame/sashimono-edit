@@ -41,6 +41,13 @@ from sashimono.asr.backend import MODELS as ASR_MODELS
 from sashimono.compat.subtitle_looks import LookRules
 from sashimono.core import userdirs
 from sashimono.core.commands.preset import PresetOptions
+from sashimono.core.direction_recipes import (
+    DEFAULT_GENRE,
+    DEFAULT_STRENGTH,
+    GENRES,
+    STRENGTHS,
+    DirectionTaste,
+)
 from sashimono.core.emphasis import (
     DEFAULT_EMPHASIS_EASING,
     DEFAULT_EMPHASIS_PAN_PX,
@@ -842,6 +849,13 @@ class Preferences:
     emphasis_ramp_ms: int = DEFAULT_EMPHASIS_RAMP_MS
     #: 動き方（:data:`~sashimono.core.emphasis.EMPHASIS_EASINGS`） 既定はなめらかに動き出して止まる
     emphasis_easing: str = DEFAULT_EMPHASIS_EASING
+    #: AI アシスタントが演出を付ける（#470 #478）ときのジャンルと強さ どれだけ付けるかは
+    #: 人と作品で違う 頼みの文で言わなければこれを使う 既定は実況・控えめ（付けすぎた演出は
+    #: 1 つずつ外す手間が要るが、足りない分は頼み直せば足せる 2026-11-16 に本人が決めた）
+    #: ジャンル（:data:`~sashimono.core.direction_recipes.GENRES`）
+    direction_genre: str = DEFAULT_GENRE
+    #: 強さ（:data:`~sashimono.core.direction_recipes.STRENGTHS`）
+    direction_strength: str = DEFAULT_STRENGTH
     #: AI アシスタントがジャンプカットのつなぎ目を目立たなくする（#332）ときの既定
     #: 溶かすか寄るか・どれだけの長さかは人と作品で違う AI に値を言わなければこれを使う
     #: 既定は短いクロスフェードと 20 ms の音のフェード（絵の中身が欠けない側
@@ -1055,6 +1069,11 @@ class Preferences:
             ramp_ms=self.emphasis_ramp_ms,
             easing=self.emphasis_easing,
         )
+
+    @property
+    def direction_taste(self) -> DirectionTaste:
+        """AI アシスタントが演出を付ける（#478）ときのジャンルと強さ"""
+        return DirectionTaste(genre=self.direction_genre, strength=self.direction_strength)
 
     @property
     def seam_style(self) -> SeamStyle:
@@ -1386,6 +1405,12 @@ class PreferenceStore:
             ),
             emphasis_easing=_choice(
                 data.get("emphasis_easing"), EMPHASIS_EASINGS, plain.emphasis_easing
+            ),
+            direction_genre=_choice(
+                data.get("direction_genre"), tuple(GENRES), plain.direction_genre
+            ),
+            direction_strength=_choice(
+                data.get("direction_strength"), tuple(STRENGTHS), plain.direction_strength
             ),
             seam_video=_choice(data.get("seam_video"), SEAM_VIDEOS, plain.seam_video),
             seam_crossfade_ms=_within(

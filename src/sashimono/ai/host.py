@@ -24,6 +24,7 @@ from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks
 from sashimono.core.clipboard import ClipboardContent
 from sashimono.core.commands import Command, Document, ParamPath
+from sashimono.core.direction_recipes import DirectionTaste
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected
 from sashimono.core.mixing import DuckShape
@@ -565,6 +566,15 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.emphasis_style`）
 
         どれだけ寄るか・どれだけ速く動くかは人と作品で違う AI が引数で渡さなければこれを使う
+        """
+        ...
+
+    @property
+    def direction_taste(self) -> DirectionTaste:
+        """演出を付ける（#478）ときのジャンルと強さ
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.direction_taste`）
+
+        どれだけ演出を付けるかは人と作品で違う 頼みの文で言われなければこれを使う
         """
         ...
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import itertools
 import json
 import math
 import os
@@ -38,7 +39,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from fractions import Fraction
 from pathlib import Path
@@ -94,7 +95,22 @@ FILLERS = "fillers"
 #: 人が見比べる 跳びが隠れたかは見た目の判断で、絵の差の数では測れない（寄りは差が大きく出るのに
 #: 跳びは隠れる）
 SEAMS = "seams"
-TASKS = (SILENCE, TALK, SCENES, SUBTITLES, EXPORT, HIGHLIGHTS, GROUPS, FILLERS, SEAMS)
+#: 演出の計画（#470 #476） 正解は持たない 見どころの手がかりから強さごとに計画を作って付け、
+#: 付いた演出の密度・近すぎる所・同じ手がかりで同じ計画になるかを数える 人の手の演出とは
+#: 比べない（同じ所に寄るかは好みで、合わないのが悪いとは言えない）
+DIRECTION = "direction"
+TASKS = (
+    SILENCE,
+    TALK,
+    SCENES,
+    SUBTITLES,
+    EXPORT,
+    HIGHLIGHTS,
+    GROUPS,
+    FILLERS,
+    SEAMS,
+    DIRECTION,
+)
 #: 正解を持つ課題 下書きと取り込みはこれだけ
 ANSWERED = (SILENCE, TALK, SCENES, SUBTITLES, HIGHLIGHTS, FILLERS)
 #: 道具の下書きを仮の正解にせず、人が素材の全体を見て一から付ける課題（#345 の決まり）
@@ -526,6 +542,13 @@ def find_highlight_ranges(
 
     字幕があれば笑いの印を主な手がかりにする（道具と同じ） 字幕起こしの部品が無ければ音と動きだけ
     """
+    return [[found.start, found.end] for found in find_highlight_spans(path, duration, transcript)]
+
+
+def find_highlight_spans(
+    path: Path, duration: float, transcript: Transcript | None
+) -> tuple[Any, ...]:
+    """見どころの区間を手がかりの点数ごと返す 演出の課題は手がかりの名前と強さまで使う"""
     from sashimono.engine.audio.waveform import analyze_waveform
     from sashimono.engine.decode.probe import probe_media
     from sashimono.engine.highlights import highlight_curves
@@ -540,7 +563,7 @@ def find_highlight_ranges(
         scenes=analyze_scenes(path, threads=0) if media.has_video else None,
         transcript=transcript,
     )
-    return [[found.start, found.end] for found in curves.highlights()]
+    return curves.highlights()
 
 
 #: 字幕起こしを返す物 試験では偽物に差し替える 入っていなければ None
@@ -1013,6 +1036,125 @@ def cut_groups_with_tools(path: Path, params: ToolParams) -> dict[str, float | i
     if ranges:
         document.execute(RippleCut(ranges))
     return {**group_metrics(document.project), "cuts": len(ranges)}
+
+
+def direction_cues(highlights: Iterable[Any]) -> list[Any]:
+    """見どころを演出の手がかりにする 半分以上の点が付いた手がかりごとに 1 つ
+
+    AI が ``find_highlights`` の区間を ``propose_direction`` へ渡すときと同じ形にする
+    点の弱い手がかりまで渡すと、笑っていない所へ笑いの寄りを置く
+    """
+    from sashimono.core.direction_recipes import Cue
+
+    return [
+        Cue(signal=name, start=found.start, end=found.end, score=float(getattr(found, name)))
+        for found in highlights
+        for name in found.reasons
+    ]
+
+
+def direction_metrics(project: Project, cues: Sequence[Any]) -> dict[str, float | int | None]:
+    """強さごとに計画を作って付け、付いた演出を段 1 の ``measure_direction`` で数える
+
+    数えるのは、強さごとの 1 分あたりの寄る・揺らすの回数・近すぎる所の数（0 であるべき）・
+    手がかりの並びを逆にしても同じ計画になるか（``consistent``）・強いほど多く付くか（``ordered``）・
+    方針の外の効果を付けた数（``off_guide`` 0 であるべき）
+    効果音は本人の素材だけを使う決まりで、評価の素材には効果音の素材が無いので数えない
+    """
+    from sashimono.ai.direction_plan import apply_items, build_items
+    from sashimono.core.direction import SHAKE, ZOOM, measure_direction
+    from sashimono.core.direction_recipes import (
+        ACTION_SOUND,
+        LETS_PLAY,
+        STRENGTHS,
+        DirectionTaste,
+        plan_direction,
+        recipe_book,
+    )
+    from sashimono.core.timebase import frame_to_seconds
+
+    end = float(frame_to_seconds(project.timeline.duration, project.timeline.rate))
+    metrics: dict[str, float | int | None] = {"cues": len(cues), "too_close": 0, "off_guide": 0}
+    consistent = True
+    placed: list[int] = []
+    for strength in STRENGTHS:
+        book = recipe_book(DirectionTaste(LETS_PLAY, strength), project.style_guide.effects)
+        planned = plan_direction(cues, book, 0.0, end)
+        # 手がかりの並びに計画が引きずられると、同じ素材でも回ごとに違う所へ寄る
+        consistent = consistent and planned == plan_direction(list(reversed(cues)), book, 0.0, end)
+        # 効果音は数えないので先に分ける 残る項目の外した数と付けられなかった数は合わせて数える
+        moved = [p for p in planned if p.action != ACTION_SOUND]
+        items, dropped = build_items(
+            project, moved, [None] * len(moved), None, project.timeline.duration
+        )
+        document = Document(project)
+        result = apply_items(document, items)
+        metrics["off_guide"] = int(metrics["off_guide"] or 0) + _off_guide(
+            project, cues, strength, end
+        )
+        report = measure_direction(document.project, document.project.timeline)
+        moves = 0
+        for kind in report.kinds:
+            metrics["too_close"] = int(metrics["too_close"] or 0) + len(kind.too_close)
+            if kind.kind.key in (ZOOM, SHAKE):
+                metrics[f"{kind.kind.key}_per_minute_{strength}"] = round(kind.per_minute, 4)
+                moves += kind.count
+        metrics[f"skipped_{strength}"] = len(dropped) + len(result.skipped)
+        placed.append(moves)
+    metrics["consistent"] = int(consistent)
+    metrics["ordered"] = int(all(a <= b for a, b in itertools.pairwise(placed)))
+    return metrics
+
+
+#: 評価の作品に効果の方針が無いときに照らす使ってよい効果 揺らす効果を許さない
+#: 方針が空だとレシピを外す所を通らないので、評価で方針に合うかを数えられない
+_PROBE_EFFECTS = ("blur",)
+
+
+def _off_guide(project: Project, cues: Sequence[Any], strength: str, end: float) -> int:
+    """方針の使ってよい効果の外の効果を、計画が付けてしまった数
+
+    作品に効果の方針があればそれで、無ければ揺らすを許さない方針（``_PROBE_EFFECTS``）で照らす
+    付けた後の作品を ``style_problems`` で照らすので、レシピの外し方と照らしの食い違いも拾う
+    """
+    from sashimono.ai.direction_plan import apply_items, build_items
+    from sashimono.ai.style_check import EFFECT, style_problems
+    from sashimono.core.direction_recipes import (
+        LETS_PLAY,
+        DirectionTaste,
+        plan_direction,
+        recipe_book,
+    )
+
+    guided = project
+    if not project.style_guide.effects:
+        guided = replace(project, style_guide=replace(project.style_guide, effects=_PROBE_EFFECTS))
+    book = recipe_book(DirectionTaste(LETS_PLAY, strength), guided.style_guide.effects)
+    planned = plan_direction(cues, book, 0.0, end)
+    items, _ = build_items(guided, planned, [None] * len(planned), None, guided.timeline.duration)
+    before = sum(p.kind == EFFECT for p in style_problems(guided))
+    document = Document(guided)
+    apply_items(document, items)
+    return sum(p.kind == EFFECT for p in style_problems(document.project)) - before
+
+
+def direct_with_tools(
+    path: Path, params: ToolParams, transcriber: Transcriber
+) -> dict[str, float | int | None]:
+    """道具の段 素材を頭から置いた作品に、見どころの手がかりから演出の計画を付けて数える
+
+    字幕起こしの部品が無ければ音と動きだけの手がかりで作る（見どころの課題と同じ）
+    """
+    from sashimono.engine.decode.probe import probe_media
+
+    media = probe_media(path)
+    document = _project_for(media, f"tools {DIRECTION}")
+    words = transcriber(path, params) if media.has_audio else None
+    spans = find_highlight_spans(path, float(media.duration), words)
+    return {
+        **direction_metrics(document.project, direction_cues(spans)),
+        "subtitles": int(words is not None),
+    }
 
 
 @dataclass(slots=True)
@@ -1830,8 +1972,8 @@ def score(
         return range_scores(value["ranges"], answer["ranges"], float(answer["duration"]))
     if task == FILLERS:
         return point_scores(value["points"], answer["points"], tolerances.filler_seconds)
-    if task in (GROUPS, SEAMS):
-        raise ValueError("グループとつなぎ目の課題は正解と比べない")
+    if task in (GROUPS, SEAMS, DIRECTION):
+        raise ValueError("グループとつなぎ目と演出の課題は正解と比べない")
     return subtitle_scores(value["segments"], answer["segments"], tolerances.subtitle_seconds)
 
 
@@ -2116,6 +2258,20 @@ def command_run(
                         metrics=finite_metrics(seams),
                         params=resolved.record(SEAMS),
                     )
+                elif task == DIRECTION:
+                    # 正解は持たない 強さごとに計画を付けて密度と近すぎる所を数える
+                    began = time.perf_counter()
+                    directed = direct_with_tools(path, resolved, once)
+                    record.update(
+                        status="ok",
+                        seconds=round(time.perf_counter() - began, 2),
+                        metrics=finite_metrics(directed),
+                        # 字幕起こしを使ったら、手がかりが変わるのでモデルの指定も書く
+                        params={
+                            "genre": "lets_play",
+                            **(resolved.record(SUBTITLES) if directed.get("subtitles") else {}),
+                        },
+                    )
                 elif truth is None:
                     record.update(status="skipped", reason="no-answer")
                 else:
@@ -2251,6 +2407,7 @@ HEADLINE = {
     GROUPS: "kept_share",
     FILLERS: "f1",
     SEAMS: "seams",
+    DIRECTION: "too_close",
 }
 
 

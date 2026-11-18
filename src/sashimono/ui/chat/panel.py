@@ -56,6 +56,7 @@ from sashimono.ai.budget import (
     format_minutes,
     format_tokens,
 )
+from sashimono.ai.direction_plan import proposal_for
 from sashimono.ai.environment import claude_cli, credentials_found, open_login_window
 from sashimono.ai.fixes import fixes_closed
 from sashimono.ai.handoff import CONTINUE_PROMPT, Handoff, StopReason, TurnRecord, shelf_for
@@ -77,6 +78,7 @@ from sashimono.ai.session import (
     system_prompt,
 )
 from sashimono.core.commands import Author
+from sashimono.ui.chat.direction_box import DirectionPlanBox
 from sashimono.ui.chat.parts_updater import PartsUpdater
 from sashimono.ui.chat.plan_box import PlanBox, plan_progress
 from sashimono.ui.chat.send_consent import ask_send
@@ -572,6 +574,12 @@ class ChatPanel(QWidget):
         self._plan_box.pause_requested.connect(self.pause_plan)
         self._plan_box.resume_requested.connect(self.resume_plan)
         self._plan_box.close_requested.connect(self.close_plan)
+        # 演出の計画（#479） 計画の欄の真下に置く 人が外して〔付ける〕を押すまで残る
+        self._direction_box = DirectionPlanBox(self)
+        self._direction_box.toggled.connect(self._toggle_direction)
+        self._direction_box.apply_requested.connect(self.apply_direction)
+        self._direction_box.cancel_requested.connect(self.cancel_direction)
+        self._direction_box.close_requested.connect(self.close_direction)
 
         # 部品が古くて断られたときの案内 その場で押せる更新のボタンを添える
         # 案内の文だけだと、どこで更新するのかを探させることになる
@@ -656,6 +664,7 @@ class ChatPanel(QWidget):
         layout.addWidget(self._login_box)
         layout.addWidget(self._view, 1)
         layout.addWidget(self._plan_box)
+        layout.addWidget(self._direction_box)
         layout.addWidget(self._approval_box)
         layout.addWidget(self._budget_box)
         layout.addWidget(self._question_box)
@@ -1821,6 +1830,45 @@ class ChatPanel(QWidget):
             ready=self._ready and not self._login_waiting,
             plan_on=self._plan_first,
         )
+        self._direction_box.show_proposal(
+            proposal_for(self._host.document).view(), working=bool(self._queued)
+        )
+
+    # --- 演出の計画（#479） ---
+
+    @property
+    def direction_box(self) -> DirectionPlanBox:
+        return self._direction_box
+
+    def _toggle_direction(self, number: int, excluded: bool) -> None:
+        proposal_for(self._host.document).exclude(number, excluded)
+        self._refresh_plan()
+
+    def apply_direction(self) -> None:
+        """〔付ける〕 外していない項目を取り消し 1 回で戻せるまとまりとして付ける
+
+        AI が応えている間は付けない AI の 1 回の指示は取り消し 1 回にまとまっているので、
+        その最中に付けると演出が AI の段に混ざり、計画だけを取り消せなくなる
+        """
+        if self._queued:
+            return
+        result = proposal_for(self._host.document).apply(self._host.document)
+        if result is not None:
+            note = f"演出を {len(result.applied)} 個付けました（取り消し 1 回で全部戻ります）"
+            if result.skipped:
+                note += f" 付けられなかった物 {len(result.skipped)} 個"
+            self._note(note)
+        self._refresh_plan()
+
+    def cancel_direction(self) -> None:
+        """〔やめる〕 何も付けずに計画を閉じる"""
+        proposal_for(self._host.document).cancel()
+        self._refresh_plan()
+
+    def close_direction(self) -> None:
+        """〔×〕 付けた後・やめた後の計画を閉じる"""
+        proposal_for(self._host.document).discard()
+        self._refresh_plan()
 
     def pause_plan(self) -> None:
         """〔区切りで止める〕 今の手順を終えた所で止める（すぐ止めるのは〔中断〕）"""

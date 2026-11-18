@@ -42,6 +42,12 @@ from sashimono.ai.auto_fix import (
     plan_noise_fix,
     raise_cap,
 )
+from sashimono.ai.direction_plan import (
+    ProposalView,
+    build_items,
+    proposal_for,
+    sound_problem,
+)
 from sashimono.ai.fixes import ASK as FIX_ASK
 from sashimono.ai.fixes import AUTO as FIX_AUTO
 from sashimono.ai.fixes import (
@@ -251,6 +257,16 @@ from sashimono.core.commands.layers import places_mixed
 from sashimono.core.commands.speed import SPEED_PERCENT_RANGE, ChangeSpeed, speed_members
 from sashimono.core.commands.volume import clip_volume, volume_commands
 from sashimono.core.direction import DirectionEvent, KindDensity, measure_direction
+from sashimono.core.direction_recipes import ACTIONS as DIRECTION_ACTIONS
+from sashimono.core.direction_recipes import CUES as DIRECTION_CUES
+from sashimono.core.direction_recipes import GENRES as DIRECTION_GENRES
+from sashimono.core.direction_recipes import STRENGTHS as DIRECTION_STRENGTHS
+from sashimono.core.direction_recipes import (
+    Cue,
+    DirectionTaste,
+    plan_direction,
+    recipe_book,
+)
 from sashimono.core.emphasis import (
     EMPHASIS_EASINGS,
     EMPHASIS_KINDS,
@@ -2666,6 +2682,218 @@ def _measure_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         )
     rows = [_event_row(event) for event in report.events]
     return _paged_after(head, rows, arguments, "events", note)
+
+
+def _direction_taste(host: EditorHost, arguments: dict[str, Any]) -> DirectionTaste:
+    """本人の設定の強さとジャンル 頼みの文で言われて引数で渡されたらそれで上書きする"""
+    taste = host.direction_taste
+    genre = str(arguments.get("genre") or taste.genre)
+    strength = str(arguments.get("strength") or taste.strength)
+    if genre not in DIRECTION_GENRES:
+        raise ToolError(f"genre は {'・'.join(DIRECTION_GENRES)} のどれかです")
+    if strength not in DIRECTION_STRENGTHS:
+        raise ToolError(f"strength は {'・'.join(DIRECTION_STRENGTHS)} のどれかです")
+    return DirectionTaste(genre=genre, strength=strength)
+
+
+def _get_direction_recipes(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """演出のレシピ（#478）を本人の好みで引く 頼みの文で強さやジャンルを言われたら引数で変える"""
+    taste = host.direction_taste
+    chosen = _direction_taste(host, arguments)
+    genre, strength = chosen.genre, chosen.strength
+    # 方針（#343）の使ってよい効果の外を使うレシピは外す 付けてから照らすと本人に直させる
+    book = recipe_book(
+        DirectionTaste(genre=genre, strength=strength), host.document.project.style_guide.effects
+    )
+    return {
+        "genre": genre,
+        "genre_name": DIRECTION_GENRES[genre],
+        "strength": strength,
+        "strength_name": DIRECTION_STRENGTHS[strength],
+        # 設定のままか 上書きしたことを本人へ伝え忘れないよう返す
+        "from_settings": (genre, strength) == (taste.genre, taste.strength),
+        "recipes": [
+            {
+                "key": rule.recipe.key,
+                "name": rule.recipe.name,
+                "cue": rule.recipe.cue,
+                "action": rule.recipe.action,
+                "action_name": DIRECTION_ACTIONS[rule.recipe.action],
+                "kind": rule.recipe.kind,
+                "reason": rule.recipe.reason,
+                "per_minute": rule.per_minute,
+                "min_gap_seconds": rule.min_gap_seconds,
+                "amount": rule.amount,
+                "seconds": rule.recipe.seconds,
+            }
+            for rule in book.rules
+        ],
+        "left_out": [
+            {"key": recipe.key, "name": recipe.name, "reason": reason}
+            for recipe, reason in book.left_out
+        ],
+        "note": (
+            "cue は find_highlights の signals と同じ名前で、その盛り上がりに action を付けます"
+            " per_minute は 1 分あたりの上限、min_gap_seconds は同じ kind どうしをあける秒数"
+            "（レシピをまたいで数えます） amount は寄るなら拡大率の %、揺らすなら幅の画素で、"
+            "emphasis の scale_percent・amplitude_px に渡します 効果音は本人が取り込んだ音の素材"
+            "から選び、無ければ付けずにそう伝えます 付けた後は measure_direction で数えます"
+            " 強さとジャンルは本人の設定で、頼みの文で言われたときだけ引数で変えます"
+        ),
+    }
+
+
+#: 一度に渡せる手がかりの数 盛り上がりの道具の 1 頁を何頁か重ねても足りる数
+DIRECTION_CUES_LIMIT = 500
+
+
+def _direction_cues(project: Project, arguments: dict[str, Any]) -> list[Cue]:
+    """手がかりの引数（タイムラインのフレーム）を秒の手がかりにする"""
+    raw = arguments.get("cues")
+    if not isinstance(raw, list) or not raw:
+        raise ToolError("cues は find_highlights の区間を並べた配列です（1 つ以上）")
+    if len(raw) > DIRECTION_CUES_LIMIT:
+        raise ToolError(f"cues は {DIRECTION_CUES_LIMIT} 個までです")
+    rate = project.timeline.rate
+    cues: list[Cue] = []
+    for number, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise ToolError(f"cues の {number} 番目がオブジェクトではありません")
+        signal = item.get("signal")
+        if signal not in DIRECTION_CUES:
+            raise ToolError(
+                f"cues の {number} 番目の signal は {'・'.join(DIRECTION_CUES)} のどれかです"
+            )
+        start, end = item.get("start_frame"), item.get("end_frame")
+        score = item.get("score", 0.5)
+        if not (isinstance(start, int) and isinstance(end, int)) or not (
+            _is_int(start) and _is_int(end) and 0 <= start < end
+        ):
+            raise ToolError(f"cues の {number} 番目の start_frame・end_frame が正しくありません")
+        if isinstance(score, bool) or not isinstance(score, int | float) or not 0 <= score <= 1:
+            raise ToolError(f"cues の {number} 番目の score は 0〜1 の数です")
+        clip = item.get("clip_id")
+        cues.append(
+            Cue(
+                signal=str(signal),
+                start=float(frame_to_seconds(start, rate)),
+                end=float(frame_to_seconds(end, rate)),
+                score=float(score),
+                source=str(clip) if clip else None,
+            )
+        )
+    return cues
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """演出の計画（#479）を作って計画の欄に出す 作品は変えない 付けるのは人の〔付ける〕"""
+    if host.active_scene is not None:
+        # 開いたシーンの時刻とクリップで計画しても、計画と〔付ける〕はメインへ当たる
+        # シーンのクリップが見つからず、同じ時刻に映るメインの素材へ寄ってしまう
+        raise ToolError(
+            "シーンを開いたままでは演出の計画を立てられません"
+            " set_active_scene でメインに戻してから頼んでください"
+        )
+    project = host.document.project
+    taste = _direction_taste(host, arguments)
+    cues = _direction_cues(project, arguments)
+    rate = project.timeline.rate
+    start = _frame_argument(arguments, "start_frame", 0)
+    end = _frame_argument(arguments, "end_frame", project.timeline.duration)
+    if end <= start:
+        raise ToolError("範囲（start_frame〜end_frame）が空です")
+    sound = None
+    raw_sound = arguments.get("sound_media_id")
+    if raw_sound:
+        sound = _require_media(project, str(raw_sound))
+        problem = sound_problem(sound)
+        if problem is not None:
+            raise ToolError(problem)
+    book = recipe_book(taste, project.style_guide.effects)
+    planned = plan_direction(
+        cues,
+        book,
+        float(frame_to_seconds(start, rate)),
+        float(frame_to_seconds(end, rate)),
+    )
+    items, dropped = build_items(
+        project,
+        planned,
+        [ClipId(p.source) if p.source else None for p in planned],
+        sound,
+        end,
+    )
+    view = proposal_for(host.document).propose(items, dropped, DIRECTION_STRENGTHS[taste.strength])
+    note = (
+        "計画の欄に出しました まだ何も付けていません ユーザーが要らない項目を外して"
+        "〔付ける〕を押すと、残りを取り消し 1 回で戻せるまとまりとして付けます "
+        "〔付ける〕を押せることを伝えて応答を終えます（応えている間は押せません） "
+        "押した後に頼まれたら、付いたかは get_direction_plan で読みます "
+        "項目が少なければ、手がかりが少ないか強さの上限に当たっています"
+        " 項目の続き（next_offset）は get_direction_plan に offset を渡して読みます"
+    )
+    if any(rule.recipe.action == "sound" for rule in book.rules) and sound is None:
+        note += " 効果音は sound_media_id に本人が取り込んだ短い音の素材を渡すと計画に入ります"
+    return _proposal_result(view, {}, note)
+
+
+def _proposal_result(view: ProposalView, arguments: dict[str, Any], note: str) -> dict[str, Any]:
+    """計画の様子 項目の一覧（items）はページに分ける
+
+    計画の欄は全項目を持つ 長い作品で項目が多いと、AI へ返す一覧だけで返事の上限を越え、
+    打ち切られて後半の項目も付けた結果も読めない
+    """
+    head: dict[str, Any] = {
+        "state": view.state.value,
+        "strength_name": view.strength_name,
+        "dropped": [{"at": at, "reason": reason} for at, reason in view.dropped],
+    }
+    if view.result is not None:
+        head["applied"] = list(view.result.applied)
+        head["skipped"] = [
+            {"number": number, "reason": reason} for number, reason in view.result.skipped
+        ]
+    rows = [
+        {
+            "number": item.number,
+            "recipe": item.recipe,
+            "action": item.action,
+            "kind": item.kind,
+            "start_frame": item.start_frame,
+            "end_frame": item.end_frame,
+            "amount": item.amount,
+            "clip_id": str(item.clip_id) if item.clip_id is not None else None,
+            "media_id": str(item.media_id) if item.media_id is not None else None,
+            "excluded": item.number in view.excluded,
+        }
+        for item in view.items
+    ]
+    return _paged_after(head, rows, arguments, "items", note)
+
+
+def _get_direction_plan(host: EditorHost, arguments: dict[str, Any]) -> object:
+    view = proposal_for(host.document).view()
+    if view is None:
+        return {
+            "state": "none",
+            "note": "演出の計画はありません 計画は propose_direction で出せます",
+        }
+    note = {
+        "proposed": (
+            "ユーザーが外す物を選んでいる所です 〔付ける〕を押せることを伝えて応答を"
+            "終えます（応えている間は押せません）"
+        ),
+        "applied": (
+            "applied の項目を付けました 取り消し 1 回で全部戻ります measure_direction・"
+            "preview_range・check_output で確かめ、方針の外ややりすぎがあれば直します"
+        ),
+        "cancelled": "ユーザーが計画をやめました 何も付けていません",
+    }[view.state.value]
+    return _proposal_result(view, arguments, note)
 
 
 def _author(by: Author | None) -> str | None:
@@ -11743,6 +11971,105 @@ OPERATIONS: tuple[Operation, ...] = (
         handler=_check_style_guide,
         # 返すのは書体の名前・色・効果の種類とクリップの在りかだけ 方針の文も本文も返さない
         sends=_STRUCTURE,
+    ),
+    Operation(
+        name="get_direction_recipes",
+        description=(
+            "演出のレシピ（どの盛り上がりに何を付けるか・1 分に何回まで・何秒あけるか・強さ）を"
+            "本人の設定のジャンルと強さで引く（読むだけ） 演出を付ける前に読み、"
+            "find_highlights の盛り上がりへレシピの数と間隔の内で付ける"
+            " 方針の使ってよい効果の外を使うレシピは left_out に外して返す"
+            " 頼みの文で「派手に」「控えめに」などと言われたときだけ strength を渡す"
+        ),
+        schema=_schema(
+            {
+                "strength": {
+                    "type": "string",
+                    "enum": list(DIRECTION_STRENGTHS),
+                    "description": (
+                        "強さ "
+                        + "・".join(f"{k}（{v}）" for k, v in DIRECTION_STRENGTHS.items())
+                        + " 省くと本人の設定"
+                    ),
+                },
+                "genre": {
+                    "type": "string",
+                    "enum": list(DIRECTION_GENRES),
+                    "description": (
+                        "ジャンル "
+                        + "・".join(f"{k}（{v}）" for k, v in DIRECTION_GENRES.items())
+                        + " 省くと本人の設定"
+                    ),
+                },
+            }
+        ),
+        handler=_get_direction_recipes,
+        # 返すのはレシピ（アプリが持つ決まり）と本人の設定の強さ・ジャンルだけ 方針の文は返さない
+        sends=frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS}),
+    ),
+    Operation(
+        name="propose_direction",
+        description=(
+            "演出の計画を作って AI のパネルの計画の欄に一覧で出す（作品は変えない）"
+            " find_highlights の区間を cues に渡すと、get_direction_recipes のレシピ（本人の設定の"
+            "強さとジャンル）で、どこに何を付けるかを選ぶ ユーザーが要らない項目を外して"
+            "〔付ける〕を押すと、残りを取り消し 1 回で戻せるまとまりとして付ける"
+            " 演出を任されたら emphasize を 1 つずつ使わずにこれを使う 前の計画は捨てる"
+        ),
+        schema=_schema(
+            {
+                "cues": {
+                    "type": "array",
+                    "description": (
+                        "手がかり find_highlights の区間ごとに、主な手がかり（reasons の先頭）を"
+                        "signal に、timeline の範囲を start_frame・end_frame に、その clip_id と"
+                        f"score を入れる（{DIRECTION_CUES_LIMIT} 個まで）"
+                    ),
+                    "maxItems": DIRECTION_CUES_LIMIT,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "signal": {"type": "string", "enum": list(DIRECTION_CUES)},
+                            "start_frame": {"type": "integer"},
+                            "end_frame": {"type": "integer"},
+                            "score": {"type": "number"},
+                            "clip_id": {"type": "string"},
+                        },
+                        "required": ["signal", "start_frame", "end_frame"],
+                        "additionalProperties": False,
+                    },
+                },
+                "start_frame": _integer("演出を付ける範囲の頭 省くとタイムラインの頭"),
+                "end_frame": _integer("範囲の終わり（含まない） 省くとタイムラインの終わり"),
+                "sound_media_id": _string(
+                    "効果音に使う本人の素材（音だけ・短い） 省くと効果音は計画に入れない"
+                ),
+                "strength": {
+                    "type": "string",
+                    "enum": list(DIRECTION_STRENGTHS),
+                    "description": "強さ 頼みの文で言われたときだけ渡す 省くと本人の設定",
+                },
+                "genre": {
+                    "type": "string",
+                    "enum": list(DIRECTION_GENRES),
+                    "description": "ジャンル 頼みの文で言われたときだけ渡す 省くと本人の設定",
+                },
+            },
+            ["cues"],
+        ),
+        handler=_propose_direction,
+        # 返すのは項目の型・フレーム・強さ・クリップと素材の ID だけ 方針の文は返さない
+        sends=frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS}),
+    ),
+    Operation(
+        name="get_direction_plan",
+        description=(
+            "演出の計画の今の様子（出している・付けた・やめた）と、ユーザーが外した項目、"
+            "付けた項目と付けられなかった項目を読む 項目の一覧（items）は" + PAGING_NOTE
+        ),
+        schema=_schema(_paging()),
+        handler=_get_direction_plan,
+        sends=frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS}),
     ),
     Operation(
         name="measure_direction",
