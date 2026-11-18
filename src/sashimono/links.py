@@ -12,6 +12,7 @@ from __future__ import annotations
 __all__ = [
     "BETA_MANIFEST_URL",
     "DISCUSSION_CATEGORIES",
+    "INSTALL_URL",
     "MANUAL_URL",
     "RELEASES_URL",
     "REPORT_URL",
@@ -26,6 +27,10 @@ REPOSITORY_URL = "https://github.com/kagemorikosame/sashimono-edit"
 #: たどれる README の操作の節へ飛ばしていたのは Wiki の公開前だけの手当て（公開前の
 #: Wiki へ飛ばすと、GitHub は「Wiki を作る」画面を出し、壊れたリンクにしか見えない）
 MANUAL_URL = f"{REPOSITORY_URL}/wiki"
+
+#: Wiki の入れ方の手順書 配る zip の一番上の説明書きから案内する（#485） exe だけを
+#: 取り出して起動できない人が、エラーの文言から辿り着く先 Wiki のページの名前を変えたら直す
+INSTALL_URL = f"{MANUAL_URL}/手順書-ダウンロードして入れる"
 
 #: 不具合・要望・質問の受け口 Discussions のカテゴリを選ぶ画面へ直に飛ばす
 #: Issue は開発者が直す作業を管理する置き場にして、使う人の報告は Discussions で受ける

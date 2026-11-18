@@ -563,6 +563,44 @@ python -m venv .venv
 「不具合の報告」「互換（AviUtl／YMM4）の報告」「要望」「質問」のカテゴリを選ぶと、版や再現手順の欄が出ます
 版と置き場は〔ヘルプ〕→〔バージョン情報…〕に出ます Issue は開発者が直す作業を管理する置き場で、報告は Discussions で確かめてから Issue に起こします
 
+## 配布版の入れ方
+
+配布版はインストーラの無い zip です [いちばん新しい版のページ](https://github.com/kagemorikosame/sashimono-edit/releases/latest)の
+Assets から `SashimonoEdit-<版>-windows-x64.zip` を落とし、次の順に置きます
+（画像付きの手順は Wiki の [ダウンロードして入れる](https://github.com/kagemorikosame/sashimono-edit/wiki/手順書-ダウンロードして入れる)）
+
+1. zip の中の `Sashimono` フォルダを、**フォルダごと**置きます おすすめの置き場は `%LOCALAPPDATA%\Programs` です
+   （自分の権限で書けるので自動更新がそのまま使えます）
+2. `Sashimono` フォルダの中の `Sashimono.exe` を起動します
+3. デスクトップから起動したいときは、`Sashimono.exe` を右クリック →〔送る〕→〔デスクトップ（ショートカットを作成）〕で
+   **ショートカット**を置きます（Windows 11 では〔送る〕が〔その他のオプションを確認〕の中にあります）
+
+zip の一番上の `はじめにお読みください.txt` にも同じことを書いています
+
+### `Sashimono.exe` だけを取り出さない
+
+`Sashimono.exe` は起動するだけの小さな exe で、Python 本体・Qt・FFmpeg などの部品は隣の `_internal` フォルダにあります
+exe だけをデスクトップなどへコピーや移動すると、アプリが動き出す前に次のエラーが出て起動しません
+
+```
+Failed to load Python DLL
+'C:\Users\<名前>\Desktop\_internal\python314.dll'.
+LoadLibrary: 指定されたモジュールが見つかりません
+```
+
+（`python314.dll` の数字は入っている Python の版で変わります）
+このエラーが出たら、次を順に確かめてください
+
+- **`Sashimono.exe` の隣に `_internal` フォルダがあるか** 無ければ exe だけを取り出しています
+  写した exe を消し、`Sashimono` フォルダごと置き直して、デスクトップにはショートカットを置いてください
+- **`_internal` の中に `python314.dll` があるか** 無ければ展開が途中で終わったか、ウイルス対策ソフトが隔離しています
+  Windows セキュリティの〔保護の履歴〕に記録が無いかを見て、zip を展開し直してください
+- **OneDrive の中に置いていないか** 同期の途中や「オンラインのみ」のファイルが残っていると読めません
+  OneDrive の外（`%LOCALAPPDATA%\Programs` など）へ置き直してください
+
+起動はするがうまく動かないときは、`Sashimono` フォルダでコマンドプロンプトを開き `Sashimono.exe --self-check | more` を打つと、
+どの部品が動いていないかが 1 行ずつ出ます
+
 ## 更新と、自分の物の置き場
 
 配布版（zip）は、新しい版を自分で確かめ、署名と中身を確かめてから、尋ねて入れ替えます
