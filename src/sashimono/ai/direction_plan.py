@@ -444,6 +444,15 @@ def _sound_commands(project: Project, item: DirectionItem) -> list[Command]:
     """効果音を効果音のトラックへ置く 空いていなければ足したトラックへ置く"""
     if item.media_id is None or project.find_media(item.media_id) is None:
         raise ValueError("効果音の素材が見つかりません（計画の後で外された）")
+    # 計画を作った時の検査だけでは、その後に人が同じ区間へ置いた効果音を見落とす
+    # 足すのは別のトラックなので、重なると両方が鳴って大きくなる 付ける直前の作品でも見る
+    if any(
+        event.kind == item.kind
+        and event.start_frame < item.end_frame
+        and item.start_frame < event.end_frame
+        for event in direction_events(project, project.timeline)
+    ):
+        raise ValueError("その時刻にはもう効果音があるので重ねません（計画の後で置かれた）")
     clip = Clip(
         timeline_start=item.start_frame,
         duration=item.end_frame - item.start_frame,

@@ -25,7 +25,14 @@ from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
-from sashimono.core.commands import AddMedia, Command, RemoveClip, history
+from sashimono.core.commands import (
+    AddClip,
+    AddMedia,
+    AddTrack,
+    Command,
+    RemoveClip,
+    history,
+)
 from sashimono.core.direction import SHAKE, SOUND, ZOOM, measure_direction
 from sashimono.core.direction_recipes import ACTION_ZOOM, BOLD, DirectionTaste, PlannedDirection
 from sashimono.core.io.serialize import json_text
@@ -319,6 +326,42 @@ class TestApply:
         again = run(work, "propose_direction", cues=_cues(work), sound_media_id=str(sound.id))
         assert SOUND not in [row["kind"] for row in again["items"]]
         assert any("もう効果音" in row["reason"] for row in again["dropped"])
+
+    def test_a_sound_placed_after_the_plan_is_not_doubled(self, work: FakeHost) -> None:
+        # 計画の後で人が同じ区間へ効果音を置くと、付ける時に見直さないと両方が鳴る
+        # 重なる効果音だけを理由付きで飛ばし、残りの項目は付ける
+        sound = _sound(1)
+        work.document.execute(AddMedia(sound))
+        items = run(work, "propose_direction", cues=_cues(work), sound_media_id=str(sound.id))[
+            "items"
+        ]
+        sounds = [row for row in items if row["kind"] == SOUND]
+        assert sounds and len(items) > len(sounds)
+        placed = sounds[0]
+        track = Track(kind=TrackKind.AUDIO, name="人の効果音")
+        work.document.execute(AddTrack(track))
+        work.document.execute(
+            AddClip(
+                track.id,
+                Clip(
+                    timeline_start=placed["start_frame"],
+                    duration=placed["end_frame"] - placed["start_frame"],
+                    media_id=sound.id,
+                ),
+            )
+        )
+        result = proposal_for(work.document).apply(work.document)
+        assert result is not None
+        reasons = dict(result.skipped)
+        assert "もう効果音" in reasons[placed["number"]]
+        assert set(result.applied) == {row["number"] for row in items} - set(reasons)
+        assert len(result.applied) >= len(items) - len(sounds)
+        heard = [
+            e
+            for e in measure_direction(work.document.project, work.document.project.timeline).events
+            if e.kind == SOUND and e.start_frame == placed["start_frame"]
+        ]
+        assert len(heard) == 1
 
     def test_sounds_stay_inside_the_range(self, work: FakeHost) -> None:
         # 範囲の終わりを越えて置くと作品が延び、書き出しに絵の無い末尾が付く
