@@ -5710,6 +5710,7 @@ Wiki の写真（手順書と、プリセットや AI アシスタントなど�
 | `library-manage.png` `library-save.png` | Wiki のプリセットとエイリアス 見本のプリセット 6 つ（`SAMPLE_PRESETS` 撮るたびに置き場を作り直す）を並べた一覧の窓と、保存済みの一覧から上書きする物を選んだ保存の窓（上書きの印を囲む 前といまの見本が並ぶ） |
 | `edit-strokes.png` `edit-layout.png` `edit-snap.png` | Wiki の基本の編集 縁取りの層 2 つのテキスト（プレビューと設定パネルだけを切り出し〔＋ 縁取りを追加〕を囲む）・見本のエイリアスを置いたテキストの〔組み方を「標準」にする〕・タイムラインの〔磁石〕と再生ヘッドの吸い付き（タイムラインだけを切り出す） |
 | `ai-question.png` | Wiki の AI アシスタント 見本の会話（`SAMPLE_QUESTION_CHAT`）と選択肢 3 つの質問（`SAMPLE_QUESTION` 道具と同じ確かめを通す） **本物の Claude には送らない** AI のパネルだけを切り出す |
+| `ai-direction.png` | Wiki の AI アシスタントと手順書 見本の会話（`SAMPLE_DIRECTION_CHAT`）と演出の計画の欄 2 つ目の項目の印を外した所 見本の素材は 8 秒でレシピの 1 分あたりの上限では 1 つも選ばれないので、選び方（`plan_direction`）だけを飛ばし、付ける先を決める `build_items` と欄は本物を通す **本物の Claude には送らない** AI のパネルだけを切り出す |
 
 気を付けること
 
