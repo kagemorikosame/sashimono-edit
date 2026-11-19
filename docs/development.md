@@ -4790,6 +4790,9 @@ Python の系列を上げる（3.14 → 3.15）ときは、setup-python の `pyt
 `tools/verify.py` も走らせる タグの push では ci.yml が走らないため main と PR では ci.yml が
 走らせるので二重にしない 本番のタグで初めて走らせて落ちると公開が止まるので、出す前に
 `gh workflow run package.yml --ref <ブランチ>` で同じ道を通しておける
+ci.yml の 3.14 も同じ制約（積む版）で入れて verify する 3.12 は留めずに最新で入れる
+0.2.5 は CI が最新の PyAV 19 だけで通り、タグの後の組み立て（PyAV 18）で mypy が落ちて打ち直した
+手元で配る版の型を見るなら、制約で入れた別の仮想環境で `python -m mypy` を走らせる
 ffmpeg の版とハッシュは `.github/actions/ffmpeg` の 1 か所（ci.yml と package.yml が使う）
 走らせるのは main への push、タグの push（`release.yml` から呼ぶ 落ちたら下書きへ上げない）、
 手で（workflow_dispatch）、組み立てと確かめに関わるファイルを変える PR 組み立てだけで
