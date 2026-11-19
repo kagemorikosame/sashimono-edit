@@ -31,14 +31,19 @@ from sashimono.ui.workspace import AUTO_QUALITY_HEIGHT, Preferences, PreferenceS
 
 def _uhd_media() -> MediaItem:
     """4K の素材 ここでは大きさだけを見るので、ファイルの中身は要らない"""
+    return _media_of(3840, 2160)
+
+
+def _media_of(width: int, height: int) -> MediaItem:
+    """その大きさの素材 自動の画質は大きさだけを見るので、ファイルの中身は要らない"""
     return MediaItem(
-        path=Path("4k.mp4"),
+        path=Path(f"{width}x{height}.mp4"),
         duration=Fraction(10),
         video_streams=(
             VideoStreamInfo(
                 index=0,
-                width=3840,
-                height=2160,
+                width=width,
+                height=height,
                 frame_rate=FrameRate(30),
                 time_base=Fraction(1, 30),
                 codec="h264",
@@ -379,6 +384,61 @@ class TestTheWindowFollowsThem:
         window._apply_preferences(Preferences(auto_quality=False))
         window.execute(AddMedia(_uhd_media()))
         assert window._transport.quality() == 1
+
+
+class TestAHandPickedQualityStays:
+    """本人が手で選んだ再生品質は、自動の値が変わるまで残る（#487）
+
+    自動で決め直す所は編集・取り消し・設定の保存のたびに通る 毎回当てると、
+    重い作品で 1/4 に下げた人のプレビューが編集のたびに等倍へ戻ってカクつく
+    """
+
+    @pytest.fixture
+    def window(self, qt_application: QApplication) -> Iterator[MainWindow]:
+        del qt_application
+        created = MainWindow(Project.create(), confirm_unsaved=False)
+        yield created
+        created.close()
+
+    @staticmethod
+    def _pick(window: MainWindow, divisor: int) -> None:
+        """本人が再生のバーの欄から選ぶのと同じ道で選ぶ"""
+        combo = window._transport._quality
+        combo.setCurrentIndex(combo.findData(divisor))
+
+    def test_an_edit_keeps_it(self, window: MainWindow) -> None:
+        # 壊れると、クリップを 1 つ動かすたびに下げた画質が等倍へ戻り、重い作品がカクつく
+        self._pick(window, 4)
+        # 1080p を置いても自動の値は等倍のまま 値が変わらないので当て直さない
+        window.execute(AddMedia(_media_of(1920, 1080)))
+        assert window._transport.quality() == 4
+
+    def test_undo_and_redo_keep_it(self, window: MainWindow) -> None:
+        # 壊れると、Ctrl+Z を押すたびに選んだ画質が戻る 取り消しは画質と関係が無い
+        window.execute(AddMedia(_media_of(1920, 1080)))
+        self._pick(window, 2)
+        window.undo()
+        window.redo()
+        assert window._transport.quality() == 2
+
+    def test_saving_unrelated_settings_keeps_it(self, window: MainWindow) -> None:
+        # 壊れると、画質と関係の無い設定（控えなど）を保存しただけで選んだ画質が戻る
+        self._pick(window, 4)
+        window._apply_preferences(Preferences(use_proxy=False))
+        assert window._transport.quality() == 4
+
+    def test_placing_a_big_source_still_drops_it(self, window: MainWindow) -> None:
+        """自動の値が変わったら当てる 4K を置いた時点で軽くする狙いは残す"""
+        self._pick(window, 4)
+        window.execute(AddMedia(_uhd_media()))
+        assert window._transport.quality() == Preferences().auto_quality_divisor
+
+    def test_changing_the_divisor_in_the_settings_applies_it(self, window: MainWindow) -> None:
+        # 壊れると、設定で自動の分母を変えても手で選んだ値のままで、変えた設定が効かない
+        window.execute(AddMedia(_uhd_media()))
+        self._pick(window, 1)
+        window._apply_preferences(Preferences(auto_quality_divisor=4))
+        assert window._transport.quality() == 4
 
 
 class TestThePrefetchSetting:

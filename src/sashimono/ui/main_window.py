@@ -528,6 +528,9 @@ class MainWindow(QMainWindow):
         self._shown_root = self._document.project
         #: 再生ヘッドのフレームを数えているレート 変わったら数え直す（:meth:`_retime_playhead`）
         self._playhead_rate = self._document.project.rate
+        #: 前に自動で決めた再生品質の分母 決め直した値が同じなら当てない（#487）
+        #: 覚えないと、編集や取り消しのたびに本人が手で選んだ画質を上書きして戻す
+        self._auto_divisor: int | None = None
         self._path: Path | None = path
         #: 最後に保存した（または開いた）時点のプロジェクト 同じオブジェクトなら
         #: 変更なし モデルは frozen なので、取り消して保存した状態へ戻れば
@@ -1522,6 +1525,10 @@ class MainWindow(QMainWindow):
 
         1 枚だけなら元の素材でも入る それでも大きさで決めるのは、重ねた時点で
         入らなくなるため 測った値は :mod:`sashimono.engine.cache.proxy` の表を見る
+
+        当てるのは自動の値が前と変わったときだけ（#487） 編集・取り消し・関係の無い設定の
+        保存でも呼ばれるので、毎回当てると本人が手で選んだ画質が戻る 4K を置いた・設定の
+        分母を変えたときは値が変わるので、今までどおりその場で軽くなる
         """
         tallest = max(
             (
@@ -1531,7 +1538,11 @@ class MainWindow(QMainWindow):
             ),
             default=0,
         )
-        self._transport.set_quality(self._preferences.quality_for(tallest))
+        divisor = self._preferences.quality_for(tallest)
+        if divisor == self._auto_divisor:
+            return
+        self._auto_divisor = divisor
+        self._transport.set_quality(divisor)
 
     def reset_layout(self) -> None:
         self.restoreState(self._default_layout, LAYOUT_VERSION)
