@@ -1967,6 +1967,91 @@ def wiki_ai_question(context: Context) -> QImage:
         return image.copy(rect_in(window, chat))
 
 
+#: 演出の計画の写真に見せる会話 **本物の Claude には送らない**（``SAMPLE_CHAT`` と同じ）
+SAMPLE_DIRECTION_CHAT: tuple[tuple[str | None, str], ...] = (
+    ("あなた", "盛り上がる所に演出を付けて"),
+    (None, "▸ get_direction_recipes"),
+    (None, "▸ find_highlights"),
+    (None, "▸ propose_direction"),
+    (
+        "Claude",
+        "笑い声と大きな声の所に、寄って戻す 2 か所と揺らす 1 か所を計画の欄に出しました"
+        " まだ何も付けていません 要らない項目の印を外して〔付ける〕を押してください"
+        " 効果音は音の素材が無いので入れていません",
+    ),
+)
+
+#: 見本の計画の項目（レシピの名前, 頭の秒） 見本の素材は 8 秒しか無く、レシピの 1 分あたりの
+#: 上限で選ぶと 1 つも入らない 選び方（plan_direction）だけを飛ばし、付ける先を決める所
+#: （build_items）と欄は本物を通す
+SAMPLE_DIRECTION_CUES: tuple[tuple[str, float], ...] = (
+    ("laugh_zoom", 1.5),
+    ("loud_shake", 3.5),
+    ("laugh_sound", 4.0),
+    ("laugh_zoom", 6.0),
+)
+
+
+def show_sample_direction(window: MainWindow) -> None:
+    """見本の演出の計画を作品へ出し、2 つ目の項目の印を外した所にする"""
+    from sashimono.ai.direction_plan import build_items, proposal_for
+    from sashimono.core.direction_recipes import (
+        STRENGTHS,
+        SUBTLE,
+        DirectionTaste,
+        PlannedDirection,
+        recipe_book,
+    )
+    from sashimono.ui.workspace import Preferences
+
+    taste = DirectionTaste(genre=Preferences().direction_genre, strength=SUBTLE)
+    rules = {rule.recipe.key: rule for rule in recipe_book(taste).rules}
+    planned = [
+        PlannedDirection(
+            recipe=key,
+            action=rules[key].recipe.action,
+            kind=rules[key].recipe.kind,
+            start=start,
+            end=start + rules[key].recipe.seconds,
+            amount=rules[key].amount,
+            reason=rules[key].recipe.reason,
+        )
+        for key, start in SAMPLE_DIRECTION_CUES
+    ]
+    project = window.project
+    items, dropped = build_items(
+        project, planned, [None] * len(planned), None, project.timeline.duration
+    )
+    if len(items) < 2:
+        raise ShotError("見本の演出の計画に項目が入らない")
+    proposal = proposal_for(window.document)
+    proposal.propose(items, dropped, STRENGTHS[SUBTLE])
+    # 外す操作を見せる 全部に印が付いたままだと、外せる欄だと伝わらない
+    proposal.exclude(items[1].number, True)
+
+
+def wiki_ai_direction(context: Context) -> QImage:
+    """AI アシスタントの演出の計画の欄 **本物のセッションは走らせない**"""
+    from sashimono.ui.chat import ChatPanel
+
+    with editor(sample_project()) as window:
+        import_sample(window, context)
+        window.seek(40)
+        window.show_chat()
+        panel = window.findChild(ChatPanel)
+        if panel is None:
+            raise ShotError("AI パネルが無い")
+        _fake_conversation(panel, SAMPLE_DIRECTION_CHAT)
+        show_sample_direction(window)
+        panel._refresh_plan()
+        _make_room_above_timeline(window)
+        chat = window.findChild(QDockWidget, "chat")
+        if chat is None:
+            raise ShotError("AI アシスタントのパネルが無い")
+        image = take_editor_shot(window)
+        return image.copy(rect_in(window, chat))
+
+
 SHOTS: tuple[Shot, ...] = (
     Shot("screenshot", "README の先頭（編集画面）", shot_editor),
     Shot("subtitle", "字幕パネル", shot_subtitle),
@@ -2087,6 +2172,7 @@ SHOTS: tuple[Shot, ...] = (
     ),
     Shot("edit-snap", "Wiki 基本の編集: 磁石と再生ヘッドの吸い付き", wiki_edit_snap, wiki=True),
     Shot("ai-question", "Wiki AI アシスタント: 質問の箱", wiki_ai_question, wiki=True),
+    Shot("ai-direction", "Wiki AI アシスタント: 演出の計画の欄", wiki_ai_direction, wiki=True),
 )
 
 
