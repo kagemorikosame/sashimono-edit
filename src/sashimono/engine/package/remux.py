@@ -144,6 +144,17 @@ def _kept_streams(container: av.container.InputContainer) -> list[av.stream.Stre
     return sorted(streams, key=lambda stream: stream.index)
 
 
+def _stream_base(stream: Any) -> Fraction:
+    """道の時間の単位 分からない道は 1/1000 秒と見る
+
+    配る版の PyAV（18）は ``time_base`` を ``None`` になりうると書く 開発の版（19）は書かないので
+    CI の型の確かめでは見つからず、配る版を組むときに初めて落ちた 4 か所で別々に書くと、
+    1 か所だけ ``None`` を見落として書き出しの途中で止まる
+    """
+    base = stream.time_base
+    return as_fraction(base) if base else Fraction(1, 1000)
+
+
 def _seconds(packet: av.Packet[Any]) -> Fraction | None:
     """パケットの表示の時刻（秒 PTS の数え方） 分からなければ復号の時刻"""
     stamp = packet.pts if packet.pts is not None else packet.dts
@@ -430,7 +441,7 @@ def _copy_span(
     """1 つの区間を写す 映像は区間の頭より前のキーフレームから、終わりの少し後ろまで"""
     head = origin + span.start
     tail = origin + span.end + _TAIL_PAD
-    time_base = as_fraction(guide.time_base) if guide.time_base else Fraction(1, 1000)
+    time_base = _stream_base(guide)
     target: Fraction | None = head
     for _ in range(_SEEK_TRIES):
         assert target is not None
@@ -705,7 +716,7 @@ def _packets(
     with av.open(str(path)) as container:
         stream = container.streams[index]
         origin = media_origin(container)
-        time_base = as_fraction(stream.time_base) if stream.time_base else Fraction(1, 1000)
+        time_base = _stream_base(stream)
         # 索引の粗い入れ物でも手前に着くよう、1 秒前へ戻ってから読む
         container.seek(max(0, int((origin + start - 1) / time_base)), stream=stream, backward=True)
         found: list[_PacketKey] = []
@@ -1076,7 +1087,7 @@ def _stamps(
     found: list[int] = []
     with av.open(str(path)) as reader:
         stream = reader.streams[index]
-        base = as_fraction(stream.time_base)
+        base = _stream_base(stream)
         reader.seek(max(0, int((origin + span.start) / base)), stream=stream, backward=True)
         for packet in reader.demux(stream):
             if cancelled():
@@ -1097,7 +1108,7 @@ def _frame_at(
     """``moment``（道の頭からでなく入れ物の時刻の秒）に映る絵 その時刻以前で最後の絵"""
     with av.open(str(path)) as reader:
         stream = reader.streams[index]
-        base = as_fraction(stream.time_base)
+        base = _stream_base(stream)
         reader.seek(max(0, int(moment / base)), stream=stream, backward=True)
         shown = None
         for frame in reader.decode(stream):

@@ -477,6 +477,16 @@ class TestCut:
         )
         assert not target.exists()
 
+    def test_a_stream_without_a_time_base_is_read_in_milliseconds(self) -> None:
+        """壊れると、配る版の PyAV（18）が時間の単位を ``None`` で返す道で、範囲の確かめが落ちる"""
+
+        class _Stream:
+            time_base: Fraction | None = None
+
+        assert remux._stream_base(_Stream()) == Fraction(1, 1000)
+        _Stream.time_base = Fraction(1, 90000)
+        assert remux._stream_base(_Stream()) == Fraction(1, 90000)
+
 
 class TestPlan:
     def test_one_media_used_twice_is_one_range_list(self, media_dir: Path) -> None:

@@ -164,6 +164,21 @@ def test_a_release_is_verified_before_the_zip_is_built() -> None:
     assert "tags:" not in ci.split("\njobs:\n", 1)[0]
 
 
+def test_ci_checks_the_shipped_dependencies_on_every_pull_request() -> None:
+    """壊れると、配る版の依存でだけ落ちる型や動きの違いを、タグを打った後に初めて知る
+
+    0.2.5 は CI が留めない最新の PyAV 19 で通り、配る版の PyAV 18 で組むときに mypy が落ちた
+    ci.yml の 3.14 は package.yml と同じ制約で入れる
+    """
+    ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+    pinned = ci.index("-c build/constraints.txt")
+    step = ci[ci.rindex("- name:", 0, pinned) : pinned]
+    assert "if: matrix.python == '3.14'" in step
+    written = ci.index("--write-constraints build/constraints.txt")
+    assert written < pinned < ci.index("python tools/verify.py")
+    assert '"3.14"' in ci
+
+
 #: package.yml の検証を走らせる条件 タグ（release.yml から呼ばれたとき github.ref と
 #: github.event_name は呼び元の物）と、前もって確かめる手動の実行
 RELEASE_OR_MANUAL = (

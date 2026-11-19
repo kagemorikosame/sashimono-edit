@@ -44,11 +44,26 @@ jobs:
           # 24 秒から 20 秒にしか縮まなかった（持ち越さない方が 6 秒速い）
           enable-cache: false
 
+      - name: 配る版の制約を書く（3.14 だけ）
+        # 3.14 は配る zip と同じ版の依存（THIRD_PARTY_NOTICES.md で留めた PyAV・PySide6 ほか）で
+        # 確かめる 留めない最新だけで見ていると、型や動きの違いがタグを打った後の組み立てで
+        # 初めて落ちる（0.2.5 は PyAV 18 の time_base が None になりうる型で mypy が落ちた）
+        # 3.12 は留めずに入れ、その日の新しい依存で壊れていないかを見る側に残す
+        if: matrix.python == '3.14'
+        run: python tools/package_notices.py --write-constraints build/constraints.txt --write-requirements build/bundled-beside.txt
+
       - name: 依存を入れる
         # pip は解決と展開に毎回 1 分近くかかっていた uv は同じことを 20 秒ほどで済ませる
         # setup-python の Python へ入れる 検証の手順は素の python を呼ぶので、uv の
         # 仮想環境に入れると別の Python から見えなくなる
+        if: matrix.python != '3.14'
         run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]"
+
+      - name: 依存を配る版で入れる（3.14 だけ）
+        # 制約は package.yml の組み立てと同じ物 起動部の組み直し（--no-binary pyinstaller）は
+        # 試験に関わらず数分かかるので、ここでは既成の wheel のまま入れる
+        if: matrix.python == '3.14'
+        run: uv pip install --python "${{ steps.python.outputs.python-path }}" -e ".[dev]" -r build/bundled-beside.txt -c build/constraints.txt
 
       - name: ffmpeg を入れる
         # 素材を使うテストが要る 無くても各テストが自分で飛ばすので、
