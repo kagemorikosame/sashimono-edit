@@ -284,7 +284,7 @@ def probe_in_children(names: Iterable[str]) -> None:
         if not unknown:
             return
         try:
-            _verdicts.update(_probe_in_child(unknown))
+            _verdicts.update(_probe_in_child(unknown, here=False))
         except WorkerUnavailableError as exc:
             _log.warning("起動の後のエンコーダの確かめで別のプロセスを起こせなかった: %s", exc)
 
@@ -376,30 +376,44 @@ def _probe(names: list[str]) -> dict[str, bool]:
     return {name: _probe_here(name) for name in names}
 
 
-def _probe_in_child(names: list[str]) -> dict[str, bool]:
+def _probe_in_child(names: list[str], *, here: bool = True) -> dict[str, bool]:
     """``names`` を子のプロセスで順に確かめる 子が落ちたら、落とした物を外して残りを次の子で
 
     1 つずつ子を起こすと、候補 4 つで 1 秒近くかかる 1 つの子で順に試し、試し始める前に
     名前を送らせておけば、落ちたときにどれが落としたかが分かる
     最初の子を起こせないときは :class:`WorkerUnavailableError` を投げる（呼ぶ側がこの中で試す）
+    ``here`` が偽なら、落ちた後に子を起こし直せなくても CPU の物をこの中で試さず、
+    答えの無いまま返す（起動の後の確かめ :func:`probe_in_children` は子の中だけで試す）
     """
     verdicts: dict[str, bool] = {}
     remaining = list(names)
     while remaining:
-        trouble, culprits = _probe_batch(remaining, verdicts)
+        trouble, culprits = _probe_batch(remaining, verdicts, here=here)
         if trouble is not None:
             # 何を試していたか分からないまま落ちた（試す前・答えた直後）ときは、
             # 残りの先頭のせいにする そうしないと、同じ所で落ちる子を起こし続ける
             left = [name for name in remaining if name not in verdicts]
-            for culprit in culprits or left[:1]:
+            # 起こし直せなかったときは GPU の物だけを外す CPU の物は落ちた理由にしない
+            blamed = culprits if trouble == _RESPAWN_FAILED else culprits or left[:1]
+            for culprit in blamed:
                 verdicts[culprit] = False
                 _troubles[culprit] = trouble
                 _log.warning("エンコーダ %s の確かめで%s", culprit, trouble)
+        if trouble == _RESPAWN_FAILED:
+            # 子を起こし直せない 残りの CPU の物は ``here`` が偽なら答えの無いまま返す
+            # 次に書き出しや控えで問われたときに確かめる
+            break
         remaining = [name for name in remaining if name not in verdicts]
     return verdicts
 
 
-def _probe_batch(names: list[str], verdicts: dict[str, bool]) -> tuple[str | None, list[str]]:
+#: 落ちた後に子を起こし直せなかったときの理由
+_RESPAWN_FAILED = "落ちた後の確かめ直しで別のプロセスを起こせなかった"
+
+
+def _probe_batch(
+    names: list[str], verdicts: dict[str, bool], *, here: bool = True
+) -> tuple[str | None, list[str]]:
     """子を 1 つ起こして ``names`` を順に試させ、答えを ``verdicts`` へ足す
 
     子が落ちたか固まったら、その理由と、使えない物にする名前（分からなければ空）を返す
@@ -437,10 +451,10 @@ def _probe_batch(names: list[str], verdicts: dict[str, bool]) -> tuple[str | Non
         # CPU の物は駆動を読まないのでこの中で試す 外すと書き出せる物が 1 つも残らない
         left = [name for name in names if name not in verdicts]
         for name in left:
-            if encoder_vendor(name) == PRIORITY_CPU:
+            if here and encoder_vendor(name) == PRIORITY_CPU:
                 verdicts[name] = _probe_here(name)
-        gpu = [name for name in left if name not in verdicts]
-        return "落ちた後の確かめ直しで別のプロセスを起こせなかった", gpu
+        gpu = [name for name in left if encoder_vendor(name) != PRIORITY_CPU]
+        return _RESPAWN_FAILED, gpu
     except WorkerError as exc:
         return f"確かめの途中でプロセスごと落ちた（{exc}）", _named(current)
     if current is not None:

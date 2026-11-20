@@ -418,3 +418,31 @@ def test_a_recheck_cannot_slip_between_probing_and_copying(
             recheck.join()
     assert blocked == [True], "確かめ直しが写しより先に答えを消せた"
     assert ("libx264", True) in memory.verdicts
+
+
+def test_the_startup_probe_tries_nothing_here_after_a_crash(
+    broken_driver: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """起動の後の確かめは、子が落ちた後に起こし直せなくても、CPU の物までこの中で試さない
+
+    起動の後の確かめは子の中だけに限る（PR #492 の CodeRabbit の 4 回目の指摘）
+    残った CPU の物は答えの無いまま残し、書き出しや控えで問われたときに確かめる
+    """
+    real = worker.run_in_process
+    calls = [0]
+
+    def once(*args: Any, **options: Any) -> Any:
+        calls[0] += 1
+        if calls[0] > 1:
+            raise WorkerUnavailableError("起こせない")
+        return real(*args, **options)
+
+    def here(name: str) -> bool:
+        pytest.fail(f"起動の後の確かめが {name} をこの中で試した")
+
+    monkeypatch.setattr(encoders, "run_in_process", once)
+    monkeypatch.setattr(encoders, "_probe_here", here)
+    encoders.probe_in_children(["crash_nvenc", "hevc_nvenc", "libx264"])
+    memory = encoders.remembered()
+    assert dict(memory.verdicts) == {"crash_nvenc": False, "hevc_nvenc": False}
+    assert set(dict(memory.troubles)) == {"crash_nvenc", "hevc_nvenc"}
