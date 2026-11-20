@@ -345,6 +345,11 @@ class ExportDialog(QDialog):
         if not self._bitrate_writing:
             self._bitrate_touched = True
 
+    @property
+    def checking_codecs(self) -> bool:
+        """使えるエンコーダを裏で確かめていて、「コーデック」の欄がまだ埋まっていない"""
+        return self._codec.count() == 1 and self._codec.itemText(0) == CHECKING_CODECS
+
     def _fill_codecs(self, codecs: list[str]) -> None:
         """確かめた候補を「コーデック」の欄へ並べる"""
         self._codec.clear()

@@ -27,13 +27,13 @@ from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.aviutl.catalog import script_catalog
 from sashimono.compat.aviutl.report import NO_RECORDS, ReportRecords, global_report
 from sashimono.core.model import Project
+from sashimono.engine.encode import exporter
 from sashimono.engine.encode.exporter import (
     ExportError,
     ExportSettings,
-    export_candidates,
     export_project,
 )
-from sashimono.engine.encoders import ProbeMemory, remember, remembered
+from sashimono.engine.encoders import ProbeMemory, probe_and_remember, remember
 from sashimono.engine.worker import (
     WorkerCrashedError,
     WorkerFailedError,
@@ -215,9 +215,13 @@ def export_anywhere(
         # 使う候補を親で確かめておく（#464） 書き出しの子は daemon なので孫を起こせず、
         # 答えを知らない物は子の中で試すことになる 壊れた駆動ならそこで子ごと落ち、
         # CPU へ戻れずに書き出しが失敗する 覚えた物は試し直さないので、普通は待たない
-        with contextlib.suppress(ValueError):
-            # 知らない優先は子の書き出しが同じ文で断る ここで止めると文が変わる
-            export_candidates(settings)
+        # 確かめと写しは同じ錠の中で取る 間に確かめ直しが割り込むと空の写しが子に渡る
+        # 名指しの GPU の物が落ちると子は自動の候補へ移るので、自動の候補もいつも確かめる
+        # 並びはモジュールから引く 試験が並びを差し替えたときも同じ物を確かめる
+        names = list(exporter.VIDEO_CODEC_PREFERENCE)
+        if settings.video_codec:
+            names.append(settings.video_codec)
+        probes = probe_and_remember(names)
         target = settings.path
         scratch = _scratch_for(target)
         try:
@@ -227,7 +231,7 @@ def export_anywhere(
                     "project": project,
                     "settings": dataclasses.replace(settings, path=scratch),
                     "runtime": AviUtlRuntime.capture(),
-                    "probes": remembered(),
+                    "probes": probes,
                 },
                 progress=progress,
                 should_cancel=should_cancel,

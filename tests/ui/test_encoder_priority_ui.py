@@ -34,6 +34,7 @@ from sashimono.ui.export_dialog import AUTO_CODEC, CODEC_LABELS, ExportDialog
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import ENCODER_PRIORITY_CHOICES, PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.ui.export_codecs import settled
 
 
 @pytest.fixture(autouse=True)
@@ -113,8 +114,8 @@ def test_the_export_dialog_follows_the_priority(
 ) -> None:
     # 効かないと、設定で AMD を先にと選んでも、書き出しの窓の自動が NVENC を使う
     del qt_application
-    plain = ExportDialog(Project.create())
-    amd = ExportDialog(Project.create(), encoder_priority=PRIORITY_AMD)
+    plain = settled(ExportDialog(Project.create()))
+    amd = settled(ExportDialog(Project.create(), encoder_priority=PRIORITY_AMD))
     try:
         assert _codecs_in(plain)[:2] == ["h264_nvenc", "h264_amf"]
         assert _codecs_in(amd)[0] == "h264_amf"
@@ -224,7 +225,7 @@ def test_the_export_dialog_says_which_encoder_wrote_it(
     monkeypatch.setattr(export_dialog, "available_video_codecs_now", lambda _priority: ["libx264"])
     monkeypatch.setattr(export_dialog, "run_export", _noting_export)
     monkeypatch.setattr(QMessageBox, "information", lambda _p, _t, text: shown.append(text))
-    dialog = ExportDialog(_text_project(), folder=tmp_path)
+    dialog = settled(ExportDialog(_text_project(), folder=tmp_path))
     try:
         dialog._start()
         _wait_until(lambda: bool(shown))

@@ -129,3 +129,37 @@ class TestExportDialogWhileProbing:
         finally:
             if not released:
                 encoders._probe_lock.release()
+
+    def test_the_export_window_opens_before_anything_is_known(
+        self, qt_application: QApplication, probe_here: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """まだ何も確かめていなければ、錠が空いていても窓の中では確かめずに裏で待つ
+
+        起動の後の確かめより先に窓を開くと、画面のスレッドで子を起こして試すことになり、
+        固まった駆動を待ち切るまで窓が開かない（PR #492 の CodeRabbit の 2 回目の指摘）
+        """
+        from sashimono.core.model import Project, ProjectSettings
+        from sashimono.engine.encode import exporter
+        from sashimono.ui.export_dialog import ExportDialog
+        from tests.ui.export_codecs import settled
+
+        del qt_application
+        gate = threading.Event()
+        ran_on: list[int] = []
+
+        def slow(_name: str) -> None:
+            ran_on.append(threading.get_ident())
+            gate.wait(5)
+
+        monkeypatch.setattr(encoders, "probe_encoder", slow)
+        monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("libx264",))
+        dialog = ExportDialog(Project.create(ProjectSettings()))
+        try:
+            assert dialog.checking_codecs
+            gate.set()
+            settled(dialog)
+            assert dialog._codec.findData("libx264") >= 0
+            assert ran_on and ran_on[0] != threading.get_ident()
+        finally:
+            gate.set()
+            dialog.deleteLater()

@@ -37,6 +37,7 @@ __all__ = [
     "encoder_vendor",
     "forget_probes",
     "order_by_priority",
+    "probe_and_remember",
     "probe_encoder",
     "probe_in_children",
     "probe_troubles",
@@ -231,18 +232,33 @@ def usable_encoders(names: Iterable[str]) -> list[str]:
 
 
 def usable_encoders_now(names: Iterable[str]) -> list[str] | None:
-    """:func:`usable_encoders` と同じ ただしほかの確かめが走っている間は待たずに ``None``
+    """覚えた答えだけで足りれば :func:`usable_encoders` と同じ 足りなければ待たずに ``None``
 
-    書き出しの窓は画面のスレッドで候補を並べる 設定画面の確かめ直しや起動の後の確かめが
-    走っている所で待つと、固まった駆動を待ち切るまで（候補ごとに 15 秒）窓が開かない
+    書き出しの窓は画面のスレッドで候補を並べる ほかの確かめが走っている所で待つか、
+    ここで子を起こして試すと、固まった駆動を待ち切るまで（候補ごとに 15 秒）窓が開かない
     ``None`` なら呼ぶ側は裏で :func:`usable_encoders` を呼んで、終わってから並べる
     """
     if not _probe_lock.acquire(blocking=False):
         return None
     try:
-        return _usable_locked(list(dict.fromkeys(names)))
+        wanted = list(dict.fromkeys(names))
+        if any(name not in _verdicts for name in wanted):
+            return None
+        return [name for name in wanted if _verdicts[name]]
     finally:
         _probe_lock.release()
+
+
+def probe_and_remember(names: Iterable[str]) -> ProbeMemory:
+    """``names`` を確かめてから、覚えている答えの写しを返す 確かめと写しは同じ錠の中で
+
+    書き出しの子へ渡す 確かめてから写すまでの間に確かめ直し（:func:`forget_probes`）が
+    割り込むと、空の写しが子に渡り、子が自分の中で GPU を試して落ちる
+    （PR #492 の CodeRabbit の指摘）
+    """
+    with _probe_lock:
+        _usable_locked(list(dict.fromkeys(names)))
+        return ProbeMemory(tuple(_verdicts.items()), tuple(_troubles.items()))
 
 
 def verdict(name: str) -> tuple[bool, str | None]:

@@ -347,3 +347,31 @@ def test_no_notice_when_the_named_encoder_was_used(
     encoders.usable_encoders(["crash_nvenc", "libx264"])
     settings = exporter.ExportSettings(path=Path("x.mp4"), video_codec="libx264")
     assert exporter._probe_notice(settings, "libx264") is None
+
+
+def test_a_recheck_cannot_slip_between_probing_and_copying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """書き出しの子へ渡す写しは、確かめと同じ錠の中で取る
+
+    間に確かめ直しが割り込むと空の写しが子に渡り、子が自分の中で GPU を試して落ちる
+    （PR #492 の CodeRabbit の 2 回目の指摘） 確かめの最中に確かめ直しを始めさせ、
+    写しを取り終えるまで待たされることを見る
+    """
+    import threading
+
+    real = encoders._usable_locked
+    blocked: list[bool] = []
+
+    def racing(wanted: list[str]) -> list[str]:
+        found = real(wanted)
+        recheck = threading.Thread(target=encoders.forget_probes)
+        recheck.start()
+        recheck.join(0.2)
+        blocked.append(recheck.is_alive())
+        return found
+
+    monkeypatch.setattr(encoders, "_usable_locked", racing)
+    memory = encoders.probe_and_remember(["libx264"])
+    assert blocked == [True], "確かめ直しが写しより先に答えを消せた"
+    assert ("libx264", True) in memory.verdicts
