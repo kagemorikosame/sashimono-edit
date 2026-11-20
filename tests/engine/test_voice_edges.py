@@ -154,6 +154,14 @@ class TestFitToVoice:
         fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
         assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
 
+    def test_a_first_word_just_before_a_tied_head_stays(self) -> None:
+        # 頭の 0.05 秒前から短い語が鳴って間が空く所は、Whisper が頭を少し遅く置いたこの行の最初の
+        # 語（#468 の作品の「でっこ」の「で」） 前の文の残りと読んで間の後ろへ送ると、最初の語が
+        # 字幕の無い所で鳴る
+        samples = _voice([(0.5, 1.4, 0.5), (1.95, 2.1, 0.5), (2.4, 4.0, 0.5)], seconds=6.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 4.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
     def test_a_tied_head_on_its_own_voice_stays(self) -> None:
         # 前の文との間が無く、行の頭ちょうどから声が始まる所は合っている 動かすと語の頭が欠ける
         samples = _voice([(0.5, 1.8, 0.5), (2.0, 3.0, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
@@ -221,6 +229,41 @@ class TestFitToVoice:
         # 素材より後ろを指す行（長さの読み違い）で落ちると、起こし全体が失敗に見える
         samples = _voice([(1.0, 2.0, 0.5)], seconds=3.0)
         assert _fit([(10.0, 11.0)], samples) == [(10.0, 11.0)]
+
+
+def _sentences() -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """#426 の合成の声の組と同じ並び 22 文を 0.25〜4 秒の間を空けて並べた声と、Whisper が返す形の行
+
+    行は 1 つおきに、頭を前の行の終わりに付けた形（#468）と、間を空けて頭を 0.2 秒早く置いた形
+    """
+    gaps = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
+    voices: list[tuple[float, float]] = []
+    at = 1.0
+    for index in range(22):
+        length = 1.2 + 0.1 * (index % 13)
+        voices.append((at, at + length))
+        at += length + gaps[index % len(gaps)]
+    lines: list[tuple[float, float]] = []
+    for index, (start, end) in enumerate(voices):
+        head = lines[-1][1] if index % 2 and lines else start - 0.2
+        lines.append((head, end + 0.02))
+    return voices, lines
+
+
+class TestSyntheticSets:
+    @pytest.mark.parametrize("noise", [0.0, 0.01, 0.07], ids=["雑音なし", "-45dB", "-28dB"])
+    def test_heads_land_on_the_voice_in_each_set(self, noise: float) -> None:
+        # #426 で測った 3 つの組（雑音なし・-45 dB・-28 dB）の形 頭のずれの中央値は 0.2.4 の寄せで
+        # 0.01 秒前後だった 壊れると、付いた頭を探す所を足したせいで、組全体の頭がずれる（#468 の
+        # 確かめ 実際の合成の声と Whisper での測りは docs/development.md）
+        voices, lines = _sentences()
+        samples = _voice([(a, b, 0.5) for a, b in voices], seconds=voices[-1][1] + 2.0, noise=noise)
+        fitted = _fit(lines, samples)
+        raw = [abs(line[0] - voice[0]) for line, voice in zip(lines, voices, strict=True)]
+        errors = [abs(fit[0] - voice[0]) for fit, voice in zip(fitted, voices, strict=True)]
+        assert float(np.median(raw)) > 0.1
+        assert float(np.median(errors)) <= 0.02
+        assert float(np.percentile(errors, 90)) <= 0.03
 
 
 class TestLoudness:
