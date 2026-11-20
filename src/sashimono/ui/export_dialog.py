@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from sashimono.engine.encode import (
     ExportError,
     ExportSettings,
     available_video_codecs,
+    available_video_codecs_now,
     build_settings,
     chosen_range,
     export_target,
@@ -53,6 +55,7 @@ from sashimono.engine.render import DEFAULT_DECODE_THREADS
 from sashimono.ui.system_clipboard import clipboard
 
 __all__ = [
+    "CHECKING_CODECS",
     "CODEC_LABELS",
     "CREDIT_NOTE",
     "RANGE_ALL",
@@ -86,6 +89,11 @@ CODEC_LABELS = {
 #: 「自動」の項目に持たせる値 ``None`` は「コーデックが 1 つも無く書き出せない」項目が
 #: 使っているので分ける 同じにすると、自動を選んで書き出しを押しても何も起きない
 AUTO_CODEC = ""
+
+#: ほかの確かめが走っている間、「コーデック」の欄に出す文（#464）
+CHECKING_CODECS = "使えるエンコーダを確かめています…"
+
+_log = logging.getLogger(__name__)
 
 
 class _ExportWorker(QObject):
@@ -138,6 +146,8 @@ class ExportDialog(QDialog):
 
     #: 素材に合わせたビットレートが出た（頼んだ印、Mbps） 読むのはスレッドの外
     _bitrate_found = Signal(object, int)
+    #: 裏で確かめ終えた候補を、窓のスレッドで並べる
+    _codecs_found = Signal(object)
 
     def __init__(
         self,
@@ -207,18 +217,18 @@ class ExportDialog(QDialog):
         path_row.addWidget(browse)
 
         self._codec = QComboBox(self)
+        self._codecs_ready = False
+        self._codecs_found.connect(self._on_codecs_found)
         # 「自動」に出す名前と書き出し側が実際に選ぶ物をそろえるため、同じ優先で並べる
-        codecs = available_video_codecs(encoder_priority)
-        if codecs:
-            # 既定は名指しせず書き出し側に選ばせる 先頭を名指しで渡すと、試しには開けても
-            # 作品の大きさで断られたとき（NVENC は幅 4096 まで）に次の候補へ落ちられない
-            first = CODEC_LABELS.get(codecs[0], codecs[0])
-            self._codec.addItem(f"自動（{first}、使えなければ次の候補）", AUTO_CODEC)
-        for name in codecs:
-            self._codec.addItem(CODEC_LABELS.get(name, name), name)
-        if not codecs:
-            self._codec.addItem("利用できるコーデックが無い", None)
+        # ほかの確かめ（設定画面の確かめ直し・起動の後の確かめ）が走っている間は待たない
+        # 待つと、固まった駆動を待ち切るまで（候補ごとに 15 秒）窓が開かない（#464）
+        codecs = available_video_codecs_now(encoder_priority)
+        if codecs is None:
+            self._codec.addItem(CHECKING_CODECS, None)
             self._codec.setEnabled(False)
+            self._wait_for_codecs(encoder_priority)
+        else:
+            self._fill_codecs(codecs)
 
         self._bitrate = QSpinBox(self)
         self._bitrate.setRange(*BITRATE_RANGE_MBPS)
@@ -258,7 +268,6 @@ class ExportDialog(QDialog):
         self._summary = QLabel(self)
         self._range = QComboBox(self)
         self._empty = QLabel("タイムラインが空なので書き出せない", self)
-        self._codecs_ready = bool(codecs)
 
         form = QFormLayout()
         form.addRow("出力先", path_row)
@@ -335,6 +344,47 @@ class ExportDialog(QDialog):
         """
         if not self._bitrate_writing:
             self._bitrate_touched = True
+
+    def _fill_codecs(self, codecs: list[str]) -> None:
+        """確かめた候補を「コーデック」の欄へ並べる"""
+        self._codec.clear()
+        if codecs:
+            # 既定は名指しせず書き出し側に選ばせる 先頭を名指しで渡すと、試しには開けても
+            # 作品の大きさで断られたとき（NVENC は幅 4096 まで）に次の候補へ落ちられない
+            first = CODEC_LABELS.get(codecs[0], codecs[0])
+            self._codec.addItem(f"自動（{first}、使えなければ次の候補）", AUTO_CODEC)
+        for name in codecs:
+            self._codec.addItem(CODEC_LABELS.get(name, name), name)
+        if not codecs:
+            self._codec.addItem("利用できるコーデックが無い", None)
+        self._codec.setEnabled(bool(codecs))
+        self._codecs_ready = bool(codecs)
+
+    def _wait_for_codecs(self, encoder_priority: str) -> None:
+        """走っている確かめが終わるのを裏で待ち、終わったら候補を並べる"""
+
+        def work() -> None:
+            try:
+                codecs = available_video_codecs(encoder_priority)
+            except Exception:
+                # 拾わないと「確かめています」のまま残り、書き出しを押せない理由が分からない
+                _log.exception("書き出しの窓でエンコーダを確かめられなかった")
+                codecs = []
+            try:
+                self._codecs_found.emit(codecs)
+            except RuntimeError:
+                # 先に窓を閉じた 届け先が無い
+                return
+
+        threading.Thread(target=work, name="sashimono-export-codecs", daemon=True).start()
+
+    def _on_codecs_found(self, codecs: list[str]) -> None:
+        """確かめ終えた候補を並べ、書き出しを押せるかを直す"""
+        self._fill_codecs(codecs)
+        if self._thread is None:
+            self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+                self._codecs_ready and self._project.duration > 0
+            )
 
     def _match_bitrate(self, project: Project) -> None:
         """書き出す物の素材に合わせたビットレートを、スレッドの外で求める（#414）

@@ -269,13 +269,19 @@ def _probe_encoders_in_background() -> None:
     確かめは別のプロセスで走り、子を起こす分だけ前より遅い 書き出しの窓は画面のスレッドで
     候補を並べるので、初めて開いたときにその待ちと、壊れた駆動なら固まった子を待ち切る
     までの間、窓が固まる 起動が落ち着いた頃に済ませておけば、窓を開く時には覚えた答えを返せる
+    子を起こせない機械ではこの中で試さずに止める 書き出しを押してもいないのに、
+    壊れた駆動で編集画面ごと落ちる（PR #492 の CodeRabbit の指摘）
     """
     import threading
 
-    from sashimono.engine.encode import available_video_codecs
+    from sashimono.engine.encode.exporter import VIDEO_CODEC_PREFERENCE
+    from sashimono.engine.encoders import probe_in_children
 
     threading.Thread(
-        target=available_video_codecs, name="sashimono-encoder-probe", daemon=True
+        target=probe_in_children,
+        args=(VIDEO_CODEC_PREFERENCE,),
+        name="sashimono-encoder-probe",
+        daemon=True,
     ).start()
 
 

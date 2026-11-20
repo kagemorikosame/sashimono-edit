@@ -38,12 +38,15 @@ __all__ = [
     "forget_probes",
     "order_by_priority",
     "probe_encoder",
+    "probe_in_children",
     "probe_troubles",
     "remember",
     "remembered",
     "trouble_notice",
     "usable",
     "usable_encoders",
+    "usable_encoders_now",
+    "verdict",
 ]
 
 _log = logging.getLogger(__name__)
@@ -223,12 +226,59 @@ def usable_encoders(names: Iterable[str]) -> list[str]:
     控えを作るたびに払わないよう、答えは起動中ずっと覚える 機械の GPU は起動中に変わらない
     駆動が戻ったとき（PC を再起動せずに入れ直したなど）は :func:`forget_probes` で忘れる
     """
-    wanted = list(dict.fromkeys(names))
     with _probe_lock:
-        unknown = [name for name in wanted if name not in _verdicts]
-        if unknown:
-            _verdicts.update(_probe(unknown))
-        return [name for name in wanted if _verdicts.get(name, False)]
+        return _usable_locked(list(dict.fromkeys(names)))
+
+
+def usable_encoders_now(names: Iterable[str]) -> list[str] | None:
+    """:func:`usable_encoders` と同じ ただしほかの確かめが走っている間は待たずに ``None``
+
+    書き出しの窓は画面のスレッドで候補を並べる 設定画面の確かめ直しや起動の後の確かめが
+    走っている所で待つと、固まった駆動を待ち切るまで（候補ごとに 15 秒）窓が開かない
+    ``None`` なら呼ぶ側は裏で :func:`usable_encoders` を呼んで、終わってから並べる
+    """
+    if not _probe_lock.acquire(blocking=False):
+        return None
+    try:
+        return _usable_locked(list(dict.fromkeys(names)))
+    finally:
+        _probe_lock.release()
+
+
+def verdict(name: str) -> tuple[bool, str | None]:
+    """``name`` で書けるかと、確かめで落ちたか固まったならその理由 同じ時点の答えを返す
+
+    書けるかと理由を別々に問うと、その間に確かめ直し（:func:`forget_probes`）が割り込んで
+    理由だけ消え、落ちた GPU の物をこのプロセスで開きにいく（PR #492 の CodeRabbit の指摘）
+    """
+    with _probe_lock:
+        ok = bool(_usable_locked([name]))
+        return ok, _troubles.get(name)
+
+
+def probe_in_children(names: Iterable[str]) -> None:
+    """``names`` を子のプロセスだけで確かめて覚える 子を起こせなければ何もしない
+
+    起動の後に裏で確かめておくときに使う 子を起こせない機械でこのプロセスへ戻すと、
+    書き出しを押してもいないのに、壊れた駆動で編集画面ごと落ちる 書き出しと控えの作成は
+    :func:`usable_encoders`（子を起こせなければこの中で試す）を通るので、そちらに任せる
+    """
+    with _probe_lock:
+        unknown = [name for name in dict.fromkeys(names) if name not in _verdicts]
+        if not unknown:
+            return
+        try:
+            _verdicts.update(_probe_in_child(unknown))
+        except WorkerUnavailableError as exc:
+            _log.warning("起動の後のエンコーダの確かめで別のプロセスを起こせなかった: %s", exc)
+
+
+def _usable_locked(wanted: list[str]) -> list[str]:
+    """錠を取った後の :func:`usable_encoders` 知らない物を試して覚え、書ける物を返す"""
+    unknown = [name for name in wanted if name not in _verdicts]
+    if unknown:
+        _verdicts.update(_probe(unknown))
+    return [name for name in wanted if _verdicts.get(name, False)]
 
 
 def probe_troubles() -> dict[str, str]:

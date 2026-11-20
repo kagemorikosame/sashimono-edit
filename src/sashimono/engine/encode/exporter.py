@@ -47,9 +47,10 @@ from sashimono.engine.encoders import (
     encoder_options,
     encoder_vendor,
     order_by_priority,
-    probe_troubles,
     trouble_notice,
     usable_encoders,
+    usable_encoders_now,
+    verdict,
 )
 from sashimono.engine.gpu import OffscreenGLContext, ShaderError, Texture
 from sashimono.engine.gpu.yuv import COLOR_TOLERANCE, YuvReadback, open_readback
@@ -79,6 +80,8 @@ __all__ = [
     "ExportError",
     "ExportSettings",
     "available_video_codecs",
+    "available_video_codecs_now",
+    "export_candidates",
     "export_chapters",
     "export_project",
     "write_chapters",
@@ -239,6 +242,16 @@ def available_video_codecs(priority: str = PRIORITY_AUTO) -> list[str]:
     return order_by_priority(usable_encoders(VIDEO_CODEC_PREFERENCE), priority)
 
 
+def available_video_codecs_now(priority: str = PRIORITY_AUTO) -> list[str] | None:
+    """:func:`available_video_codecs` と同じ ただしほかの確かめが走っている間は待たずに ``None``
+
+    書き出しの窓が画面のスレッドで使う 確かめ直しの途中で待つと、固まった駆動を
+    待ち切るまで窓が開かない（:func:`~sashimono.engine.encoders.usable_encoders_now`）
+    """
+    found = usable_encoders_now(VIDEO_CODEC_PREFERENCE)
+    return None if found is None else order_by_priority(found, priority)
+
+
 class _EncoderError(ExportError):
     """エンコーダが使えなかった 書きかけを捨てて、別のコーデックで最初からやり直せる"""
 
@@ -264,7 +277,7 @@ class _GpuColorError(ExportError):
     """
 
 
-def _candidates(settings: ExportSettings) -> list[str]:
+def export_candidates(settings: ExportSettings) -> list[str]:
     """試す順のコーデック 名指しが無ければ確かめて書けた物を優先の順に
 
     名指しした GPU のエンコーダも確かめる（別のプロセスで） 確かめで子ごと落ちた物を
@@ -276,9 +289,12 @@ def _candidates(settings: ExportSettings) -> list[str]:
     named = settings.video_codec
     if not named:
         return available_video_codecs(settings.encoder_priority)
-    if encoder_vendor(named) == PRIORITY_CPU or usable_encoders([named]):
+    if encoder_vendor(named) == PRIORITY_CPU:
         return [named]
-    if named in probe_troubles():
+    # 書けるかと理由は同じ時点で取る 別々に問うと、間に確かめ直しが割り込んで理由だけ消え、
+    # 落ちた物をこのプロセスで開きにいく
+    ok, trouble = verdict(named)
+    if not ok and trouble is not None:
         return available_video_codecs(settings.encoder_priority)
     return [named]
 
@@ -392,7 +408,7 @@ def export_project(
     # 断られることがある（NVENC の H.264 は幅 4096 を超える画を開けない）
     # そのときに書き出しごと失敗させず、最後は libx264 まで落とす
     try:
-        codecs = _candidates(settings)
+        codecs = export_candidates(settings)
     except ValueError as exc:
         # 知らない優先を黙って自動にすると、選んだ物が効かない理由が分からない
         raise ExportError(str(exc)) from exc

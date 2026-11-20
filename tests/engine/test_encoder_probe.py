@@ -188,14 +188,14 @@ class TestExport:
         """
         monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("crash_nvenc", "libx264"))
         named = exporter.ExportSettings(path=Path("x.mp4"), video_codec="crash_nvenc")
-        assert exporter._candidates(named) == ["libx264"]
+        assert exporter.export_candidates(named) == ["libx264"]
         told = exporter._probe_notice(named, "libx264")
         assert told is not None and "crash_nvenc" in told
 
     def test_a_named_cpu_encoder_is_not_probed(self, spawned: list[list[str]]) -> None:
         # CPU の物は駆動に関わらない 確かめると、名指しの書き出しのたびに子を起こす分待たされる
         settings = exporter.ExportSettings(path=Path("x.mp4"), video_codec="libx264")
-        assert exporter._candidates(settings) == ["libx264"]
+        assert exporter.export_candidates(settings) == ["libx264"]
         assert spawned == []
 
     def test_no_notice_when_the_trouble_was_behind_the_used_one(
@@ -246,7 +246,83 @@ class TestExportChild:
                 exporter.ExportSettings(path=tmp_path / "x.mp4"),
                 separate_process=True,
             )
-        assert seen["probes"] == encoders.ProbeMemory(verdicts=(("libx264", True),))
+        # 親が書き出しの前に確かめた分も足されるので、渡した答えが含まれているかを見る
+        assert ("libx264", True) in seen["probes"].verdicts
+
+    def test_the_parent_probes_before_starting_the_export_child(
+        self, broken_driver: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """まだ確かめていない候補は、書き出しの子を起こす前に親で確かめる
+
+        書き出しの子は daemon で孫を起こせず、知らない物を子の中で試す 壊れた駆動なら
+        書き出しの子ごと落ち、CPU へ戻れずに書き出しが失敗する（PR #492 の CodeRabbit の指摘）
+        """
+        from sashimono.core.model import Project
+        from sashimono.engine.encode import export_job
+
+        monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("crash_nvenc", "libx264"))
+        seen: dict[str, Any] = {}
+
+        def fake(_job: Callable[..., Any], kwargs: dict[str, Any], **_options: Any) -> None:
+            seen.update(kwargs)
+
+        monkeypatch.setattr(export_job, "run_in_process", fake)
+        with pytest.raises(exporter.ExportError):
+            export_job.export_anywhere(
+                cast("Project", object()),
+                exporter.ExportSettings(path=tmp_path / "x.mp4"),
+                separate_process=True,
+            )
+        memory: encoders.ProbeMemory = seen["probes"]
+        assert dict(memory.verdicts) == {"crash_nvenc": False, "libx264": True}
+        assert "crash_nvenc" in dict(memory.troubles)
+
+
+class TestRaces:
+    def test_the_verdict_and_its_reason_come_together(self, broken_driver: None) -> None:
+        # 別々に問うと、間に確かめ直しが割り込んで理由だけ消え、落ちた物をこの中で開きにいく
+        ok, trouble = encoders.verdict("crash_nvenc")
+        assert not ok
+        assert trouble is not None and "落ちた" in trouble
+        assert encoders.verdict("no_such_encoder") == (False, None)
+
+    def test_a_running_probe_is_not_waited_for_by_the_window(self) -> None:
+        """ほかの確かめが走っている間は、書き出しの窓の問いは待たずに ``None`` を返す
+
+        待つと、固まった駆動を待ち切るまで書き出しの窓が開かない
+        """
+        encoders.remember(encoders.ProbeMemory(verdicts=(("libx264", True),)))
+        with encoders._probe_lock:
+            assert encoders.usable_encoders_now(["libx264"]) is None
+        assert encoders.usable_encoders_now(["libx264"]) == ["libx264"]
+
+
+class TestStartup:
+    def test_without_a_child_the_startup_probe_does_nothing_here(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """起動の後の確かめは、子を起こせなければこの中で試さずに止める
+
+        この中で試すと、書き出しを押してもいないのに壊れた駆動で編集画面ごと落ちる
+        """
+
+        def refuse(*_args: Any, **_options: Any) -> None:
+            raise WorkerUnavailableError("起こせない")
+
+        def here(name: str) -> bool:
+            pytest.fail(f"起動の後の確かめが {name} をこの中で試した")
+
+        monkeypatch.setattr(encoders, "run_in_process", refuse)
+        monkeypatch.setattr(encoders, "_probe_here", here)
+        encoders.probe_in_children(["h264_nvenc", "libx264"])
+        assert encoders.remembered() == encoders.ProbeMemory()
+
+    def test_the_startup_probe_remembers_the_answers(self, spawned: list[list[str]]) -> None:
+        # 覚えないと、書き出しの窓を初めて開いたときに改めて子を起こして待たせる
+        encoders.probe_in_children(["libx264"])
+        encoders.probe_in_children(["libx264"])
+        assert spawned == [["libx264"]]
+        assert encoders.usable_encoders_now(["libx264"]) == ["libx264"]
 
 
 def test_the_self_check_starts_the_probe_child() -> None:

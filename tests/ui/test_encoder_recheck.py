@@ -65,8 +65,12 @@ class TestDialog:
         """
         del qt_application
         gate = threading.Event()
+        #: 確かめ直しを走らせたスレッド 画面のスレッドで同期に走らせても、gate.wait の
+        #: 時間切れで下の確かめは通ってしまうので、どこで走ったかを見る（CodeRabbit の指摘）
+        ran_on: list[int] = []
 
         def slow() -> str:
+            ran_on.append(threading.get_ident())
             gate.wait(5)
             return "使えるエンコーダ: libx264"
 
@@ -80,6 +84,48 @@ class TestDialog:
             gate.set()
             _settle(dialog._encoder_recheck)
             assert dialog._encoder_status.text() == "使えるエンコーダ: libx264"
+            assert ran_on and ran_on[0] != threading.get_ident()
         finally:
             gate.set()
             dialog.deleteLater()
+
+
+class TestExportDialogWhileProbing:
+    def test_the_export_window_opens_while_a_probe_runs(
+        self, qt_application: QApplication, probe_here: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """確かめ直しの途中でも書き出しの窓は待たずに開き、終わったら候補を並べる
+
+        待つと、固まった駆動を待ち切るまで（候補ごとに 15 秒）窓が開かない
+        （PR #492 の CodeRabbit の指摘）
+        """
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        from sashimono.core.model import Project, ProjectSettings
+        from sashimono.engine.encode import exporter
+        from sashimono.ui.export_dialog import CHECKING_CODECS, ExportDialog
+
+        del qt_application
+        monkeypatch.setattr(encoders, "probe_encoder", lambda _name: None)
+        monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("libx264",))
+        project = Project.create(ProjectSettings())
+        encoders._probe_lock.acquire()
+        released = False
+        try:
+            dialog = ExportDialog(project)
+            assert dialog._codec.itemText(0) == CHECKING_CODECS
+            assert not dialog._codec.isEnabled()
+            ok = dialog._buttons.button(QDialogButtonBox.StandardButton.Ok)
+            assert not ok.isEnabled()
+            encoders._probe_lock.release()
+            released = True
+            wait_until(
+                lambda: dialog._codec.currentData() is not None,
+                "書き出しの窓の候補",
+                step=QApplication.processEvents,
+            )
+            assert dialog._codec.findData("libx264") >= 0
+            dialog.deleteLater()
+        finally:
+            if not released:
+                encoders._probe_lock.release()
