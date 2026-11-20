@@ -27,7 +27,20 @@ from sashimono.compat.aviutl import native, plugin
 from sashimono.compat.aviutl.catalog import script_catalog
 from sashimono.compat.aviutl.report import NO_RECORDS, ReportRecords, global_report
 from sashimono.core.model import Project
-from sashimono.engine.encode.exporter import ExportError, ExportSettings, export_project
+from sashimono.engine.encode import exporter
+from sashimono.engine.encode.exporter import (
+    ExportError,
+    ExportSettings,
+    export_project,
+)
+from sashimono.engine.encoders import (
+    PRIORITY_CPU,
+    ProbeMemory,
+    encoder_vendor,
+    probe_and_remember,
+    remember,
+    remembered,
+)
 from sashimono.engine.worker import (
     WorkerCrashedError,
     WorkerFailedError,
@@ -122,6 +135,7 @@ def export_job(
     project: Project,
     settings: ExportSettings,
     runtime: AviUtlRuntime,
+    probes: ProbeMemory | None = None,
 ) -> ExportOutcome | None:
     """子のプロセスで書き出す
 
@@ -131,8 +145,11 @@ def export_job(
     やめたときも書き出しは :class:`ExportError` を投げる（書きかけを消してから）ので、
     ここで取り消しへ直す 直さないと、取り消しが失敗として画面に出る
     ``runtime`` は省けない 省けると、渡し忘れた呼び出しで本人が切った DLL を子が読む
+    ``probes`` は親が覚えたエンコーダの確かめの答え（#464） 無ければ子が孫を起こして確かめる
     """
     runtime.apply()
+    if probes is not None:
+        remember(probes)
     # GL を作れるかを先に確かめる 書き出しの途中で作れないと分かると、どこまで書いたかの
     # 後片付けまで子の中で済ませてから親が頭からやり直すことになり、時間が倍かかる
     from sashimono.engine.gpu import GLContextError, OffscreenGLContext
@@ -202,6 +219,23 @@ def export_anywhere(
     アプリごと落ちる）
     """
     if separate_process:
+        # 使う候補を親で確かめておく（#464） 書き出しの子は daemon なので孫を起こせず、
+        # 答えを知らない物は子の中で試すことになる 壊れた駆動ならそこで子ごと落ち、
+        # CPU へ戻れずに書き出しが失敗する 覚えた物は試し直さないので、普通は待たない
+        # 確かめと写しは同じ錠の中で取る 間に確かめ直しが割り込むと空の写しが子に渡る
+        # 名指しの GPU の物が落ちると子は自動の候補へ移るので、自動の候補もいつも確かめる
+        # 並びはモジュールから引く 試験が並びを差し替えたときも同じ物を確かめる
+        # CPU を名指ししたときは GPU を確かめない 確かめの子を起こせない機械ではこの中で
+        # GPU を開くことになり、CPU を選んだのに壊れた駆動でアプリごと落ちうる
+        # 子の書き出しも CPU の名指しなら GPU を試さない（export_candidates）
+        named = settings.video_codec
+        if named and encoder_vendor(named) == PRIORITY_CPU:
+            probes = remembered()
+        else:
+            names = list(exporter.VIDEO_CODEC_PREFERENCE)
+            if named:
+                names.append(named)
+            probes = probe_and_remember(names)
         target = settings.path
         scratch = _scratch_for(target)
         try:
@@ -211,6 +245,7 @@ def export_anywhere(
                     "project": project,
                     "settings": dataclasses.replace(settings, path=scratch),
                     "runtime": AviUtlRuntime.capture(),
+                    "probes": probes,
                 },
                 progress=progress,
                 should_cancel=should_cancel,

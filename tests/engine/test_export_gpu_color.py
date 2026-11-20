@@ -25,6 +25,7 @@ from OpenGL.error import NullFunctionError
 from sashimono.core.commands import Document, insert_media
 from sashimono.core.model import Project, ProjectSettings
 from sashimono.core.timebase import FrameRate
+from sashimono.engine import encoders
 from sashimono.engine.colorspace import bt709_planes
 from sashimono.engine.decode import probe_media
 from sashimono.engine.encode import ExportError, ExportSettings, export_project, exporter
@@ -653,8 +654,12 @@ class TestExport:
             if not usable(name):
                 pytest.skip(f"{name} で書けない")
         # 開けるかの答えはプロセスの中で覚えている 偽の答えを後の試験へ漏らさない
-        exporter._opens.cache_clear()
-        monkeypatch.setattr(exporter, "_open_encoder", lambda name: None)
+        # 差し替えた偽のエンコーダは子のプロセスに届かないので、確かめはこの中で行う
+        encoders.forget_probes()
+        monkeypatch.setattr(
+            encoders, "_probe_in_child", lambda names: {n: encoders._probe_here(n) for n in names}
+        )
+        monkeypatch.setattr(encoders, "probe_encoder", lambda name: None)
         monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("mpeg4", "libx264"))
         real = exporter._encode_frame
         written = [0]
@@ -700,7 +705,7 @@ class TestExport:
                 notice=notices.append,
             )
         finally:
-            exporter._opens.cache_clear()
+            encoders.forget_probes()
 
         assert len(opened) == 2, "書き直しで GPU の読み戻しを開き直していない"
         assert all(readback.released for readback in opened), "読み戻しを返していない"

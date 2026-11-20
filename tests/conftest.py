@@ -515,3 +515,21 @@ def sample_long_gop(media_dir: Path) -> SampleMedia:
 def sample_ntsc(media_dir: Path) -> SampleMedia:
     """29.97fps の素材 分数フレームレートの扱いを確かめるため"""
     return make_sample(media_dir, "ntsc.mp4", fps="30000/1001", duration=2.0)
+
+
+@pytest.fixture
+def probe_here(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """エンコーダの確かめを、このプロセスの中で行う 覚えた答えは試験の前後で忘れる
+
+    本物は別のプロセスで確かめる（#464） 子には試験の差し替え（偽のエンコーダ）が
+    届かないので、差し替えを確かめる試験はこの中で試す 答えを残すと、偽の答えが
+    後の試験へ漏れて本物の NVENC が「使えない」扱いになる
+    """
+    from sashimono.engine import encoders
+
+    encoders.forget_probes()
+    monkeypatch.setattr(
+        encoders, "_probe_in_child", lambda names: {n: encoders._probe_here(n) for n in names}
+    )
+    yield
+    encoders.forget_probes()

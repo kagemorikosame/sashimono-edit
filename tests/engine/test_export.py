@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -33,6 +32,7 @@ from sashimono.core.model import (
     TrackKind,
 )
 from sashimono.core.timebase import FrameRate
+from sashimono.engine import encoders
 from sashimono.engine.decode import VideoDecoder, probe_media
 from sashimono.engine.encode import (
     COLOR_OPTIONS,
@@ -53,6 +53,7 @@ from tests.color_bars import (
     rgb_at_bars,
     yuv_at_bars,
 )
+from tests.encoder_probe_jobs import broken_driver_job
 from tests.media_fixtures import SampleMedia, make_sample
 
 # 書き出しは内部で GL コンテキストを作って合成する GPU の無い環境では
@@ -83,15 +84,12 @@ def silent_project(sample_long: SampleMedia) -> Project:
 
 
 @pytest.fixture
-def forget_probes() -> Iterator[None]:
-    """開けるかの答えを、試験の前後で忘れる
+def forget_probes(probe_here: None) -> None:
+    """開けるかの答えを、試験の前後で忘れる 確かめはこのプロセスの中で行う
 
     答えはプロセスの中で覚えている 残すと、偽の答えが後の試験へ漏れて、
-    本物の NVENC が「開けない」扱いになる
+    本物の NVENC が「開けない」扱いになる 差し替えた偽のエンコーダは子のプロセスに届かない
     """
-    exporter._opens.cache_clear()
-    yield
-    exporter._opens.cache_clear()
 
 
 @pytest.fixture
@@ -102,7 +100,7 @@ def probed(monkeypatch: pytest.MonkeyPatch, forget_probes: None) -> list[str]:
     ほかのコーデックは本物を開く
     """
     calls: list[str] = []
-    real = exporter._open_encoder
+    real = encoders.probe_encoder
 
     def fake(name: str) -> None:
         calls.append(name)
@@ -110,7 +108,7 @@ def probed(monkeypatch: pytest.MonkeyPatch, forget_probes: None) -> list[str]:
             raise av.error.ArgumentError(22, "Invalid argument")
         real(name)
 
-    monkeypatch.setattr(exporter, "_open_encoder", fake)
+    monkeypatch.setattr(encoders, "probe_encoder", fake)
     monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("h264_qsv", "libx264"))
     return calls
 
@@ -150,7 +148,7 @@ def breaks_mid_way(monkeypatch: pytest.MonkeyPatch, forget_probes: None) -> list
         packets: list[av.Packet[Any]] = real(target, frame)
         return packets
 
-    monkeypatch.setattr(exporter, "_open_encoder", lambda name: None)
+    monkeypatch.setattr(encoders, "probe_encoder", lambda name: None)
     monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("mpeg4", "libx264"))
     # 直す前の書き出しにはこの口が無い 無ければ差し込まずに mpeg4 のまま書き上がり、試験が落ちる
     monkeypatch.setattr(exporter, "_encode_frame", fake, raising=False)
@@ -253,7 +251,7 @@ class TestExport:
         8K の作品は libx264 なら書けるのに失敗する ここでは yuv420p を受け付けない png を
         「試しには開けた」ことにして同じ状況を作る
         """
-        monkeypatch.setattr(exporter, "_open_encoder", lambda name: None)
+        monkeypatch.setattr(encoders, "probe_encoder", lambda name: None)
         monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("png", "libx264"))
         output = tmp_path / "out.mp4"
         export_project(ready_project, ExportSettings(path=output, frame_range=(0, 3)))
@@ -262,6 +260,37 @@ class TestExport:
             frames = sum(1 for _ in container.decode(video=0))
         # やり直しの前に音やコマを進めていたら、頭が欠けたり音がずれたりする
         assert frames == 3
+
+    def test_a_driver_that_kills_the_probe_leaves_a_cpu_export(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        ready_project: Project,
+        tmp_path: Path,
+    ) -> None:
+        """確かめで子がプロセスごと落ちても、書き出しは CPU で終わり、理由を知らせる（#464）
+
+        確かめを親でしていた頃は、駆動が壊れた機械で書き出しを押すとアプリごと落ちた
+        知らせが無いと、GPU で書いたつもりの人が遅さの原因を探せない
+        """
+        if not usable("libx264"):
+            pytest.skip("libx264 で書けない")
+        encoders.forget_probes()
+        monkeypatch.setattr(encoders, "_probe_job", broken_driver_job)
+        monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("crash_nvenc", "libx264"))
+        notices: list[str] = []
+        output = tmp_path / "out.mp4"
+        try:
+            export_project(
+                ready_project,
+                ExportSettings(path=output, frame_range=(0, 3)),
+                notice=notices.append,
+            )
+        finally:
+            encoders.forget_probes()
+        assert _encoder_of(output) == "libx264"
+        assert len(notices) == 1
+        assert "crash_nvenc" in notices[0]
+        assert "再起動" in notices[0]
 
     def test_falls_back_when_the_stream_cannot_be_added(
         self,
@@ -275,7 +304,7 @@ class TestExport:
         入っていない名前やコンテナが受けないコーデックは、開くより前にここで断られる
         拾わないと、指定なしの書き出しでも libx264 まで落ちずに失敗する
         """
-        monkeypatch.setattr(exporter, "_open_encoder", lambda name: None)
+        monkeypatch.setattr(encoders, "probe_encoder", lambda name: None)
         monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("no_such_encoder", "libx264"))
         output = tmp_path / "out.mp4"
         export_project(ready_project, ExportSettings(path=output, frame_range=(0, 3)))
