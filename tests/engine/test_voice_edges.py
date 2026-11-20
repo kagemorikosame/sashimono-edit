@@ -22,6 +22,7 @@ from sashimono.core.model import (
 from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.engine.audio.voice_edges import (
     fit_to_voice,
+    found_edges,
     loudness_of_samples,
     loudness_of_waveform,
     retime,
@@ -158,6 +159,36 @@ class TestFitToVoice:
         samples = _voice([(0.5, 1.8, 0.5), (2.0, 3.0, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
         fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
         assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_leftover_of_exactly_half_a_second_stays_with_the_last_line(self) -> None:
+        # 前の文の残りがちょうど 0.5 秒だと、前の行の終わりを探す窓の終わりまで声が続いて終わりを
+        # 読めず、2〜2.5 秒の声に字幕が無くなっていた（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(0.5, 2.5, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[0][1] == pytest.approx(2.5, abs=0.02)
+        assert fitted[1][0] == pytest.approx(3.5, abs=0.02)
+
+    def test_a_tied_head_does_not_pass_an_overlapping_next_line(self) -> None:
+        # 次の行が重なって返ってきた所で頭を次の行の頭より後ろへ送ると、次の行が長さ 0 に潰れて
+        # 字幕が消える（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(0.5, 1.8, 0.5), (8.0, 9.0, 0.5)], seconds=12.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 10.0), (3.0, 4.0)], samples)
+        assert all(end > start for start, end in fitted)
+        assert fitted[1][0] <= 3.0
+
+    def test_a_loud_voice_far_ahead_does_not_hide_a_quiet_head(self) -> None:
+        # 行の終わりまでの広い窓で話の大きさを読むと、後ろの大声でしきい値が上がり、頭の近くの
+        # 小さな声を無音と読んで最初の語を字幕から外していた（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(2.0, 3.0, 0.01), (25.0, 28.0, 0.56)], seconds=31.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 29.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_tied_head_on_time_counts_as_found(self) -> None:
+        # 頭ちょうどから声が始まる行を「境目が見つからない」と読むと、字幕の時刻の確かめがその
+        # 行の頭を比べずに飛ばす（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(0.5, 1.8, 0.5), (2.0, 3.0, 0.5)], seconds=5.0)
+        times = [(_f(0.5), _f(2.0)), (_f(2.0), _f(3.0))]
+        assert found_edges(times, loudness_of_samples(samples, RATE))[1][0] is True
 
     def test_a_gap_before_the_head_still_limits_the_reach(self) -> None:
         # 前の行との間を Whisper が空けて返した行は、頭の手掛かりを認識が持っている 遠くの声まで

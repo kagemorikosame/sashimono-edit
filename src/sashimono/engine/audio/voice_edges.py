@@ -239,7 +239,12 @@ def _edges(
     heads: list[Fraction | None] = []
     for index, (start, end) in enumerate(times):
         if _tied(times, index):
-            heads.append(_tied_start_edge(loudness, start, end))
+            # 次の行が重なって返ってきた（次の行の頭がこの行の終わりより前）ときは、次の行の頭で
+            # 探すのを止める 越えて送ると、次の行の頭が前へ出られず長さ 0 に潰れる
+            limit = end
+            if index + 1 < len(times) and start < times[index + 1][0] < end:
+                limit = times[index + 1][0]
+            heads.append(_tied_start_edge(loudness, start, limit))
         else:
             low, _high = _window(times, index)
             heads.append(_start_edge(loudness, start, low, min(start + REACH, end)))
@@ -248,7 +253,10 @@ def _edges(
         _low, high = _window(times, index)
         following = heads[index + 1] if index + 1 < len(times) else None
         if following is not None and _tied(times, index + 1) and following > high:
-            high = min(end + REACH, following)
+            # 次の行の頭が飛ばした前の文の残りは、頭から最大 :data:`REACH` まで 残りがちょうど
+            # その長さだと窓の終わりまで声が続いて終わりを読めないので、1 コマ先まで見る 見つかる
+            # 終わりは窓の最後のコマの頭までなので、次の行の新しい頭は越えない
+            high = min(end + REACH + STEP, following)
         out.append((heads[index], _end_edge(loudness, end, max(end - REACH, start), high)))
     return out
 
@@ -333,7 +341,11 @@ def _tied_start_edge(loudness: np.ndarray, at: Fraction, end: Fraction) -> Fract
     始まるこの行の声とを見分けられない 残りが長いか行の終わりまで続くなら、Whisper が 1 つの話を
     割った所なので動かさない
     """
-    window = _voiced(loudness, at - REACH, end, START_QUIET_DB)
+    # 話の大きさは、これまで通り頭の近く（前後 REACH）の周りで読む 行の終わりまでの広い窓で読むと、
+    # 後ろの大声に引きずられてしきい値が上がり、頭の近くの小さな声を無音と読んで頭を遠くへ送る
+    window = _voiced(
+        loudness, at - REACH, end, START_QUIET_DB, read_around=(at - REACH, at + REACH)
+    )
     if window is None:
         return None
     first, voiced = window
@@ -341,9 +353,13 @@ def _tied_start_edge(loudness: np.ndarray, at: Fraction, end: Fraction) -> Fract
     if not 0 <= here < len(voiced):
         return None
     if voiced[here]:
-        if here == 0 or not voiced[here - 1]:
-            # 頭ちょうどから声が始まる 頭はもう合っている
+        if here == 0:
+            # 頭より前を見られない（素材の頭） 前の文の残りか、この行の声かを見分けられない
             return None
+        if not voiced[here - 1]:
+            # 頭ちょうどから声が始まる 頭はもう合っていて、境目は見つかっている（字幕の時刻の
+            # 確かめは、見つかったかどうかで比べるかを決める）
+            return at
         tail = here
         while tail < len(voiced) - 1 and voiced[tail + 1]:
             tail += 1
@@ -372,15 +388,29 @@ def _end_edge(loudness: np.ndarray, at: Fraction, low: Fraction, high: Fraction)
 
 
 def _voiced(
-    loudness: np.ndarray, low: Fraction, high: Fraction, quiet_db: float
+    loudness: np.ndarray,
+    low: Fraction,
+    high: Fraction,
+    quiet_db: float,
+    *,
+    read_around: tuple[Fraction, Fraction] | None = None,
 ) -> tuple[int, np.ndarray] | None:
-    """``[low, high)`` の声のあるコマ 窓の頭のコマの番号と一緒に返す 読めなければ ``None``"""
+    """``[low, high)`` の声のあるコマ 窓の頭のコマの番号と一緒に返す 読めなければ ``None``
+
+    話と雑音の大きさは ``read_around``（省けば窓そのもの）の前後 :data:`_REFERENCE_REACH` で読む
+    """
     first = max(0, _step(low))
     last = min(len(loudness), _step(high))
     if last - first < 1:
         return None
     reach = _step(_REFERENCE_REACH)
-    around = loudness[max(0, first - reach) : min(len(loudness), last + reach)]
+    ref_first, ref_last = (first, last)
+    if read_around is not None:
+        ref_first = max(0, _step(read_around[0]))
+        ref_last = min(len(loudness), _step(read_around[1]))
+    around = loudness[max(0, ref_first - reach) : min(len(loudness), ref_last + reach)]
+    if around.size == 0:
+        return None
     spoken = around[around > _NEARLY_SILENT_DB]
     if spoken.size == 0:
         return None
