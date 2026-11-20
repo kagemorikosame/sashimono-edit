@@ -7,6 +7,8 @@ Whisper の時刻は声とずれる 文の単位の時刻は無音を落とし�
 
 寄せる幅は前後 :data:`REACH` まで 認識の時刻が大きく外れた行（別の文と取り違えた物など）は、
 音で寄せても正しい所へは届かないので、遠くへは動かさない
+ただし頭が前の行の終わりにぴったり付いた行（#468）は、Whisper が文の間の無音を次の行に入れた形
+なので、頭を行の終わりまで探し、前の文の声の残りの後ろの間を越えて声の出だしへ寄せる
 
 音の大きさは 10 ms ごとのピーク（dBFS）で見る 起こすときは読んだ音から作り
 （:func:`loudness_of_samples`）、起こした後に合わせ直すときは解析済みの波形から作る
@@ -43,6 +45,11 @@ __all__ = [
 STEP = Fraction(1, 100)
 #: 寄せる幅（秒） 合成の声で測った認識のずれ（9 割が 0.36 秒以内）を覆い、隣の文までは届かない
 REACH = Fraction(1, 2)
+#: 頭が前の行の終わりに付いた行で、頭の後ろに残る声を前の文の残りと読むには、その声が頭より
+#: これだけ前から続いている要る（秒） #426 で測った Whisper の頭のずれは 9 割が 0.28 秒以内で、
+#: それより近くから始まる声はこの行の最初の語を頭が少し遅れて指している形と読む #468 の作品で
+#: 頭の 0.01〜0.1 秒前から始まる声（「でっこ」の「で」）を前の文の残りと読み、最初の語を落とした
+_LEFTOVER_BEHIND = Fraction(3, 10)
 #: 声の出だしと読む大きさ（周りの話の大きさから dB） 合成の声の 3 つの組で -24 と -30 を比べ、
 #: 頭のずれの中央値はどちらも 0.01〜0.02 秒 -30 の方が「か」「た」の頭の弱い子音を拾う
 START_QUIET_DB = -30.0
@@ -204,12 +211,9 @@ def fit_to_voice(
     ほぼ無音）は元の時刻のまま返す
     """
     fitted: list[tuple[Fraction, Fraction]] = []
-    for index, (start, end) in enumerate(times):
-        low, high = _window(times, index)
-        new_start = _start_edge(loudness, start, low, min(start + REACH, end))
-        new_end = _end_edge(loudness, end, max(end - REACH, start), high)
-        new_start = start if new_start is None else new_start
-        new_end = end if new_end is None else new_end
+    for (start, end), (head, tail) in zip(times, _edges(times, loudness), strict=True):
+        new_start = start if head is None else head
+        new_end = end if tail is None else tail
         if new_end <= new_start:
             new_start, new_end = start, end
         fitted.append((new_start, new_end))
@@ -225,13 +229,57 @@ def found_edges(
     分からない 字幕の時刻の確かめは、設定のずらしが足されているかどうかを、どちらの位置から
     境目が見つかるかで見分ける（PR #451）
     """
-    out: list[tuple[bool, bool]] = []
+    return [(head is not None, tail is not None) for head, tail in _edges(times, loudness)]
+
+
+def _edges(
+    times: Sequence[tuple[Fraction, Fraction]], loudness: np.ndarray
+) -> list[tuple[Fraction | None, Fraction | None]]:
+    """行ごとに見つかった声の出だしと終わり 見つからない端は ``None``
+
+    頭を先に全部の行で決めてから終わりを探す 頭が前の行の終わりに付いた行（:func:`_tied`）の頭を
+    間の後ろへ送ったら、前の行の終わりはその新しい頭まで声を追ってよい 元の頭で止めると、前の文の
+    声が次の行の元の頭を越えて残る所で、前の行の最後の語が字幕の無い所で鳴る
+    """
+    heads: list[Fraction | None] = []
     for index, (start, end) in enumerate(times):
-        low, high = _window(times, index)
-        head = _start_edge(loudness, start, low, min(start + REACH, end))
-        tail = _end_edge(loudness, end, max(end - REACH, start), high)
-        out.append((head is not None, tail is not None))
+        if _tied(times, index):
+            # 次の行が重なって返ってきた（次の行の頭がこの行の終わりより前 同じ頭も含む）ときは、
+            # 次の行の頭で探すのを止める 越えて送ると、次の行の頭が前へ出られず長さ 0 に潰れる
+            limit = end
+            if index + 1 < len(times) and start <= times[index + 1][0] < end:
+                limit = times[index + 1][0]
+            heads.append(_tied_start_edge(loudness, start, limit))
+        else:
+            low, _high = _window(times, index)
+            heads.append(_start_edge(loudness, start, low, min(start + REACH, end)))
+    out: list[tuple[Fraction | None, Fraction | None]] = []
+    for index, (start, end) in enumerate(times):
+        _low, high = _window(times, index)
+        following = heads[index + 1] if index + 1 < len(times) else None
+        if following is not None and _tied(times, index + 1) and following > high:
+            # 次の行の頭が飛ばした前の文の残りは、頭から最大 :data:`REACH` まで 残りがちょうど
+            # その長さだと窓の終わりまで声が続いて終わりを読めないので、1 コマ先まで見る 見つかる
+            # 終わりは窓の最後のコマの頭までなので、次の行の新しい頭は越えない
+            high = min(end + REACH + STEP, following)
+        out.append((heads[index], _end_edge(loudness, end, max(end - REACH, start), high)))
     return out
+
+
+def _tied(times: Sequence[tuple[Fraction, Fraction]], index: int) -> bool:
+    """行の頭が前の行の終わりにぴったり付いている
+
+    Whisper は頭の手掛かりが無いとき、文の頭を前の文の終わりに付けて返す（#468 の作品では 738 行の
+    うち 699 行） 間の無音もその行に入るので、声の出だしが :data:`REACH` より先にある 前の行との
+    間を空けて返した行は認識が頭の手掛かりを持っているので、これまで通り近くだけを探す
+    """
+    if index == 0:
+        return False
+    before = times[index - 1][1]
+    start = times[index][0]
+    # 秒の分数を丸めて持ち直した素材（保存の往復など）でもぴったりと読めるよう、1 コマまでの差は
+    # 付いていると読む
+    return before <= start and start - before < STEP
 
 
 def _window(times: Sequence[tuple[Fraction, Fraction]], index: int) -> tuple[Fraction, Fraction]:
@@ -288,6 +336,60 @@ def _start_edge(
     return _seconds(first + here + int(ahead[0])) if ahead.size else None
 
 
+def _tied_start_edge(loudness: np.ndarray, at: Fraction, end: Fraction) -> Fraction | None:
+    """頭が前の行の終わりに付いた行の声の出だし 見つからなければ ``None``
+
+    探すのは行の終わりまで（:data:`REACH` で止めると、1.6 秒の間の後ろにある出だしへ届かない）
+    行の終わりを越えないので、行の中に声が無ければ隣の文へは飛ばない
+    頭のすぐ後ろに、頭より前から続く声が短く（:data:`REACH` まで）残って間が空くなら、それは前の
+    文の終わりで、この行の出だしは間の後ろ 頭より前から見ないと、前の文の残りと、頭ちょうどから
+    始まるこの行の声とを見分けられない 残りが長いか行の終わりまで続くなら、Whisper が 1 つの話を
+    割った所なので動かさない
+    """
+    # 話の大きさは、これまで通り頭の近く（前後 REACH）の周りで読む 行の終わりまでの広い窓で読むと、
+    # 後ろの大声に引きずられてしきい値が上がり、頭の近くの小さな声を無音と読んで頭を遠くへ送る
+    around = (at - REACH, at + REACH)
+    window = _voiced(loudness, at - REACH, end, START_QUIET_DB, read_around=around)
+    # 頭より前から続く声は、声の終わりと同じ深いしきい値で読む 出だしのしきい値で読むと、前の文の
+    # 弱い声（息だけの「す」・小さく続く語）を無音と読み、続きの長さを測らずに頭を間の後ろへ送る
+    # 前の行の終わりは深いしきい値でその声を追うので、行の終わりまで届かず声に字幕が無くなる
+    # （PR #491 の CodeRabbit の指摘） 間の後ろの出だしはこれまで通り出だしのしきい値で探す
+    lasting = _voiced(loudness, at - REACH, end, END_QUIET_DB, read_around=around)
+    if window is None or lasting is None:
+        return None
+    first, voiced = window
+    _first, trailing = lasting
+    here = _step(at) - first
+    if not 0 <= here < len(voiced):
+        return None
+    if here == 0 and (voiced[here] or trailing[here]):
+        # 頭より前を見られない（素材の頭） 前の文の残りか、この行の声かを見分けられない
+        return None
+    if voiced[here] and not voiced[here - 1]:
+        # 頭ちょうどから声が始まる 頭はもう合っていて、境目は見つかっている（字幕の時刻の
+        # 確かめは、見つかったかどうかで比べるかを決める） 出だしは出だしのしきい値で見る 深い
+        # しきい値で見ると、前の文の弱い声の直後に頭ちょうどから始まるこの行の最初の語を前の文の
+        # 続きと読み、間の後ろへ送る（PR #491 の CodeRabbit の指摘）
+        return at
+    if trailing[here] and trailing[here - 1]:
+        head = here
+        while head > 0 and trailing[head - 1]:
+            head -= 1
+        if _seconds(here - head) < _LEFTOVER_BEHIND:
+            # 声が頭のすぐ前から始まる Whisper が頭を少し遅く置いたこの行の最初の語（「でっこ」の
+            # 「で」・「あ、ちょ」の「あ」）で、前の文の残りではない 間の後ろへ送ると最初の語が
+            # 字幕の無い所で鳴る
+            return None
+        tail = here
+        while tail < len(trailing) - 1 and trailing[tail + 1]:
+            tail += 1
+        if tail == len(trailing) - 1 or _seconds(tail + 1 - here) > REACH:
+            return None
+        here = tail + 1
+    ahead = np.flatnonzero(voiced[here:])
+    return _seconds(first + here + int(ahead[0])) if ahead.size else None
+
+
 def _end_edge(loudness: np.ndarray, at: Fraction, low: Fraction, high: Fraction) -> Fraction | None:
     """窓の中の声の終わり 見つからなければ ``None``（呼ぶ側が元の時刻のまま残す）"""
     window = _voiced(loudness, low, high, END_QUIET_DB)
@@ -306,15 +408,29 @@ def _end_edge(loudness: np.ndarray, at: Fraction, low: Fraction, high: Fraction)
 
 
 def _voiced(
-    loudness: np.ndarray, low: Fraction, high: Fraction, quiet_db: float
+    loudness: np.ndarray,
+    low: Fraction,
+    high: Fraction,
+    quiet_db: float,
+    *,
+    read_around: tuple[Fraction, Fraction] | None = None,
 ) -> tuple[int, np.ndarray] | None:
-    """``[low, high)`` の声のあるコマ 窓の頭のコマの番号と一緒に返す 読めなければ ``None``"""
+    """``[low, high)`` の声のあるコマ 窓の頭のコマの番号と一緒に返す 読めなければ ``None``
+
+    話と雑音の大きさは ``read_around``（省けば窓そのもの）の前後 :data:`_REFERENCE_REACH` で読む
+    """
     first = max(0, _step(low))
     last = min(len(loudness), _step(high))
     if last - first < 1:
         return None
     reach = _step(_REFERENCE_REACH)
-    around = loudness[max(0, first - reach) : min(len(loudness), last + reach)]
+    ref_first, ref_last = (first, last)
+    if read_around is not None:
+        ref_first = max(0, _step(read_around[0]))
+        ref_last = min(len(loudness), _step(read_around[1]))
+    around = loudness[max(0, ref_first - reach) : min(len(loudness), ref_last + reach)]
+    if around.size == 0:
+        return None
     spoken = around[around > _NEARLY_SILENT_DB]
     if spoken.size == 0:
         return None

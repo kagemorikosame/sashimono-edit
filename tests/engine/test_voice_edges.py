@@ -22,6 +22,7 @@ from sashimono.core.model import (
 from sashimono.core.subtitle_timing import SubtitleTiming
 from sashimono.engine.audio.voice_edges import (
     fit_to_voice,
+    found_edges,
     loudness_of_samples,
     loudness_of_waveform,
     retime,
@@ -115,6 +116,136 @@ class TestFitToVoice:
         assert fitted[0] == pytest.approx((3.2, 3.6), abs=0.02)
         assert fitted[1] == pytest.approx((3.6, 5.0), abs=0.02)
 
+    def test_a_head_tied_to_the_last_line_skips_the_pause(self) -> None:
+        # Whisper は文の頭を前の文の終わりに付けて返す（#468 の作品では 738 行のうち 699 行）
+        # 壊れると、前の文の声の残りを「声の途中」と読んで動かさず、1.5 秒の無音の間ずっと次の
+        # 字幕が先に出る
+        samples = _voice([(0.5, 2.0, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 1.98), (1.98, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(3.5, abs=0.02)
+        assert fitted[1][1] == pytest.approx(5.0, abs=0.02)
+
+    def test_a_head_tied_to_the_last_line_reaches_past_half_a_second(self) -> None:
+        # 頭が前の行の終わりに付いた行は、声の出だしが 0.5 秒より先でも寄せる 壊れると、寄せる
+        # 範囲の外に出だしがある行（#468 の 1.6 秒）は早く出たまま残る
+        samples = _voice([(0.5, 1.9, 0.5), (3.6, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[0] == pytest.approx((0.5, 1.9), abs=0.02)
+        assert fitted[1] == pytest.approx((3.6, 5.0), abs=0.02)
+
+    def test_the_last_line_keeps_the_rest_of_its_voice(self) -> None:
+        # 前の文の声が次の行の頭を越えて残る所で、次の行の頭だけを遅らせると、前の行の最後の語が
+        # 字幕の無い所で鳴る 前の行の終わりは、次の行の新しい頭まで声を追う
+        samples = _voice([(0.5, 2.2, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 1.9), (1.9, 5.0)], samples)
+        assert fitted[0][1] == pytest.approx(2.2, abs=0.02)
+        assert fitted[1][0] == pytest.approx(3.5, abs=0.02)
+
+    def test_a_tied_head_without_voice_in_its_line_stays(self) -> None:
+        # 行の中に声が無いのに次の行の声まで探しに行くと、行が隣の文へ飛ぶ
+        samples = _voice([(0.5, 2.0, 0.5), (4.0, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 3.5)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_tied_head_inside_a_long_run_keeps_its_words(self) -> None:
+        # 行の頭から 0.5 秒より長く続く声は、前の文の残りでなくこの行の言葉（Whisper が 1 つの話を
+        # 割った所） 間の後ろへ頭を送ると、この行の最初の語が字幕の無い所で鳴る
+        samples = _voice([(0.5, 3.0, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_first_word_just_before_a_tied_head_stays(self) -> None:
+        # 頭の 0.05 秒前から短い語が鳴って間が空く所は、Whisper が頭を少し遅く置いたこの行の最初の
+        # 語（#468 の作品の「でっこ」の「で」） 前の文の残りと読んで間の後ろへ送ると、最初の語が
+        # 字幕の無い所で鳴る
+        samples = _voice([(0.5, 1.4, 0.5), (1.95, 2.1, 0.5), (2.4, 4.0, 0.5)], seconds=6.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 4.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_long_weak_voice_past_a_tied_head_keeps_it(self) -> None:
+        # 前の文の弱い声（-40 dB）が頭を越えて 0.8 秒続く所で、出だしのしきい値で無音と読んで頭を
+        # 間の後ろへ送ると、前の行の終わりも届かず、その声に字幕が無くなる（PR #491 の CodeRabbit の
+        # 指摘）
+        samples = _voice([(0.5, 1.4, 0.5), (1.4, 2.8, 0.01), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_short_weak_leftover_still_moves_the_head(self) -> None:
+        # 前の文の弱い残り（-40 dB）が頭の後ろに 0.3 秒だけ続いて間が空く所は、これまで通り頭を
+        # 間の後ろへ送り、前の行の終わりはその残りまで追う 壊れると、息だけの「す」の後の長い間に
+        # 次の字幕が早く出る
+        samples = _voice([(0.5, 1.6, 0.5), (1.6, 2.3, 0.01), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[0][1] == pytest.approx(2.3, abs=0.03)
+        assert fitted[1][0] == pytest.approx(3.5, abs=0.02)
+
+    def test_a_first_word_right_after_a_weak_tail_keeps_the_head(self) -> None:
+        # 前の文の弱い声（-40 dB）の直後に、頭ちょうどからこの行の最初の語が大きく始まる所 前の文の
+        # 続きと読んで間の後ろへ送ると、最初の語に字幕が無くなる（PR #491 の CodeRabbit の指摘）
+        samples = _voice(
+            [(0.5, 1.4, 0.5), (1.4, 2.0, 0.01), (2.0, 2.2, 0.5), (3.5, 5.0, 0.5)], seconds=7.0
+        )
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_overlapping_speakers_do_not_delay_the_head(self) -> None:
+        # 前の話者の声が残る所に次の話者が重ねて話し始めると、声は頭をまたいで切れずに続く 前の文の
+        # 残りと読んで次の間の後ろへ送ると、重ねて話した最初の語が字幕の無い所で鳴る
+        samples = _voice([(0.5, 2.3, 0.5), (2.05, 3.0, 0.3), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_tied_head_on_its_own_voice_stays(self) -> None:
+        # 前の文との間が無く、行の頭ちょうどから声が始まる所は合っている 動かすと語の頭が欠ける
+        samples = _voice([(0.5, 1.8, 0.5), (2.0, 3.0, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_leftover_of_exactly_half_a_second_stays_with_the_last_line(self) -> None:
+        # 前の文の残りがちょうど 0.5 秒だと、前の行の終わりを探す窓の終わりまで声が続いて終わりを
+        # 読めず、2〜2.5 秒の声に字幕が無くなっていた（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(0.5, 2.5, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[0][1] == pytest.approx(2.5, abs=0.02)
+        assert fitted[1][0] == pytest.approx(3.5, abs=0.02)
+
+    def test_a_tied_head_does_not_pass_an_overlapping_next_line(self) -> None:
+        # 次の行が重なって返ってきた所で頭を次の行の頭より後ろへ送ると、次の行が長さ 0 に潰れて
+        # 字幕が消える（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(0.5, 1.8, 0.5), (8.0, 9.0, 0.5)], seconds=12.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 10.0), (3.0, 4.0)], samples)
+        assert all(end > start for start, end in fitted)
+        assert fitted[1][0] <= 3.0
+
+    def test_a_tied_head_stays_with_a_next_line_on_the_same_start(self) -> None:
+        # 次の行が同じ頭で重なって返ってきた所で頭を送ると、次の行が送った頭に押されて長さ 0 に
+        # 潰れる（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(0.5, 1.8, 0.5), (8.0, 9.0, 0.5)], seconds=12.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 10.0), (2.0, 4.0)], samples)
+        assert all(end > start for start, end in fitted)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_loud_voice_far_ahead_does_not_hide_a_quiet_head(self) -> None:
+        # 行の終わりまでの広い窓で話の大きさを読むと、後ろの大声でしきい値が上がり、頭の近くの
+        # 小さな声を無音と読んで最初の語を字幕から外していた（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(2.0, 3.0, 0.01), (25.0, 28.0, 0.56)], seconds=31.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 29.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_tied_head_on_time_counts_as_found(self) -> None:
+        # 頭ちょうどから声が始まる行を「境目が見つからない」と読むと、字幕の時刻の確かめがその
+        # 行の頭を比べずに飛ばす（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(0.5, 1.8, 0.5), (2.0, 3.0, 0.5)], seconds=5.0)
+        times = [(_f(0.5), _f(2.0)), (_f(2.0), _f(3.0))]
+        assert found_edges(times, loudness_of_samples(samples, RATE))[1][0] is True
+
+    def test_a_gap_before_the_head_still_limits_the_reach(self) -> None:
+        # 前の行との間を Whisper が空けて返した行は、頭の手掛かりを認識が持っている 遠くの声まで
+        # 探すと、取り違えた行が隣の文へ寄る
+        samples = _voice([(0.5, 1.5, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 1.5), (2.0, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
     def test_lines_stay_in_order_without_overlapping(self) -> None:
         # 壊れると、字幕の並びの不変条件が崩れて作品へ入れられず、焼き込みで前の字幕が欠ける
         samples = _voice([(1.0, 2.0, 0.5), (2.1, 3.0, 0.5)], seconds=5.0)
@@ -131,6 +262,41 @@ class TestFitToVoice:
         # 素材より後ろを指す行（長さの読み違い）で落ちると、起こし全体が失敗に見える
         samples = _voice([(1.0, 2.0, 0.5)], seconds=3.0)
         assert _fit([(10.0, 11.0)], samples) == [(10.0, 11.0)]
+
+
+def _sentences() -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """#426 の合成の声の組と同じ並び 22 文を 0.25〜4 秒の間を空けて並べた声と、Whisper が返す形の行
+
+    行は 1 つおきに、頭を前の行の終わりに付けた形（#468）と、間を空けて頭を 0.2 秒早く置いた形
+    """
+    gaps = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
+    voices: list[tuple[float, float]] = []
+    at = 1.0
+    for index in range(22):
+        length = 1.2 + 0.1 * (index % 13)
+        voices.append((at, at + length))
+        at += length + gaps[index % len(gaps)]
+    lines: list[tuple[float, float]] = []
+    for index, (start, end) in enumerate(voices):
+        head = lines[-1][1] if index % 2 and lines else start - 0.2
+        lines.append((head, end + 0.02))
+    return voices, lines
+
+
+class TestSyntheticSets:
+    @pytest.mark.parametrize("noise", [0.0, 0.01, 0.07], ids=["雑音なし", "-45dB", "-28dB"])
+    def test_heads_land_on_the_voice_in_each_set(self, noise: float) -> None:
+        # #426 で測った 3 つの組（雑音なし・-45 dB・-28 dB）の形 頭のずれの中央値は 0.2.4 の寄せで
+        # 0.01 秒前後だった 壊れると、付いた頭を探す所を足したせいで、組全体の頭がずれる（#468 の
+        # 確かめ 実際の合成の声と Whisper での測りは docs/development.md）
+        voices, lines = _sentences()
+        samples = _voice([(a, b, 0.5) for a, b in voices], seconds=voices[-1][1] + 2.0, noise=noise)
+        fitted = _fit(lines, samples)
+        raw = [abs(line[0] - voice[0]) for line, voice in zip(lines, voices, strict=True)]
+        errors = [abs(fit[0] - voice[0]) for fit, voice in zip(fitted, voices, strict=True)]
+        assert float(np.median(raw)) > 0.1
+        assert float(np.median(errors)) <= 0.02
+        assert float(np.percentile(errors, 90)) <= 0.03
 
 
 class TestLoudness:
@@ -322,6 +488,18 @@ class TestRetimeCommand:
         spans = sorted(final.values())
         assert all(left[1] <= right[0] for left, right in pairwise(spans))
         assert all(end > start for start, end in spans)
+
+    def test_a_tied_head_moves_when_retimed_later(self) -> None:
+        # 前の版で起こした字幕は、字幕パネルの〔時刻を合わせる…〕と AI の retime_subtitles で直す
+        # （#468） 壊れると、起こし直さない限り頭が前の行の終わりに付いたまま早く出る
+        transcript = Transcript((_segment(0.5, 1.98, "一", "a"), _segment(1.98, 5.0, "二", "b")))
+        samples = _voice([(0.5, 2.0, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
+        command = retime_command(
+            MediaId("m"), transcript, SubtitleTiming(), loudness_of_samples(samples, RATE)
+        )
+        assert command is not None
+        moved = {i: (float(start), float(end)) for i, start, end in command.times}
+        assert moved[SegmentId("b")][0] == pytest.approx(3.5, abs=0.02)
 
     def test_nothing_to_move_gives_no_command(self) -> None:
         # 空の命令を履歴に積むと、何も変わらない「元に戻す」が 1 つ増える

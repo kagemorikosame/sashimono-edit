@@ -84,3 +84,34 @@ def test_turned_off_the_lines_are_left_as_recognized(
     # 切っても寄せると、音楽の上で話す素材で寄せ方が合わない人が逃げられない
     options = TranscribeOptions(timing=SubtitleTiming(fit_to_voice=False))
     assert _times(tmp_path, monkeypatch, options) == [(0.7, 2.3)]
+
+
+class _TiedModel:
+    """Whisper の癖をまねて、2 行目の頭を 1 行目の終わりに付けて返す（#468）"""
+
+    def transcribe(self, audio: Any, **_: Any) -> tuple[list[_Segment], _Info]:
+        del audio
+        return [_Segment(0.5, 1.98, "前の文"), _Segment(1.98, 5.0, "次の文")], _Info()
+
+
+def test_a_head_tied_to_the_last_line_moves_past_the_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 前の文の声の終わりのすぐ後ろに 1.5 秒の間があり、その後に次の文が始まる音 壊れると、起こした
+    # 直後の字幕が間の分だけ声より早く出る（#468 認識器の返し方は偽の物 音は合成）
+    t = np.arange(6 * RATE) / RATE
+    tone = 0.5 * np.sin(2 * np.pi * 220 * t)
+    samples = np.where(((t >= 0.5) & (t < 2.0)) | ((t >= 3.5) & (t < 5.0)), tone, 0.0)
+    path = tmp_path / "間のある声.wav"
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(RATE)
+        out.writeframes((samples * 32767).astype(np.int16).tobytes())
+    backend = FasterWhisperBackend()
+    monkeypatch.setattr(backend, "_ensure_model", lambda options: _TiedModel())
+    transcript = backend.transcribe(path, TranscribeOptions(timing=SubtitleTiming()))
+    assert transcript is not None
+    (first, second) = [(float(s.start), float(s.end)) for s in transcript.segments]
+    assert first[1] == pytest.approx(2.0, abs=0.02)
+    assert second[0] == pytest.approx(3.5, abs=0.02)
