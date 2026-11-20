@@ -239,10 +239,10 @@ def _edges(
     heads: list[Fraction | None] = []
     for index, (start, end) in enumerate(times):
         if _tied(times, index):
-            # 次の行が重なって返ってきた（次の行の頭がこの行の終わりより前）ときは、次の行の頭で
-            # 探すのを止める 越えて送ると、次の行の頭が前へ出られず長さ 0 に潰れる
+            # 次の行が重なって返ってきた（次の行の頭がこの行の終わりより前 同じ頭も含む）ときは、
+            # 次の行の頭で探すのを止める 越えて送ると、次の行の頭が前へ出られず長さ 0 に潰れる
             limit = end
-            if index + 1 < len(times) and start < times[index + 1][0] < end:
+            if index + 1 < len(times) and start <= times[index + 1][0] < end:
                 limit = times[index + 1][0]
             heads.append(_tied_start_edge(loudness, start, limit))
         else:

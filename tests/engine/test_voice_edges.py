@@ -176,6 +176,14 @@ class TestFitToVoice:
         assert all(end > start for start, end in fitted)
         assert fitted[1][0] <= 3.0
 
+    def test_a_tied_head_stays_with_a_next_line_on_the_same_start(self) -> None:
+        # 次の行が同じ頭で重なって返ってきた所で頭を送ると、次の行が送った頭に押されて長さ 0 に
+        # 潰れる（PR #491 の CodeRabbit の指摘）
+        samples = _voice([(0.5, 1.8, 0.5), (8.0, 9.0, 0.5)], seconds=12.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 10.0), (2.0, 4.0)], samples)
+        assert all(end > start for start, end in fitted)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
     def test_a_loud_voice_far_ahead_does_not_hide_a_quiet_head(self) -> None:
         # 行の終わりまでの広い窓で話の大きさを読むと、後ろの大声でしきい値が上がり、頭の近くの
         # 小さな声を無音と読んで最初の語を字幕から外していた（PR #491 の CodeRabbit の指摘）
