@@ -365,9 +365,11 @@ def _tied_start_edge(loudness: np.ndarray, at: Fraction, end: Fraction) -> Fract
     if here == 0 and (voiced[here] or trailing[here]):
         # 頭より前を見られない（素材の頭） 前の文の残りか、この行の声かを見分けられない
         return None
-    if voiced[here] and not trailing[here - 1]:
+    if voiced[here] and not voiced[here - 1]:
         # 頭ちょうどから声が始まる 頭はもう合っていて、境目は見つかっている（字幕の時刻の
-        # 確かめは、見つかったかどうかで比べるかを決める）
+        # 確かめは、見つかったかどうかで比べるかを決める） 出だしは出だしのしきい値で見る 深い
+        # しきい値で見ると、前の文の弱い声の直後に頭ちょうどから始まるこの行の最初の語を前の文の
+        # 続きと読み、間の後ろへ送る（PR #491 の CodeRabbit の指摘）
         return at
     if trailing[here] and trailing[here - 1]:
         head = here

@@ -179,6 +179,15 @@ class TestFitToVoice:
         assert fitted[0][1] == pytest.approx(2.3, abs=0.03)
         assert fitted[1][0] == pytest.approx(3.5, abs=0.02)
 
+    def test_a_first_word_right_after_a_weak_tail_keeps_the_head(self) -> None:
+        # 前の文の弱い声（-40 dB）の直後に、頭ちょうどからこの行の最初の語が大きく始まる所 前の文の
+        # 続きと読んで間の後ろへ送ると、最初の語に字幕が無くなる（PR #491 の CodeRabbit の指摘）
+        samples = _voice(
+            [(0.5, 1.4, 0.5), (1.4, 2.0, 0.01), (2.0, 2.2, 0.5), (3.5, 5.0, 0.5)], seconds=7.0
+        )
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
     def test_overlapping_speakers_do_not_delay_the_head(self) -> None:
         # 前の話者の声が残る所に次の話者が重ねて話し始めると、声は頭をまたいで切れずに続く 前の文の
         # 残りと読んで次の間の後ろへ送ると、重ねて話した最初の語が字幕の無い所で鳴る
