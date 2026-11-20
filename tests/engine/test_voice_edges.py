@@ -162,6 +162,13 @@ class TestFitToVoice:
         fitted = _fit([(0.5, 2.0), (2.0, 4.0)], samples)
         assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
 
+    def test_overlapping_speakers_do_not_delay_the_head(self) -> None:
+        # 前の話者の声が残る所に次の話者が重ねて話し始めると、声は頭をまたいで切れずに続く 前の文の
+        # 残りと読んで次の間の後ろへ送ると、重ねて話した最初の語が字幕の無い所で鳴る
+        samples = _voice([(0.5, 2.3, 0.5), (2.05, 3.0, 0.3), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
     def test_a_tied_head_on_its_own_voice_stays(self) -> None:
         # 前の文との間が無く、行の頭ちょうどから声が始まる所は合っている 動かすと語の頭が欠ける
         samples = _voice([(0.5, 1.8, 0.5), (2.0, 3.0, 0.5), (3.5, 5.0, 0.5)], seconds=7.0)
