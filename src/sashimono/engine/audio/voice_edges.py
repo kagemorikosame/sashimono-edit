@@ -348,25 +348,30 @@ def _tied_start_edge(loudness: np.ndarray, at: Fraction, end: Fraction) -> Fract
     """
     # 話の大きさは、これまで通り頭の近く（前後 REACH）の周りで読む 行の終わりまでの広い窓で読むと、
     # 後ろの大声に引きずられてしきい値が上がり、頭の近くの小さな声を無音と読んで頭を遠くへ送る
-    window = _voiced(
-        loudness, at - REACH, end, START_QUIET_DB, read_around=(at - REACH, at + REACH)
-    )
-    if window is None:
+    around = (at - REACH, at + REACH)
+    window = _voiced(loudness, at - REACH, end, START_QUIET_DB, read_around=around)
+    # 頭より前から続く声は、声の終わりと同じ深いしきい値で読む 出だしのしきい値で読むと、前の文の
+    # 弱い声（息だけの「す」・小さく続く語）を無音と読み、続きの長さを測らずに頭を間の後ろへ送る
+    # 前の行の終わりは深いしきい値でその声を追うので、行の終わりまで届かず声に字幕が無くなる
+    # （PR #491 の CodeRabbit の指摘） 間の後ろの出だしはこれまで通り出だしのしきい値で探す
+    lasting = _voiced(loudness, at - REACH, end, END_QUIET_DB, read_around=around)
+    if window is None or lasting is None:
         return None
     first, voiced = window
+    _first, trailing = lasting
     here = _step(at) - first
     if not 0 <= here < len(voiced):
         return None
-    if voiced[here]:
-        if here == 0:
-            # 頭より前を見られない（素材の頭） 前の文の残りか、この行の声かを見分けられない
-            return None
-        if not voiced[here - 1]:
-            # 頭ちょうどから声が始まる 頭はもう合っていて、境目は見つかっている（字幕の時刻の
-            # 確かめは、見つかったかどうかで比べるかを決める）
-            return at
+    if here == 0 and (voiced[here] or trailing[here]):
+        # 頭より前を見られない（素材の頭） 前の文の残りか、この行の声かを見分けられない
+        return None
+    if voiced[here] and not trailing[here - 1]:
+        # 頭ちょうどから声が始まる 頭はもう合っていて、境目は見つかっている（字幕の時刻の
+        # 確かめは、見つかったかどうかで比べるかを決める）
+        return at
+    if trailing[here] and trailing[here - 1]:
         head = here
-        while head > 0 and voiced[head - 1]:
+        while head > 0 and trailing[head - 1]:
             head -= 1
         if _seconds(here - head) < _LEFTOVER_BEHIND:
             # 声が頭のすぐ前から始まる Whisper が頭を少し遅く置いたこの行の最初の語（「でっこ」の
@@ -374,9 +379,9 @@ def _tied_start_edge(loudness: np.ndarray, at: Fraction, end: Fraction) -> Fract
             # 字幕の無い所で鳴る
             return None
         tail = here
-        while tail < len(voiced) - 1 and voiced[tail + 1]:
+        while tail < len(trailing) - 1 and trailing[tail + 1]:
             tail += 1
-        if tail == len(voiced) - 1 or _seconds(tail + 1 - here) > REACH:
+        if tail == len(trailing) - 1 or _seconds(tail + 1 - here) > REACH:
             return None
         here = tail + 1
     ahead = np.flatnonzero(voiced[here:])

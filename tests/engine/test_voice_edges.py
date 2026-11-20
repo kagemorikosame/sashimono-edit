@@ -162,6 +162,23 @@ class TestFitToVoice:
         fitted = _fit([(0.5, 2.0), (2.0, 4.0)], samples)
         assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
 
+    def test_a_long_weak_voice_past_a_tied_head_keeps_it(self) -> None:
+        # 前の文の弱い声（-40 dB）が頭を越えて 0.8 秒続く所で、出だしのしきい値で無音と読んで頭を
+        # 間の後ろへ送ると、前の行の終わりも届かず、その声に字幕が無くなる（PR #491 の CodeRabbit の
+        # 指摘）
+        samples = _voice([(0.5, 1.4, 0.5), (1.4, 2.8, 0.01), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[1][0] == pytest.approx(2.0, abs=0.02)
+
+    def test_a_short_weak_leftover_still_moves_the_head(self) -> None:
+        # 前の文の弱い残り（-40 dB）が頭の後ろに 0.3 秒だけ続いて間が空く所は、これまで通り頭を
+        # 間の後ろへ送り、前の行の終わりはその残りまで追う 壊れると、息だけの「す」の後の長い間に
+        # 次の字幕が早く出る
+        samples = _voice([(0.5, 1.6, 0.5), (1.6, 2.3, 0.01), (3.5, 5.0, 0.5)], seconds=7.0)
+        fitted = _fit([(0.5, 2.0), (2.0, 5.0)], samples)
+        assert fitted[0][1] == pytest.approx(2.3, abs=0.03)
+        assert fitted[1][0] == pytest.approx(3.5, abs=0.02)
+
     def test_overlapping_speakers_do_not_delay_the_head(self) -> None:
         # 前の話者の声が残る所に次の話者が重ねて話し始めると、声は頭をまたいで切れずに続く 前の文の
         # 残りと読んで次の間の後ろへ送ると、重ねて話した最初の語が字幕の無い所で鳴る
