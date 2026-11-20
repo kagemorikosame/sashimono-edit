@@ -123,6 +123,7 @@ from sashimono.engine.vision.sampling import MEASURED_SCREEN_SAMPLE
 from sashimono.gc_policy import IDLE_S, MAX_DEFER_S
 from sashimono.stall_watch import DEFAULT_THRESHOLD_MS, default_log_path
 from sashimono.ui.backup_settings import BackupSection, confirm_backup_changes
+from sashimono.ui.encoder_recheck import EncoderRecheck
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THUMBNAILS_SIMPLE
 from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_DARK, BACKDROP_LIGHT
@@ -588,7 +589,21 @@ class PreferencesDialog(QDialog):
             "同じビットレートなら CPU（libx264）の方がきれいなことが多い "
             "書き出しの窓でコーデックを名指しすれば、そちらが勝つ"
         )
-        form.addRow("エンコーダの優先", self._encoder_priority)
+        recheck = QPushButton("エンコーダを確かめ直す", self)
+        recheck.setToolTip(
+            "どのエンコーダが使えるかは、起動して最初に書き出すときに 1 度だけ確かめて覚えている "
+            "GPU の駆動の不調で使えなかった物が、PC の再起動や駆動の入れ直しで直ったときに押す"
+        )
+        recheck.clicked.connect(self._recheck_encoders)
+        encoder_row = QHBoxLayout()
+        encoder_row.addWidget(self._encoder_priority, 1)
+        encoder_row.addWidget(recheck)
+        form.addRow("エンコーダの優先", encoder_row)
+        self._encoder_status = QLabel("", self)
+        self._encoder_status.setWordWrap(True)
+        form.addRow("", self._encoder_status)
+        #: 確かめ直しを裏で進める係 壊れた駆動で固まっても設定の窓を固めない
+        self._encoder_recheck = EncoderRecheck(self)
 
         self._decode_threads = QComboBox(self)
         for label, threads in DECODE_THREADS:
@@ -1983,6 +1998,13 @@ class PreferencesDialog(QDialog):
                 "エンジンの場所を変えたので、既定の声を一覧の最初の声に戻した"
                 " 〔声の一覧を読む〕で選び直す"
             )
+
+    def _recheck_encoders(self, _checked: bool = False) -> None:
+        """覚えているエンコーダの答えを捨てて、裏で確かめ直す（#464）"""
+        if not self._encoder_recheck.start(self._encoder_status.setText):
+            self._encoder_status.setText("前の確かめ直しがまだ終わっていません")
+            return
+        self._encoder_status.setText("エンコーダを確かめています…")
 
     def _read_voices(self, _checked: bool = False) -> None:
         """エンジンの声を並べる 人が押したときだけ、自分の機械の中のエンジンへつなぐ

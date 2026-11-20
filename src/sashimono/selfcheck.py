@@ -90,6 +90,7 @@ def run_self_check() -> list[CheckResult]:
         ("同梱の絵（アイコン・ボタンの印）", _bundled_files, False),
         ("追加機能の導入（pip）", _pip, False),
         (WORKER_CHECK_NAME, _worker, False),
+        (ENCODER_PROBE_CHECK_NAME, _encoder_probe, False),
         # 合否に混ぜない 子で GL を作れない機械（リモート接続・仮想の画面）では、書き出しは
         # 自分でスレッドへ戻って書ける ここで分かるのは、戻る道を通る機械かどうか
         (WORKER_EXPORT_CHECK_NAME, _worker_export, True),
@@ -484,6 +485,26 @@ def _worker() -> str:
     if answer != "子が答えた" or not seen:
         raise RuntimeError(f"子から答えが返らなかった（{answer!r} 進み具合 {len(seen)} 回）")
     return f"{answer}（進み具合 {len(seen)} 回）"
+
+
+#: エンコーダを別のプロセスで確かめる項目の名前（#464）
+ENCODER_PROBE_CHECK_NAME = "別のプロセスでエンコーダを確かめる"
+
+
+def _encoder_probe() -> str:
+    """エンコーダの確かめの子を、この exe で起こして答えを受けられるか
+
+    子を起こせないと、エンコーダの確かめはこのプロセスの中へ戻り、書き出しの項目は
+    それでも通る 戻った配布版は、駆動の壊れた機械で書き出しを押すとアプリごと落ちる
+    （#464 の前と同じ）ので、子の道そのものをここで別に確かめる
+    CPU の物で確かめる GPU の物は機械ごとに有無が違い、同じ zip が機械で通ったり落ちたりする
+    """
+    from sashimono.engine.encoders import _probe_in_child
+
+    answers = _probe_in_child([CPU_CODEC])
+    if answers != {CPU_CODEC: True}:
+        raise RuntimeError(f"子が {CPU_CODEC} で書けると答えなかった（{answers!r}）")
+    return f"子が {CPU_CODEC} で書けると答えた"
 
 
 #: 別のプロセスで書き出す項目の名前（#453）

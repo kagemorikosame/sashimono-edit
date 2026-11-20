@@ -14,7 +14,6 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
-from functools import cache
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
@@ -43,10 +42,15 @@ from sashimono.engine.colorspace import (
 )
 from sashimono.engine.encoders import (
     PRIORITY_AUTO,
+    PRIORITY_CPU,
     MonotonicProgress,
     encoder_options,
+    encoder_vendor,
     order_by_priority,
-    probe_encoder,
+    trouble_notice,
+    usable_encoders,
+    usable_encoders_now,
+    verdict,
 )
 from sashimono.engine.gpu import OffscreenGLContext, ShaderError, Texture
 from sashimono.engine.gpu.yuv import COLOR_TOLERANCE, YuvReadback, open_readback
@@ -76,6 +80,8 @@ __all__ = [
     "ExportError",
     "ExportSettings",
     "available_video_codecs",
+    "available_video_codecs_now",
+    "export_candidates",
     "export_chapters",
     "export_project",
     "write_chapters",
@@ -229,33 +235,21 @@ def available_video_codecs(priority: str = PRIORITY_AUTO) -> list[str]:
 
     ``priority`` の作り手のエンコーダを前へ寄せる
     （:func:`~sashimono.engine.encoders.order_by_priority`） 知らない値は ``ValueError``
+
+    試し方と覚え方は控えの作成と同じ物を使う（:func:`~sashimono.engine.encoders.usable_encoders`）
+    試すのは別のプロセスなので、駆動が壊れた機械でもアプリごと落ちない（#464）
     """
-    return order_by_priority([name for name in VIDEO_CODEC_PREFERENCE if _opens(name)], priority)
+    return order_by_priority(usable_encoders(VIDEO_CODEC_PREFERENCE), priority)
 
 
-@cache
-def _opens(name: str) -> bool:
-    """``name`` のエンコーダで書けるか 1 つにつき 1 度だけ試して覚える
+def available_video_codecs_now(priority: str = PRIORITY_AUTO) -> list[str] | None:
+    """:func:`available_video_codecs` と同じ ただしほかの確かめが走っている間は待たずに ``None``
 
-    NVENC を開くのは 1 回 100 ms ほどかかる 書き出しの画面を開くたびに試すと、
-    そのたびに待たされる 機械の GPU は起動中に変わらないので、覚えておいてよい
+    書き出しの窓が画面のスレッドで使う 確かめ直しの途中で待つと、固まった駆動を
+    待ち切るまで窓が開かない（:func:`~sashimono.engine.encoders.usable_encoders_now`）
     """
-    try:
-        _open_encoder(name)
-    except Exception:
-        # 入っていない（UnknownCodecError）・開けない（ArgumentError など）の種類は
-        # 環境によって違う 名前で拾うと、知らない種類の失敗で候補の列挙ごと落ちる
-        return False
-    return True
-
-
-def _open_encoder(name: str) -> None:
-    """``name`` のエンコーダを開いて 1 コマ書いてみる 書けなければ投げる
-
-    試し方は控えの作成と同じ物を使う（:func:`~sashimono.engine.encoders.probe_encoder`）
-    名前をここに残すのは、試験が開けないエンコーダを真似るときにここを差し替えるため
-    """
-    probe_encoder(name)
+    found = usable_encoders_now(VIDEO_CODEC_PREFERENCE)
+    return None if found is None else order_by_priority(found, priority)
 
 
 class _EncoderError(ExportError):
@@ -281,6 +275,48 @@ class _GpuColorError(ExportError):
     バッファごと捨てるしかなく、絵と音の一部はもう入れ物へ書いてある 続けるとコマが欠けるか
     順が乱れるので、同じコーデックで頭から CPU の色変換で書き直す
     """
+
+
+def export_candidates(settings: ExportSettings) -> list[str]:
+    """試す順のコーデック 名指しが無ければ確かめて書けた物を優先の順に
+
+    名指しした GPU のエンコーダも確かめる（別のプロセスで） 確かめで子ごと落ちた物を
+    このプロセスで開くと、今度はアプリごと落ちる（#464） そのときは名指しを捨てて、
+    自動の候補で書き出す 書き出しそのものを断るより、CPU で書けた方が編集を失わずに済む
+    名指しが CPU の物か、ただ開けないだけの物は確かめずに渡す 開けない理由は
+    書き出しの失敗としてそのまま伝わる
+    """
+    named = settings.video_codec
+    if not named:
+        return available_video_codecs(settings.encoder_priority)
+    if encoder_vendor(named) == PRIORITY_CPU:
+        return [named]
+    # 書けるかと理由は同じ時点で取る 別々に問うと、間に確かめ直しが割り込んで理由だけ消え、
+    # 落ちた物をこのプロセスで開きにいく
+    ok, trouble = verdict(named)
+    if not ok and trouble is not None:
+        return available_video_codecs(settings.encoder_priority)
+    return [named]
+
+
+def _probe_notice(settings: ExportSettings, used: str) -> str | None:
+    """確かめで落ちたか固まった GPU のエンコーダを飛ばして書いたときの知らせ
+
+    優先の並びで、使った物より前にあった物だけを数える CPU を先にと選んだ人には、
+    後ろの NVENC が落ちていても書き出しには関わらない 名指しした物で書けたときも出さない
+    名指しで libx264 を選んだ人に GPU の不調を知らせても、書き出しは何も変わっていない
+    """
+    named = settings.video_codec
+    if named == used:
+        return None
+    try:
+        ordered = order_by_priority(list(VIDEO_CODEC_PREFERENCE), settings.encoder_priority)
+    except ValueError:
+        return None
+    if named:
+        ordered = [named, *ordered]
+    skipped = ordered[: ordered.index(used)] if used in ordered else ordered
+    return trouble_notice(skipped)
 
 
 def _fallback_notice(
@@ -372,11 +408,7 @@ def export_project(
     # 断られることがある（NVENC の H.264 は幅 4096 を超える画を開けない）
     # そのときに書き出しごと失敗させず、最後は libx264 まで落とす
     try:
-        codecs = (
-            [settings.video_codec]
-            if settings.video_codec
-            else available_video_codecs(settings.encoder_priority)
-        )
+        codecs = export_candidates(settings)
     except ValueError as exc:
         # 知らない優先を黙って自動にすると、選んだ物が効かない理由が分からない
         raise ExportError(str(exc)) from exc
@@ -464,8 +496,14 @@ def export_project(
                         shown.start_again()
                     continue
             else:
-                if (refused or gpu_failure is not None) and notice is not None:
-                    notice(_fallback_notice(refused, codec, gpu_failure))
+                if notice is not None:
+                    told = _probe_notice(settings, codec)
+                    if refused or gpu_failure is not None:
+                        told = " ".join(
+                            filter(None, [told, _fallback_notice(refused, codec, gpu_failure)])
+                        )
+                    if told:
+                        notice(told)
                 break
             if shown is not None:
                 shown.start_again()

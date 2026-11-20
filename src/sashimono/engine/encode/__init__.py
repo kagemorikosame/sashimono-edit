@@ -26,6 +26,8 @@ from sashimono.engine.encode.exporter import (
     ExportError,
     ExportSettings,
     available_video_codecs,
+    available_video_codecs_now,
+    export_candidates,
     export_project,
 )
 
@@ -49,8 +51,10 @@ __all__ = [
     "ExportError",
     "ExportSettings",
     "available_video_codecs",
+    "available_video_codecs_now",
     "build_settings",
     "chosen_range",
+    "export_candidates",
     "export_project",
     "export_target",
     "matched_bitrate_mbps",
