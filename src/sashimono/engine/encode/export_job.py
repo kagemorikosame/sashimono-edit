@@ -33,7 +33,14 @@ from sashimono.engine.encode.exporter import (
     ExportSettings,
     export_project,
 )
-from sashimono.engine.encoders import ProbeMemory, probe_and_remember, remember
+from sashimono.engine.encoders import (
+    PRIORITY_CPU,
+    ProbeMemory,
+    encoder_vendor,
+    probe_and_remember,
+    remember,
+    remembered,
+)
 from sashimono.engine.worker import (
     WorkerCrashedError,
     WorkerFailedError,
@@ -218,10 +225,17 @@ def export_anywhere(
         # 確かめと写しは同じ錠の中で取る 間に確かめ直しが割り込むと空の写しが子に渡る
         # 名指しの GPU の物が落ちると子は自動の候補へ移るので、自動の候補もいつも確かめる
         # 並びはモジュールから引く 試験が並びを差し替えたときも同じ物を確かめる
-        names = list(exporter.VIDEO_CODEC_PREFERENCE)
-        if settings.video_codec:
-            names.append(settings.video_codec)
-        probes = probe_and_remember(names)
+        # CPU を名指ししたときは GPU を確かめない 確かめの子を起こせない機械ではこの中で
+        # GPU を開くことになり、CPU を選んだのに壊れた駆動でアプリごと落ちうる
+        # 子の書き出しも CPU の名指しなら GPU を試さない（export_candidates）
+        named = settings.video_codec
+        if named and encoder_vendor(named) == PRIORITY_CPU:
+            probes = remembered()
+        else:
+            names = list(exporter.VIDEO_CODEC_PREFERENCE)
+            if named:
+                names.append(named)
+            probes = probe_and_remember(names)
         target = settings.path
         scratch = _scratch_for(target)
         try:

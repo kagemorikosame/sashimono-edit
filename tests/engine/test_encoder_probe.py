@@ -278,6 +278,41 @@ class TestExportChild:
         assert "crash_nvenc" in dict(memory.troubles)
 
 
+class TestNamedCpu:
+    def test_a_cpu_export_does_not_probe_the_gpus(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """CPU を名指しした書き出しは、子を起こせない機械でも GPU をこの中で試さない
+
+        試すと、CPU を選んだのに壊れた駆動でアプリごと落ちうる
+        （PR #492 の CodeRabbit の 3 回目の指摘）
+        """
+        from sashimono.core.model import Project
+        from sashimono.engine.encode import export_job
+
+        def refuse(*_args: Any, **_options: Any) -> None:
+            raise WorkerUnavailableError("起こせない")
+
+        def here(name: str) -> bool:
+            pytest.fail(f"CPU を名指しした書き出しが {name} をこの中で試した")
+
+        seen: dict[str, Any] = {}
+
+        def fake(_job: Callable[..., Any], kwargs: dict[str, Any], **_options: Any) -> None:
+            seen.update(kwargs)
+
+        monkeypatch.setattr(encoders, "run_in_process", refuse)
+        monkeypatch.setattr(encoders, "_probe_here", here)
+        monkeypatch.setattr(export_job, "run_in_process", fake)
+        with pytest.raises(exporter.ExportError):
+            export_job.export_anywhere(
+                cast("Project", object()),
+                exporter.ExportSettings(path=tmp_path / "x.mp4", video_codec="libx264"),
+                separate_process=True,
+            )
+        assert seen["probes"] == encoders.ProbeMemory()
+
+
 class TestRaces:
     def test_the_verdict_and_its_reason_come_together(self, broken_driver: None) -> None:
         # 別々に問うと、間に確かめ直しが割り込んで理由だけ消え、落ちた物をこの中で開きにいく
@@ -362,16 +397,24 @@ def test_a_recheck_cannot_slip_between_probing_and_copying(
 
     real = encoders._usable_locked
     blocked: list[bool] = []
+    # 確かめ直しのスレッドは錠を放した後で待ち切る 錠の中で待ち切れないまま試験を終えると、
+    # 遅れて走った確かめ直しが次の試験の覚えた答えを消す（CodeRabbit の 3 回目の指摘）
+    rechecks: list[threading.Thread] = []
 
     def racing(wanted: list[str]) -> list[str]:
         found = real(wanted)
         recheck = threading.Thread(target=encoders.forget_probes)
+        rechecks.append(recheck)
         recheck.start()
         recheck.join(0.2)
         blocked.append(recheck.is_alive())
         return found
 
     monkeypatch.setattr(encoders, "_usable_locked", racing)
-    memory = encoders.probe_and_remember(["libx264"])
+    try:
+        memory = encoders.probe_and_remember(["libx264"])
+    finally:
+        for recheck in rechecks:
+            recheck.join()
     assert blocked == [True], "確かめ直しが写しより先に答えを消せた"
     assert ("libx264", True) in memory.verdicts
