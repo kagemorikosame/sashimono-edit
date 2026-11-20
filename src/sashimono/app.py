@@ -259,7 +259,24 @@ def _start_editor(arguments: list[str]) -> int:
         QTimer.singleShot(0, lambda: window.show_missing_media(only_if_missing=True))
     # 新しい版を確かめるのは、起動が落ち着いてから 起動を待たせない
     QTimer.singleShot(STARTUP_DELAY_MS, window.start_updates)
+    QTimer.singleShot(STARTUP_DELAY_MS, _probe_encoders_in_background)
     return application.exec()
+
+
+def _probe_encoders_in_background() -> None:
+    """使えるエンコーダを裏で確かめておく（#464）
+
+    確かめは別のプロセスで走り、子を起こす分だけ前より遅い 書き出しの窓は画面のスレッドで
+    候補を並べるので、初めて開いたときにその待ちと、壊れた駆動なら固まった子を待ち切る
+    までの間、窓が固まる 起動が落ち着いた頃に済ませておけば、窓を開く時には覚えた答えを返せる
+    """
+    import threading
+
+    from sashimono.engine.encode import available_video_codecs
+
+    threading.Thread(
+        target=available_video_codecs, name="sashimono-encoder-probe", daemon=True
+    ).start()
 
 
 if __name__ == "__main__":

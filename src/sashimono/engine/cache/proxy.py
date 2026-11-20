@@ -138,7 +138,7 @@ from sashimono.engine.encoders import (
     MonotonicProgress,
     encoder_options,
     order_by_priority,
-    usable,
+    usable_encoders,
 )
 from sashimono.engine.worker import WorkerUnavailableError, run_in_process
 
@@ -234,12 +234,13 @@ CODEC_PREFERENCE = ("h264_nvenc", "h264_amf", "h264_qsv", "libx264")
 def proxy_codecs(priority: str = PRIORITY_AUTO) -> list[str]:
     """この環境で控えを作れるコーデックを、優先順に返す
 
-    入っているだけでは数えず、開けて 1 コマ書けた物だけを返す（:func:`usable`）
+    入っているだけでは数えず、開けて 1 コマ書けた物だけを返す
+    （:func:`usable_encoders` 別のプロセスで試す #464）
     前は入っているかだけを見ていた AMF や QSV は GPU の無い機械でも FFmpeg に入っているので、
     素材を読み込むたびに開けない物から変換を始め、失敗してから次へ移っていた
     ``priority`` の作り手を前へ寄せる 知らない値は ``ValueError``
     """
-    return order_by_priority([name for name in CODEC_PREFERENCE if usable(name)], priority)
+    return order_by_priority(usable_encoders(CODEC_PREFERENCE), priority)
 
 
 def is_worth_proxying(media: MediaItem, keyframe_gap: Fraction | None = None) -> bool:
@@ -650,7 +651,8 @@ def _transcode(
             # 控えは見るためだけのもの 画質より、小ささと変換の速さを取る
             video.bit_rate = width * scaled * 4
             # AMF は品質と上限のビットレートを書き出しと同じ組み方で渡す（#365） 試し
-            # （:func:`usable`）も同じ組み方で開くので、選択肢の名前を駆動が受けないなら試しで外れる
+            # （:func:`usable_encoders`）も同じ組み方で開くので、選択肢の名前を駆動が受けないなら
+            # 試しで外れる
             options = encoder_options(codec, video.bit_rate)
             if options:
                 video.options = dict(options)
@@ -1093,7 +1095,7 @@ class ProxyBuilder:
         # 1 本目の映像だけを控えにする 読む側（レンダラ）も 1 本目を指すクリップにしか渡さない
         stream_index = media.video_streams[0].index if media.video_streams else None
         if self.separate_process:
-            # 試すのは親の側で 1 度だけ（:func:`usable` が覚える） 子は渡された順に試す
+            # 試すのは親の側で 1 度だけ（:func:`usable_encoders` が覚える） 子は渡された順に試す
             codecs = tuple(proxy_codecs(self._encoder_priority))
             if not codecs:
                 return None

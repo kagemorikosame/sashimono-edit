@@ -28,6 +28,7 @@ from sashimono.compat.aviutl.catalog import script_catalog
 from sashimono.compat.aviutl.report import NO_RECORDS, ReportRecords, global_report
 from sashimono.core.model import Project
 from sashimono.engine.encode.exporter import ExportError, ExportSettings, export_project
+from sashimono.engine.encoders import ProbeMemory, remember, remembered
 from sashimono.engine.worker import (
     WorkerCrashedError,
     WorkerFailedError,
@@ -122,6 +123,7 @@ def export_job(
     project: Project,
     settings: ExportSettings,
     runtime: AviUtlRuntime,
+    probes: ProbeMemory | None = None,
 ) -> ExportOutcome | None:
     """子のプロセスで書き出す
 
@@ -131,8 +133,11 @@ def export_job(
     やめたときも書き出しは :class:`ExportError` を投げる（書きかけを消してから）ので、
     ここで取り消しへ直す 直さないと、取り消しが失敗として画面に出る
     ``runtime`` は省けない 省けると、渡し忘れた呼び出しで本人が切った DLL を子が読む
+    ``probes`` は親が覚えたエンコーダの確かめの答え（#464） 無ければ子が孫を起こして確かめる
     """
     runtime.apply()
+    if probes is not None:
+        remember(probes)
     # GL を作れるかを先に確かめる 書き出しの途中で作れないと分かると、どこまで書いたかの
     # 後片付けまで子の中で済ませてから親が頭からやり直すことになり、時間が倍かかる
     from sashimono.engine.gpu import GLContextError, OffscreenGLContext
@@ -211,6 +216,7 @@ def export_anywhere(
                     "project": project,
                     "settings": dataclasses.replace(settings, path=scratch),
                     "runtime": AviUtlRuntime.capture(),
+                    "probes": remembered(),
                 },
                 progress=progress,
                 should_cancel=should_cancel,

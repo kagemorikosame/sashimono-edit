@@ -22,6 +22,7 @@ from sashimono.core.model import (
     Track,
     TrackKind,
 )
+from sashimono.engine import encoders
 from sashimono.engine.encode import exporter
 from sashimono.ui import export_dialog
 from sashimono.ui.export_dialog import AUTO_CODEC, ExportDialog
@@ -35,19 +36,17 @@ def _non_empty_project() -> Project:
 
 
 @pytest.fixture
-def qsv_does_not_open(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def qsv_does_not_open(monkeypatch: pytest.MonkeyPatch, probe_here: None) -> Iterator[None]:
     """この開発機と同じく、QSV は入っているが開けない機械を真似る"""
 
     def fake(name: str) -> None:
         if name == "h264_qsv":
             raise av.error.ArgumentError(22, "Invalid argument")
 
-    # 開けるかの答えはプロセスの中で覚えている 前後で忘れないと、偽の答えが他の試験へ漏れる
-    exporter._opens.cache_clear()
-    monkeypatch.setattr(exporter, "_open_encoder", fake)
+    # 開けるかの答えを前後で忘れ、確かめはこの中で行う（probe_here） 偽の答えを他の試験へ漏らさない
+    monkeypatch.setattr(encoders, "probe_encoder", fake)
     monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("h264_qsv", "libx264"))
     yield
-    exporter._opens.cache_clear()
 
 
 def test_an_unopenable_qsv_is_hidden_so_export_does_not_fail_and_need_a_reselect(

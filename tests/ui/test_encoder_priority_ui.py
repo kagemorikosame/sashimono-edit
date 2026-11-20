@@ -21,7 +21,8 @@ from sashimono.core.commands import AddClip, AddTrack
 from sashimono.core.io.atomic import expect_now
 from sashimono.core.model import Clip, Project, Track, TrackKind
 from sashimono.effects.sources import TEXT
-from sashimono.engine.encode import RANGE_ALL, ExportSettings, exporter
+from sashimono.engine import encoders
+from sashimono.engine.encode import RANGE_ALL, ExportSettings
 from sashimono.engine.encoders import (
     ENCODER_PRIORITIES,
     PRIORITY_AMD,
@@ -53,15 +54,13 @@ def no_popups(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def every_codec_opens(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def every_codec_opens(monkeypatch: pytest.MonkeyPatch, probe_here: None) -> None:
     """NVIDIA・AMD・Intel の GPU と CPU のすべてで書ける機械を真似る
 
     この開発機には AMD も Intel の GPU も無い 並びと優先を確かめるには、全部が開ける形にする
     """
-    exporter._opens.cache_clear()
-    monkeypatch.setattr(exporter, "_open_encoder", lambda _name: None)
-    yield
-    exporter._opens.cache_clear()
+    # 確かめはこの中で行う（probe_here） 偽のエンコーダは子のプロセスに届かない
+    monkeypatch.setattr(encoders, "probe_encoder", lambda _name: None)
 
 
 def _codecs_in(dialog: ExportDialog) -> list[str]:

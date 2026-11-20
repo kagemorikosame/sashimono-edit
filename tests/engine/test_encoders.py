@@ -7,7 +7,6 @@ AMD の GPU の無い機械（この開発機と CI）では、AMF は FFmpeg �
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -38,13 +37,11 @@ ALL = ["h264_nvenc", "h264_amf", "h264_qsv", "libx264"]
 
 
 @pytest.fixture
-def forget_usable() -> Iterator[None]:
-    """書けるかの答えを、試験の前後で忘れる 偽の答えが後の試験へ漏れると本物の NVENC が外れる"""
-    encoders.usable.cache_clear()
-    exporter._opens.cache_clear()
-    yield
-    encoders.usable.cache_clear()
-    exporter._opens.cache_clear()
+def forget_usable(probe_here: None) -> None:
+    """書けるかの答えを、試験の前後で忘れる 偽の答えが後の試験へ漏れると本物の NVENC が外れる
+
+    差し替えた偽のエンコーダは子のプロセスに届かないので、確かめはこの中で行う
+    """
 
 
 def _no_amd(name: str) -> None:
@@ -213,7 +210,7 @@ class TestExportCandidates:
         self, monkeypatch: pytest.MonkeyPatch, forget_usable: None
     ) -> None:
         # 落ちないと、AMD の無い機械で書き出しの窓の既定が開けない AMF になる
-        monkeypatch.setattr(exporter, "_open_encoder", _no_amd)
+        monkeypatch.setattr(encoders, "probe_encoder", _no_amd)
         monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", ("h264_amf", "libx264"))
         assert exporter.available_video_codecs() == ["libx264"]
 
@@ -221,7 +218,7 @@ class TestExportCandidates:
         self, monkeypatch: pytest.MonkeyPatch, forget_usable: None
     ) -> None:
         # 効かないと、設定で CPU を先にと選んでも GPU で書き出される
-        monkeypatch.setattr(exporter, "_open_encoder", lambda _name: None)
+        monkeypatch.setattr(encoders, "probe_encoder", lambda _name: None)
         monkeypatch.setattr(exporter, "VIDEO_CODEC_PREFERENCE", tuple(ALL))
         assert exporter.available_video_codecs() == ALL
         assert exporter.available_video_codecs(PRIORITY_CPU)[0] == "libx264"
