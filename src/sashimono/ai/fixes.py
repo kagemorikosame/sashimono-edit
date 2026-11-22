@@ -35,6 +35,7 @@ from sashimono.engine.checks.scan import (
     FREEZE,
     LENGTH,
     LOUDNESS,
+    MISSING_GLYPH,
     SILENCE,
     SUBTITLE_TIMING,
     SUBTITLE_WORDS,
@@ -181,6 +182,16 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
     ),
     (TEXT_OVERFLOW, LOW, None): Fix(
         LEAVE, (), "動く文字（流れるテロップなど）はわざと外へ出すことが多い"
+    ),
+    (MISSING_GLYPH, MEDIUM, None): Fix(
+        AUTO,
+        ("set_param",),
+        "書体に無い字が細い代わりの書体で出る set_param で match_fallback（無い字の太さをそろえる）"
+        "を true にして preview_frame で見る 書体は本人の選んだ物なので替えない"
+        " AviUtl2 の組み方では効かないので、その字を人に伝える",
+    ),
+    (MISSING_GLYPH, LOW, None): Fix(
+        LEAVE, (), "代わりの書体で出るが太さはそろえてある 字の形まで揃えたいかは人が決める"
     ),
     (BLACK, HIGH, None): Fix(
         ASK,

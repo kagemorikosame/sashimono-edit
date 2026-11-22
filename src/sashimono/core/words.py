@@ -52,6 +52,10 @@ CUT_OUT = "out"
 #: 語の途中と読む、語の端からの距離（秒） 実物の素材で、語の境目と音の谷の差は中央値 0.06 秒・
 #: 9 割が 0.09 秒以内だった 端ちょうどを途中と読むと、語の境目で切った所まで問題になる
 WORD_MARGIN = Fraction(8, 100)
+#: 端の短い語（認識の 1 単位）を切ったときの遊びの下限（秒 #494） 語の時刻のずれの中央値
+#: 端の語が短いと :data:`WORD_MARGIN` が語の半分より長くなり、語を落としても途中と読まない
+#: これより狭めると、語の境目で切った所まで時刻のずれだけで途中と読む
+_SHORT_WORD_MARGIN = Fraction(6, 100)
 #: 語の間がこれより空いていれば、字の種類によらず区切る 息継ぎより短く、語の中の促音（「っ」の
 #: 詰まり）より長い
 PHRASE_GAP = Fraction(12, 100)
@@ -339,6 +343,15 @@ def _near(words: Iterable[Word], seconds: Fraction) -> bool:
     return any(word.start - _GAP_REACH < seconds < word.end + _GAP_REACH for word in words)
 
 
+def _past_edge(inside: Fraction, unit: Fraction | None) -> bool:
+    """文節の端から ``inside`` 秒入った所が、端の遊びより内側か ``unit`` は端の語の長さ"""
+    if inside > WORD_MARGIN:
+        return True
+    if unit is None or unit > 2 * WORD_MARGIN:
+        return False
+    return inside >= max(_SHORT_WORD_MARGIN, unit / 2)
+
+
 class WordMap:
     """1 つの音の語の読み取り 語の途中か・語で確かめられる所かを、道具と検査が同じ答えで読む
 
@@ -351,6 +364,16 @@ class WordMap:
         self._line_starts = [line.start for line in self.lines]
         self._line_reach = list(accumulate((line.end for line in self.lines), max))
         self._word_starts = [word.start for word in self.phrases]
+        timed = transcript_words(transcript)
+        #: 文節の頭と終わりに来うる語（認識の 1 単位）の長さ 同じ時刻に重なれば短い方
+        self._head_units: dict[Fraction, Fraction] = {}
+        self._tail_units: dict[Fraction, Fraction] = {}
+        for unit in timed:
+            length = unit.end - unit.start
+            if length <= 0:
+                continue
+            for units, at in ((self._head_units, unit.start), (self._tail_units, unit.end)):
+                units[at] = min(length, units.get(at, length))
         self._word_reach = list(accumulate((word.end for word in self.phrases), max))
 
     @property
@@ -362,14 +385,20 @@ class WordMap:
         bare = (Word(line.start, line.end, line.text) for line in self.lines if not line.words)
         return tuple(sorted((*self.phrases, *bare), key=lambda word: (word.start, word.end)))
 
-    def word_at(self, seconds: Fraction) -> Word | None:
+    def word_at(self, seconds: Fraction, side: str | None = None) -> Word | None:
         """``seconds`` を中に含む語 語の頭と終わりから :data:`WORD_MARGIN` より内側に入る物だけ
 
-        語の時刻は見積もりなので、端ちょうどは語の途中と読まない
+        語の時刻は見積もりなので、端ちょうどは語の途中と読まない ただし端の語が短ければ、その語の
+        真ん中から内側は途中と読む（#494） :func:`heard_words` は真ん中で切った語を鳴らない語と
+        数えるので、遊びをそろえないと「途中ではない」のに語が消える
+        狭めるのは語を落とす向きだけ ``side`` が入りなら頭、出なら終わり 省けば両方
+        逆の向きで残るのは 0.1 秒に満たない端で、数えると誤報が倍になる
         """
         for at in _reaching(self._word_starts, self._word_reach, seconds, seconds):
             word = self.phrases[at]
-            if word.start + WORD_MARGIN < seconds < word.end - WORD_MARGIN:
+            head = None if side == CUT_OUT else self._head_units.get(word.start)
+            tail = None if side == CUT_IN else self._tail_units.get(word.end)
+            if _past_edge(seconds - word.start, head) and _past_edge(word.end - seconds, tail):
                 return word
         return None
 

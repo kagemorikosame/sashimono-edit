@@ -88,6 +88,7 @@ OWN_LIBRARY = {
     # check_output・normalize_loudness・export_video が問題の値と結果と確かめの箱に載せる
     "subtitle_timing",
     "loudness_limiter",
+    "loudness_depth",
     "export_bitrate",
     # AI の字幕起こしのモデルと語の時刻（#469） transcribe が返事の method に載せる
     "ai_transcribe_model",

@@ -195,7 +195,7 @@ def _word_cuts(
             missing.add(key)
             continue
         waveform = waveform_of(media, key[1])
-        reading = read_cut(words, waveform, edge.seconds)
+        reading = read_cut(words, waveform, edge.seconds, edge.side)
         if not reading.known:
             unknown += 1
             continue
@@ -207,7 +207,9 @@ def _word_cuts(
         if level is not None and level <= QUIET_DB:
             # 語の時刻の上では途中でも、音が静かなら語は欠けない 語の時刻のずれのことが多い
             continue
-        point = _suggested(edge, cut_points(words.phrases, waveform, edge.seconds, _REACH), word)
+        point = _suggested(
+            edge, cut_points(words.phrases, waveform, edge.seconds, _REACH, words), word
+        )
         name = "入り" if edge.side == CUT_IN else "出"
         # 出は残った最後のコマで返す 切った位置のコマは次の音か、作品の終わりの外に当たる
         frame = int(edge.frame) if edge.side == CUT_IN else max(0, math.ceil(edge.frame) - 1)

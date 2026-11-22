@@ -484,13 +484,16 @@ def _separated(media: MediaItem) -> _Stage:
 
 def _mixed(media: MediaItem) -> _Stage:
     """混合の方式 レイヤーを足す項目と、不透明度・音量の線の切り替えが出る"""
-    base = Project.create(ProjectSettings(layer_mode=LayerMode.MIXED), media=(media,))
+    # 素材より大きい作品にする 画素で置いた動画が小さく入り、〔画面に合わせる〕が出る（#494）
+    settings = ProjectSettings(width=3840, height=2160, layer_mode=LayerMode.MIXED)
+    base = Project.create(settings, media=(media,))
     # 音の番号を持たせる 持たないと絵だけのクリップになり、音量の線の切り替えが出ない
     movie = Clip(
         timeline_start=0,
         duration=90,
         media_id=media.id,
         audio_stream=media.audio_streams[0].index,
+        native_size=True,
     )
     tracks = (Track(TrackKind.MIXED, "戊", (movie,)), Track(TrackKind.MIXED, "己"))
     project = base.with_timeline(replace(base.timeline, tracks=tracks))

@@ -20,12 +20,16 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 
 import numpy as np
 
+from sashimono.effects.limiter import DEFAULT_RELEASE_MS, reduction
+
 __all__ = [
     "ABSOLUTE_GATE",
+    "Dynamics",
     "LoudnessMeter",
     "block_loudness",
     "channel_weights",
@@ -114,6 +118,46 @@ def channel_weights(channels: int) -> np.ndarray:
     return np.ones(channels)
 
 
+#: 100 ms の区切りを、抑えた後の見積もりのためにいくつへ割って覚えるか（1 つ 5 ms #494）
+#: 戻る速さ（150 ms）より十分に短く、3 時間の作品でも 17 MB に収まる
+_FINE_PARTS = 20
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Dynamics:
+    """リミッターで抑えた後の音量を、混ぜ直さずに見積もる手がかり（#494）
+
+    抑えた分の音量は掛けた dB どおりに増えない 見込まずに掛けると基準へ届かないまま書き出す
+    ``eq=False`` なのは numpy の配列を持つため
+    """
+
+    #: 5 ms ごとの、K 特性と重みを掛けた二乗の和
+    energy: np.ndarray
+    #: 同じ区切りの最大のサンプル
+    peak: np.ndarray
+    #: 100 ms の区切り 1 つのサンプル数
+    step: int
+
+    def limited_loudness(self, gain_db: float, ceiling_db: float) -> float | None:
+        """``gain_db`` 上げて ``ceiling_db`` のリミッターを通した積分ラウドネス
+
+        区切りの中は一番強く絞った量で通して数える 見積もりが低めに出るので、届かない側へは外さない
+        """
+        ratio = 10.0 ** (gain_db / 20.0)
+        ceiling = 10.0 ** (ceiling_db / 20.0)
+        wanted = 1.0 - np.minimum(1.0, ceiling / np.maximum(self.peak * ratio, 1e-12))
+        kept = np.full(len(wanted), ratio)
+        if np.any(wanted > 0.0):
+            held = reduction(wanted, 0.1 / _FINE_PARTS, DEFAULT_RELEASE_MS / 1000.0)
+            kept = ratio * (1.0 - held)
+        ticks = (self.energy * kept * kept).reshape(-1, _FINE_PARTS).sum(axis=1)
+        if len(ticks) < 4:
+            return None
+        return gated_loudness(
+            (ticks[:-3] + ticks[1:-2] + ticks[2:-1] + ticks[3:]) / (4 * self.step)
+        )
+
+
 class LoudnessMeter:
     """音を少しずつ渡して、積分ラウドネスと最大のサンプルを測る
 
@@ -136,6 +180,11 @@ class LoudnessMeter:
         #: 100 ms ごとの、重みを掛けた二乗の和
         self._energies: list[float] = []
         self._peak = 0.0
+        #: 100 ms を細かく割る境目と、割った区切りの大きさと山（:meth:`dynamics`）
+        self._cuts = np.arange(_FINE_PARTS) * self._step // _FINE_PARTS
+        self._partial_peaks = np.zeros(0)
+        self._fine_energy: list[np.ndarray] = []
+        self._fine_peak: list[np.ndarray] = []
         self._responses: dict[int, np.ndarray] = {}
         #: まだ畳み込んでいない音（:data:`CHUNK_SECONDS` まで溜める）
         self._pending: list[np.ndarray] = []
@@ -171,11 +220,17 @@ class LoudnessMeter:
         weighted = self._filter(block)
         energy = np.sum(weighted * weighted * self._weights, axis=1)
         joined = np.concatenate([self._partial, energy])
+        peaks = np.concatenate([self._partial_peaks, np.abs(block).max(axis=1)])
         whole = len(joined) // self._step * self._step
         if whole:
-            sums = joined[:whole].reshape(-1, self._step).sum(axis=1)
-            self._energies.extend(float(value) for value in sums)
+            ticks = joined[:whole].reshape(-1, self._step)
+            self._energies.extend(float(value) for value in ticks.sum(axis=1))
+            fine = np.add.reduceat(ticks, self._cuts, axis=1)
+            self._fine_energy.append(fine.ravel().astype(np.float32))
+            loudest = np.maximum.reduceat(peaks[:whole].reshape(-1, self._step), self._cuts, axis=1)
+            self._fine_peak.append(loudest.ravel().astype(np.float32))
         self._partial = joined[whole:]
+        self._partial_peaks = peaks[whole:]
 
     def _filter(self, block: np.ndarray) -> np.ndarray:
         """K 特性を掛ける 前の塊の終わりを頭に付けて畳み込み、頭の分を捨てる"""
@@ -206,6 +261,20 @@ class LoudnessMeter:
         """
         self._flush()
         return np.asarray(self._energies, dtype=np.float64)
+
+    def dynamics(self) -> Dynamics | None:
+        """抑えた後の音量の見積もりに使う手がかり 測れた区切りが無ければ ``None``
+
+        つなぐ手間が作品の長さに比例するので、測り終えてから 1 度だけ呼ぶ
+        """
+        self._flush()
+        if not self._fine_energy:
+            return None
+        if len(self._fine_energy) > 1:
+            # 検査の結果は読まれるたびに組み直される 毎回つなぐと長い作品で画面が引っ掛かる
+            self._fine_energy = [np.concatenate(self._fine_energy)]
+            self._fine_peak = [np.concatenate(self._fine_peak)]
+        return Dynamics(self._fine_energy[0], self._fine_peak[0], self._step)
 
     def integrated(self) -> float | None:
         """積分ラウドネス（LUFS） 測れる区切りが無ければ（400 ms に満たない・無音）``None``"""

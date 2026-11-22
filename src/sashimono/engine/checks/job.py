@@ -33,11 +33,13 @@ from PySide6.QtCore import QCoreApplication, QObject, QThread, Signal
 
 from sashimono.core.model import Project
 from sashimono.engine.audio import AudioMixer
+from sashimono.engine.checks.glyphs import glyph_runs
 from sashimono.engine.checks.overflow import OverflowScan
 from sashimono.engine.checks.report import CheckReport, ClipIndex, assemble
 from sashimono.engine.checks.scan import (
     CLIPPING,
     LOUDNESS,
+    MISSING_GLYPH,
     PICTURE_KINDS,
     SOUND_KINDS,
     TEXT_OVERFLOW,
@@ -110,6 +112,7 @@ class _Progress:
         self.video: VideoScan | None = None
         self.audio: AudioScan | None = None
         self.overflow: OverflowScan | None = None
+        self.glyphs: list[Run] = []
         self.index: ClipIndex | None = None
         self.start = request.start
         self.end = request.end
@@ -155,6 +158,7 @@ class _Progress:
             runs += self.audio.runs(final=final)
         if self.overflow is not None:
             runs += self.overflow.runs()
+        runs += self.glyphs
         loudness = self.audio.loudness() if self.audio is not None else None
         skipped = set(self.skipped)
         notes = list(self.notes)
@@ -182,6 +186,7 @@ class _Progress:
             notes=tuple(notes),
             skipped=frozenset(skipped),
             sound=self.audio.profile() if self.audio is not None else None,
+            dynamics=self.audio.dynamics() if final and self.audio is not None else None,
         )
 
     def fraction(self) -> float:
@@ -456,6 +461,10 @@ def _check_timeline(
                 else None
             )
             progress.overflow = overflow
+        if MISSING_GLYPH in limits.kinds:
+            absent = glyph_runs(project, request.start, request.end)
+            with progress.lock:
+                progress.glyphs = absent
         canvas = renderer.size if renderer is not None else (0, 0)
         frames: range | list[int] = range(request.start, request.end)
         if progress.video is None and progress.audio is None:
@@ -508,6 +517,11 @@ def _check_file(path: Path, progress: _Progress) -> None:
             progress.skip(
                 frozenset({TEXT_OVERFLOW}),
                 "書き出した動画からは字幕のはみ出しを調べられません（字の形が残らない）"
+                " タイムラインを調べると分かります",
+            )
+            progress.skip(
+                frozenset({MISSING_GLYPH}),
+                "書き出した動画からは書体に無い字を調べられません（字と書体が残らない）"
                 " タイムラインを調べると分かります",
             )
             progress.skip(

@@ -13,7 +13,7 @@ BGM を話している間だけ下げる（ダッキング）線と、音量の�
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from itertools import pairwise
@@ -25,6 +25,7 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
+    EffectId,
     Keyframe,
     Project,
     Track,
@@ -40,6 +41,7 @@ __all__ = [
     "DUCK_ATTACK_MS_RANGE",
     "DUCK_DEPTH_DB_RANGE",
     "DUCK_RELEASE_MS_RANGE",
+    "LIMITER_DEPTHS",
     "MAX_LIMITER_DB",
     "VOLUME_LIMIT",
     "DuckPlan",
@@ -263,17 +265,31 @@ def plan_ducking(
     return DuckPlan(tuple(commands), tuple(curves), tuple(untouched))
 
 
-def measure_project(project: Project, clip_ids: Iterable[ClipId]) -> Project:
+def measure_project(
+    project: Project, clip_ids: Iterable[ClipId], bypass: Collection[EffectId] = ()
+) -> Project:
     """測るクリップだけを残したプロジェクト ミュートとソロは外す
 
     ほかのクリップを残すと、BGM だけをそろえたいのに声まで含めた音量を測る ソロは聞き比べの
     ための物で、残すとソロのトラックの外にある測りたい音が鳴らない
+    ``bypass`` のエフェクトは切って測る 前にそろえたときのリミッターを外して測ると、掛け直しても
+    抑える量が重ならない（#494）
     """
     wanted = set(clip_ids)
+
+    def bare(clip: Clip) -> Clip:
+        if not any(effect.id in bypass for effect in clip.effects):
+            return clip
+        effects = tuple(
+            replace(effect, enabled=False) if effect.id in bypass else effect
+            for effect in clip.effects
+        )
+        return replace(clip, effects=effects)
+
     tracks = tuple(
         replace(
             track,
-            clips=tuple(clip for clip in track.clips if clip.id in wanted),
+            clips=tuple(bare(clip) for clip in track.clips if clip.id in wanted),
             muted=False,
             solo=False,
         )
@@ -285,9 +301,16 @@ def measure_project(project: Project, clip_ids: Iterable[ClipId]) -> Project:
 #: 音の山の上限の既定（dBFS） 配信の多くが求める -1 dBTP に合わせる 窓と AI の道具と
 #: 検査の直し方が同じ値を見る
 DEFAULT_PEAK_CEILING_DB = -1.0
-#: リミッターで抑えてよい山の量の上限（dB #414） 通しの確かめで届かなかった 3.8〜6 LU を覆う
-#: これより絞ると、話し声の子音の立ち上がりまで潰れて平たく聞こえる
-MAX_LIMITER_DB = 6.0
+#: リミッターで抑えてよい山の量の既定（dB #414 #494） 59 分の話し声の配信から作った 2 本では、
+#: -14 LUFS へ届くのに 8.1 と 9.8 dB 要った 6 dB を越えて抑えた区切りは全体の 0.3% ほどで、
+#: 基準へ届かせる量だけを抑える（上限いっぱいまで潰すわけではない）
+MAX_LIMITER_DB = 12.0
+#: 設定画面の選び 立ち上がりを残したい人は浅くする
+LIMITER_DEPTHS: tuple[tuple[int, str], ...] = (
+    (6, "浅め 6 dB（立ち上がりを残す 基準に届かないことがある）"),
+    (9, "中くらい 9 dB"),
+    (12, "深め 12 dB（話し声の配信でも基準に届く）"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +322,38 @@ class LoudnessGain:
     limited_by: tuple[str, ...] = ()
     #: 掛けた後に山が天井を越える量（dB） リミッターで抑える分 0 なら抑えなくてよい
     squeeze_db: float = 0.0
+    #: 抑えた後の音量の見積もり（LUFS #494） 抑えないか、見積もる手がかりが無ければ ``None``
+    limited_lufs: float | None = None
+
+
+def _compensated(
+    predict: Callable[[float], float | None], target: float, low: float, high: float
+) -> float:
+    """抑えた後の音量が ``target`` になる量 ``high`` でも届かなければ ``high``
+
+    抑えた後の音量は掛ける量に対して増える一方なので、二分で詰める
+    """
+    if high <= low:
+        return high
+    top = predict(high)
+    if top is None:
+        return low
+    if top <= target:
+        return high
+    for _ in range(_COMPENSATION_STEPS):
+        middle = (low + high) / 2.0
+        value = predict(middle)
+        if value is not None and value < target:
+            low = middle
+        else:
+            high = middle
+    return high
+
+
+#: これより足りなければ基準に届いていないと読む（LU） 見積もりの細かさと同じくらい
+_SHORT_LU = 0.05
+#: 二分の回数 12 dB の幅が 0.003 dB まで詰まる
+_COMPENSATION_STEPS = 12
 
 
 def loudness_gain(
@@ -310,6 +365,7 @@ def loudness_gain(
     ceiling: float,
     squeeze: float = 0.0,
     raise_ceiling: float | None = None,
+    predict: Callable[[float], float | None] | None = None,
 ) -> LoudnessGain:
     """測った積分ラウドネス ``measured`` を ``target`` へ寄せる量（dB）
 
@@ -320,13 +376,25 @@ def loudness_gain(
     ``raise_ceiling`` は前に積んだリミッターが山を止める所 そこより上へは上げないが、下げる
     理由にはしない 測った山は混ぜた音の物で、どのクリップの山かは分からない 静かなクリップの
     低い上限で全体を下げると、そろえるはずの音量が大きく下がる（PR #451 の CodeRabbit の指摘）
+    ``predict`` は掛ける量から、抑えた後の音量を見積もる手（#494） 渡すと抑えて下がる分を
+    見込んで掛ける 渡さなければ、抑えた分だけ基準より小さくなる
     """
     gain = target - measured
     limited: list[str] = []
     room = max(0.0, squeeze)
+    # 抑える所だけ見込む 天井に当たらなければ掛けた量どおりに動く
+    estimate = predict if room > 0 and peak_db is not None else None
+    if estimate is not None and peak_db is not None and peak_db + gain > ceiling:
+        most = ceiling + room - peak_db
+        if gain <= most:
+            gain = _compensated(estimate, target, gain, most)
+            after = estimate(gain)
+            if after is not None and after < target - _SHORT_LU:
+                limited.append("peak")
     if peak_db is not None and peak_db + gain > ceiling + room:
         gain = ceiling + room - peak_db
-        limited.append("peak")
+        if "peak" not in limited:
+            limited.append("peak")
     if (
         raise_ceiling is not None
         and peak_db is not None
@@ -341,7 +409,8 @@ def loudness_gain(
         gain = ratio_to_db(VOLUME_LIMIT / top)
         limited.append("volume_limit")
     over = 0.0 if peak_db is None else max(0.0, peak_db + gain - ceiling)
-    return LoudnessGain(gain, tuple(limited), over)
+    after = estimate(gain) if estimate is not None and over > 0 else None
+    return LoudnessGain(gain, tuple(limited), over, after)
 
 
 def gain_commands(clips: Sequence[Clip], gain_db: float) -> list[Command]:

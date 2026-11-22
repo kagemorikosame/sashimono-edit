@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from sashimono.ai.auto_fix import limited_ceiling, raise_cap
+from sashimono.ai.auto_fix import clips_overlap, limited_ceiling, raise_cap
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
@@ -24,7 +24,7 @@ from sashimono.core.commands.fixed import (
     loose_slot,
     with_fixed_items,
 )
-from sashimono.core.mixing import MAX_LIMITER_DB
+from sashimono.core.mixing import MAX_LIMITER_DB, loudness_gain
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -43,6 +43,7 @@ from sashimono.effects.audio import LIMITER_KIND, AudioContext
 from sashimono.effects.limiter import limit, limiter_history
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.audio.mixer import HISTORY_WINDOW
+from sashimono.engine.checks.loudness import LoudnessMeter
 from sashimono.engine.checks.report import HIGH, MEDIUM
 from sashimono.engine.checks.scan import LOUDNESS
 from sashimono.engine.decode.probe import probe_media
@@ -227,7 +228,7 @@ class TestNormalize:
     def test_the_limiting_is_capped(self, work: _Work) -> None:
         """壊れると、山を何 dB でも潰して、話し声の立ち上がりまで平たくなる"""
         _run(work)
-        _measured(work.host, -24.0, -1.0)
+        _measured(work.host, -30.0, -1.0)
         result = _run(work)
         assert result["gain_db"] == pytest.approx(MAX_LIMITER_DB)
         assert result["reached"] is False
@@ -235,12 +236,13 @@ class TestNormalize:
         assert "リミッターで" in result["note"]
 
     def test_a_second_call_does_not_stack(self, work: _Work) -> None:
-        """抑えた後の音をまた抑えると、上限の 6 dB を越えて重なる"""
+        """抑えた後の音をまた抑えると、上限を越えて重なる"""
         _run(work)
-        _measured(work.host, -24.0, -1.0)
+        _measured(work.host, -30.0, -1.0)
         _run(work)
         _run(work)
-        _measured(work.host, -18.5, -1.0)
+        # 測るのはリミッターを外した音 12 dB 上げたので山は +11 dBFS
+        _measured(work.host, -18.0, 11.0)
         result = _run(work)
         assert result["gain_db"] == 0.0
         assert result["reached"] is False
@@ -249,7 +251,7 @@ class TestNormalize:
 
     def test_a_new_clip_does_not_reopen_the_limiting(self, work: _Work) -> None:
         """抑えた作品へクリップを足して呼び直しても、前のクリップを重ねて潰さない（Codex の指摘）"""
-        effect = registry.require(LIMITER_KIND).create()
+        effect = registry.require(LIMITER_KIND).create(release=300.0)  # 人の整えたリミッター
         work.host.apply_commands([AddEffect(work.voice.id, effect)], "前のリミッター")
         _run(work)
         _measured(work.host, -18.0, -1.0)
@@ -314,7 +316,7 @@ class TestNormalize:
 
         壊れると、基準より大きいまま「届いた」と答えて書き出す
         """
-        effect = registry.require(LIMITER_KIND).create()
+        effect = registry.require(LIMITER_KIND).create(release=300.0)  # 人の整えたリミッター
         work.host.apply_commands([AddEffect(work.voice.id, effect)], "前のリミッター")
         _run(work)
         _measured(work.host, -10.0, -1.0)
@@ -447,3 +449,138 @@ class TestCheckOutput:
         result: Any = check(work.host, {"wait_seconds": 0})
         rows = [row for row in result["problems"] if row["kind"] == LOUDNESS]
         assert rows[0]["fix"]["action"] == AUTO
+
+
+def _peaky(seconds: float = 12.0) -> np.ndarray:
+    """平均より 20 dB ほど高い山が時々立つ、話し声に似た音"""
+    times = np.arange(int(RATE * seconds)) / RATE
+    body = 0.09 * np.sin(2 * np.pi * 220 * times) * (0.6 + 0.4 * np.sin(2 * np.pi * 3 * times))
+    burst = 0.85 * np.sin(2 * np.pi * 700 * times) * np.exp(-(times % 0.9) / 0.012)
+    mono = (body + burst).astype(np.float32)
+    return np.stack([mono, mono], axis=1)
+
+
+def _meter(samples: np.ndarray) -> LoudnessMeter:
+    meter = LoudnessMeter(RATE, 2)
+    # 検査は塊で渡す 区切りの端数の持ち越しも一緒に通す
+    for start in range(0, len(samples), 7001):
+        meter.add(samples[start : start + 7001])
+    return meter
+
+
+def _limited(samples: np.ndarray, gain: float) -> float:
+    context = AudioContext(offset=0, sample_rate=RATE, duration=len(samples))
+    values = {"ceiling": -1.0, "release": 150.0}
+    value = _meter(limit(samples * 10 ** (gain / 20), values, context)).integrated()
+    assert value is not None
+    return value
+
+
+class TestTheEstimate:
+    """抑えた分の音量の低下を見込む（#494）"""
+
+    @pytest.mark.parametrize("gain", [0.0, 4.0, 8.0, 12.0])
+    def test_the_estimate_matches_the_real_limiter(self, gain: float) -> None:
+        """ずれると、届いたと答えた作品が小さいか大きいまま書き出される"""
+        samples = _peaky()
+        dynamics = _meter(samples).dynamics()
+        assert dynamics is not None
+        estimated = dynamics.limited_loudness(gain, -1.0)
+        assert estimated is not None
+        assert estimated == pytest.approx(_limited(samples, gain), abs=0.3)
+
+    @pytest.mark.parametrize(("depth", "reaches"), [(12.0, True), (4.0, False)])
+    def test_the_gain_makes_up_for_the_squashed_peaks(self, depth: float, reaches: bool) -> None:
+        """見込まないと基準に届かず、上限を越えて見込むと浅くした人の立ち上がりまで潰す"""
+        samples = _peaky()
+        meter = _meter(samples)
+        measured, dynamics = meter.integrated(), meter.dynamics()
+        assert measured is not None
+        assert dynamics is not None
+        target = measured + 5.0
+        decided = loudness_gain(
+            [],
+            measured=measured,
+            peak_db=float(20 * np.log10(meter.peak)),
+            target=target,
+            ceiling=-1.0,
+            squeeze=depth,
+            predict=lambda gain: dynamics.limited_loudness(gain, -1.0),
+        )
+        assert decided.squeeze_db <= depth + 1e-6
+        if reaches:
+            # 掛ける量は足りない分より多い 抑えて下がる分を見込んでいる
+            assert decided.gain_db > 5.0
+            assert _limited(samples, decided.gain_db) == pytest.approx(target, abs=0.3)
+            assert not decided.limited_by
+        else:
+            assert decided.limited_by == ("peak",)
+
+
+class TestAnotherCall:
+    """掛け直しは抑える前の音から数える（#494）"""
+
+    def test_the_own_limiter_is_bypassed_to_measure(self, work: _Work) -> None:
+        """残して測ると、2 回目から 1 dB も上がらず基準に届かない"""
+        effect = registry.require(LIMITER_KIND).create()
+        work.host.apply_commands([AddEffect(work.voice.id, effect)], "そろえたときのリミッター")
+        _run(work)
+        project = work.host.check_requests[-1].project
+        assert project is not None
+        clips = [c for t in project.timeline.tracks for c in t.clips]
+        found = [e for c in clips for e in c.effects if e.kind == LIMITER_KIND]
+        assert found
+        assert not any(e.enabled for e in found)
+        _measured(work.host, -18.0, -1.0)
+        assert _run(work)["gain_db"] == pytest.approx(4.0)
+
+    def test_a_tuned_limiter_stays_while_measuring(self, work: _Work) -> None:
+        """人の整えたリミッターを外して測ると、その人の音と違う音から掛ける量を決める"""
+        effect = registry.require(LIMITER_KIND).create(release=300.0)
+        work.host.apply_commands([AddEffect(work.voice.id, effect)], "人のリミッター")
+        _run(work)
+        project = work.host.check_requests[-1].project
+        assert project is not None
+        clips = [c for t in project.timeline.tracks for c in t.clips]
+        assert all(e.enabled for c in clips for e in c.effects if e.kind == LIMITER_KIND)
+
+    def test_the_depth_follows_the_preference(self, work: _Work) -> None:
+        """設定を読まないと、浅くした人の音も 12 dB まで潰す"""
+        work.host.depth = 6.0
+        _run(work)
+        _measured(work.host, -30.0, -1.0)
+        assert _run(work)["gain_db"] == pytest.approx(6.0)
+
+    def test_a_settled_call_says_the_loudness_after_limiting(self, work: _Work) -> None:
+        """抑える前の値だけ返すと、基準に合った音を AI が大きすぎると読んで下げる"""
+        for clip_id in (work.voice.id, work.bgm.id):
+            effect = registry.require(LIMITER_KIND).create()
+            work.host.apply_commands([AddEffect(clip_id, effect)], "そろえたときのリミッター")
+        samples = _peaky() * 10 ** (6.0 / 20)
+        meter = _meter(samples)
+        loudness, dynamics = meter.integrated(), meter.dynamics()
+        assert loudness is not None
+        assert dynamics is not None
+        target = dynamics.limited_loudness(0.0, -1.0)
+        assert target is not None
+        _run(work, target_lufs=target)
+        _measured(work.host, loudness, float(20 * np.log10(meter.peak)))
+        state = work.host.check
+        assert state.report is not None
+        work.host.check = replace(state, report=replace(state.report, dynamics=dynamics))
+        result = _run(work, target_lufs=target)
+        assert result["gain_db"] == 0.0
+        if clips_overlap([work.clip(work.voice.id), work.clip(work.bgm.id)]):
+            # 声と BGM が重なる 和は見積もりほど抑えられないので言い切らない
+            assert result["reached"] is None
+            assert "expected_lufs" not in result
+        alone = [str(work.voice.id)]
+        _run(work, clip_ids=alone, target_lufs=target)
+        _measured(work.host, loudness, float(20 * np.log10(meter.peak)))
+        state = work.host.check
+        assert state.report is not None
+        work.host.check = replace(state, report=replace(state.report, dynamics=dynamics))
+        result = _run(work, clip_ids=alone, target_lufs=target)
+        assert result["gain_db"] == 0.0
+        assert result["reached"] is True
+        assert result["expected_lufs"] == pytest.approx(target, abs=0.15)

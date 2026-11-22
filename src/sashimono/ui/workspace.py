@@ -72,6 +72,8 @@ from sashimono.core.mixing import (
     DUCK_ATTACK_MS_RANGE,
     DUCK_DEPTH_DB_RANGE,
     DUCK_RELEASE_MS_RANGE,
+    LIMITER_DEPTHS,
+    MAX_LIMITER_DB,
     DuckShape,
 )
 from sashimono.core.model import LayerMode, StyleGuide
@@ -798,6 +800,10 @@ class Preferences:
     #: 山の音の立ち上がりをそのまま残したい人（音楽・効果音の作品）は切る 切ると前の動き
     #: （山の手前で止めて、届かないことを伝える）
     loudness_limiter: bool = True
+    #: そのとき抑えてよい山の量（dB #494 :data:`~sashimono.core.mixing.LIMITER_DEPTHS`）
+    #: 既定は 12 話し声の配信は 8〜10 dB 抑えないと -14 LUFS に届かない 抑えるのは届くのに
+    #: 要る量だけ 立ち上がりを残したい人（音楽・効果音の作品）は浅くする
+    loudness_depth: int = int(MAX_LIMITER_DB)
     #: AI アシスタントが字幕を起こすとき、モデルを指示されなければ使うモデル（#469） 選べるのは
     #: 起こしの窓と同じ :data:`~sashimono.asr.backend.MODELS` 既定は一番正確な large-v3
     #: 速さと精度の釣り合いは機械と素材で答えが違う GPU の無い PC で下書きだけ欲しい人は
@@ -1177,6 +1183,14 @@ def apply_switch_interval(preferences: Preferences) -> None:
     )
 
 
+def _limiter_depth(value: object, fallback: int) -> int:
+    """抑えてよい山の量 選びに無い値は既定へ戻す（手で書いた 100 で音を潰し切らない）"""
+    for depth, _name in LIMITER_DEPTHS:
+        if type(value) is int and value == depth:
+            return depth
+    return fallback
+
+
 class PreferenceStore:
     """:class:`Preferences` の読み書き
 
@@ -1359,6 +1373,7 @@ class PreferenceStore:
                 data.get("check_loudness_target"), plain.check_loudness_target
             ),
             loudness_limiter=_flag(data.get("loudness_limiter"), plain.loudness_limiter),
+            loudness_depth=_limiter_depth(data.get("loudness_depth"), plain.loudness_depth),
             ai_transcribe_model=_choice(
                 data.get("ai_transcribe_model"),
                 tuple(info.name for info in ASR_MODELS),

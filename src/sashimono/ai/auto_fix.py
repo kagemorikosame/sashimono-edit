@@ -11,7 +11,7 @@ AI の ``auto_color`` ``reduce_noise`` と、人の〔色を自動で整える�
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import Any, Protocol
@@ -32,6 +32,7 @@ from sashimono.core.model import (
     Clip,
     ClipId,
     Effect,
+    EffectId,
     MediaId,
     MediaItem,
     Project,
@@ -41,7 +42,7 @@ from sashimono.core.model import (
 )
 from sashimono.effects import registry
 from sashimono.effects.audio import DENOISE_KIND, LIMITER_KIND
-from sashimono.effects.limiter import CEILING_DB_RANGE, DEFAULT_CEILING_DB
+from sashimono.effects.limiter import CEILING_DB_RANGE, DEFAULT_CEILING_DB, DEFAULT_RELEASE_MS
 from sashimono.engine.audio.noise import QUIET_NOISE_DB, NoiseEstimate, estimate_noise
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.auto_color import (
@@ -53,6 +54,7 @@ from sashimono.engine.auto_color import (
     thinned,
 )
 from sashimono.engine.cache.thumbnails import Filmstrip
+from sashimono.engine.checks.loudness import Dynamics
 
 __all__ = [
     "AUTO_GRADE_PARAMS",
@@ -182,6 +184,49 @@ def limiter_ceiling(track: Track, ceiling: float) -> float:
     """
     low, high = CEILING_DB_RANGE
     return float(np.clip(ceiling - track_gain_db(track), low, high))
+
+
+#: 前にそろえたときのリミッターと読む、上限と戻る速さの差
+_SAME_LIMITER = 0.05
+
+
+def redoable_limiters(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> frozenset[EffectId]:
+    """外して測り直してよいリミッター 効いている物が全部そろえた形のときだけ返す（#494）
+
+    そろえた形は、末尾に 1 つ・上限が :func:`limiter_ceiling`・戻る速さが既定・どれも動かない物
+    人が整えたリミッターを外して測ると、その人の作った音と違う音から掛ける量を決める 1 つでも
+    違えば空（前の形のとおり、抑えた後の音を測って重ねて抑えない）
+    """
+    found: set[EffectId] = set()
+    for track, clip in targets:
+        active = [e for e in clip.effects if e.kind == LIMITER_KIND and e.enabled]
+        if not active:
+            continue
+        if len(active) > 1 or active[0] is not clip.effects[-1]:
+            return frozenset()
+        wanted = {"ceiling": limiter_ceiling(track, ceiling), "release": DEFAULT_RELEASE_MS}
+        for name, expected in wanted.items():
+            value = active[0].params.get(name, expected)
+            if isinstance(value, AnimatedValue):
+                if value.is_animated:
+                    return frozenset()
+                value = value.static
+            if not isinstance(value, int | float) or abs(value - expected) > _SAME_LIMITER:
+                return frozenset()
+        found.add(active[0].id)
+    return frozenset(found)
+
+
+def loudness_predictor(
+    dynamics: Dynamics | None, ceiling: float
+) -> Callable[[float], float | None] | None:
+    """掛ける量から抑えた後の音量を見積もる手（#494） 手がかりが無ければ ``None``
+
+    トラックの音量は測った音に入っているので、書き出しで止まる所（``ceiling``）で見積もる
+    """
+    if dynamics is None:
+        return None
+    return lambda gain: dynamics.limited_loudness(gain, ceiling)
 
 
 def limited_peak(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float:

@@ -67,9 +67,11 @@ from sashimono.ai.auto_fix import (
     has_limiter,
     limited_peak,
     limiter_commands,
+    loudness_predictor,
     plan_color_fix,
     plan_noise_fix,
     raise_cap,
+    redoable_limiters,
 )
 from sashimono.ai.host import (
     UNSAVED_REFUSAL,
@@ -119,6 +121,7 @@ from sashimono.core.commands import (
     place_media,
     switch_layer_mode,
 )
+from sashimono.core.commands.fit import placed_small, small_note
 from sashimono.core.commands.insert import media_alone, with_known_video_end
 from sashimono.core.commands.project_format import retime_frame
 from sashimono.core.commands.speed import ChangeSpeed, can_change_speed
@@ -160,7 +163,6 @@ from sashimono.core.io.library import Library
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.mixing import (
-    MAX_LIMITER_DB,
     DuckShape,
     gain_commands,
     loudness_gain,
@@ -2129,6 +2131,8 @@ class MainWindow(QMainWindow):
         for media in loaded:
             self._request_analysis(media)
             self._request_proxy(media)
+        if not lost:
+            self._tell_small(commands)
         if failures:
             self.statusBar().showMessage(failures[0], 5000)
         elif lost and commands:
@@ -2327,7 +2331,8 @@ class MainWindow(QMainWindow):
             split_audio=self._preferences.splits_media,
         )
         label = f"配置: {media[0].name}" if len(media) == 1 else f"配置: {len(media)} 件"
-        self.execute_all(commands, label)
+        if self.execute_all(commands, label):
+            self._tell_small(commands)
 
     def _scene_project(self, scene: SceneId | None) -> Project | None:
         """そのシーン（``None`` ならメイン）のタイムラインを差し込んだプロジェクト
@@ -2461,10 +2466,25 @@ class MainWindow(QMainWindow):
         # 古い作品の素材は映像の終わりを持たない 置く前に開き直して添えないと、音の方が
         # 長い素材の絵を止めず、書き出した動画の終わりが黒くなる（#402）
         (placed,) = with_known_video_end([media], _probe_or_none)
-        self.execute_all(
-            insert_media(self.view_project, placed, split_audio=self._preferences.splits_media),
-            f"配置: {media.name}",
+        commands = insert_media(
+            self.view_project, placed, split_audio=self._preferences.splits_media
         )
+        if self.execute_all(commands, f"配置: {media.name}"):
+            self._tell_small(commands)
+
+    def _tell_small(self, commands: Sequence[Command]) -> None:
+        """置いた動画が小さく入ったら知らせる（#494） 窓は出さない 小さく置く人の手を止めない"""
+        for command in commands:
+            if not isinstance(command, AddClip):
+                continue
+            share = placed_small(self.view_project, command.clip)
+            if share is not None:
+                self.statusBar().showMessage(
+                    f"{small_note(share)} 画面いっぱいにするには、クリップを選んで"
+                    "設定パネルの〔画面に合わせる〕",
+                    10000,
+                )
+                return
 
     def _match_project_to(self, media: list[MediaItem]) -> None:
         """空のプロジェクトへ最初の動画を置く前に、プロジェクトを動画の形へ合わせる
@@ -4554,6 +4574,10 @@ class MainWindow(QMainWindow):
         return self._preferences.subtitle_timing
 
     @property
+    def loudness_depth(self) -> float:
+        return float(self._preferences.loudness_depth)
+
+    @property
     def loudness_limiter(self) -> bool:
         return self._preferences.loudness_limiter
 
@@ -4918,6 +4942,7 @@ class MainWindow(QMainWindow):
             self,
             float(self._preferences.check_loudness_target),
             self._preferences.loudness_limiter,
+            self.loudness_depth,
         )
         if choice is None:
             return False
@@ -4927,19 +4952,20 @@ class MainWindow(QMainWindow):
         if not clips:
             self.statusBar().showMessage("選んだクリップはどれも無効です", 5000)
             return False
+        redo = redoable_limiters(enabled, choice.ceiling) if choice.limiter else frozenset()
         request = CheckRequest(
             CheckLimits(loudness_target=choice.target, kinds=frozenset({LOUDNESS})),
-            project=measure_project(project, (clip.id for clip in clips)),
+            project=measure_project(project, (clip.id for clip in clips), redo),
             start=min(clip.timeline_start for clip in clips),
             end=max(clip.timeline_end for clip in clips),
             scene=str(self._active_scene) if self._active_scene is not None else None,
         )
-        # 前に積んだリミッターで抑えた後の音を測るので、もう 1 度抑えると 6 dB を越えて重なる
-        squeeze = (
-            MAX_LIMITER_DB if choice.limiter and not any(has_limiter(c) for c in clips) else 0.0
-        )
+        # 人の整えたリミッターは抑えた後の音を測るので、もう 1 度抑えると上限を越えて重なる
+        # そろえたときのリミッター（redo）は外して測るので重ならない（#494）
+        stacks = not redo and any(has_limiter(c) for c in clips)
+        squeeze = self.loudness_depth if choice.limiter and not stacks else 0.0
         self._pending_loudness = _PendingLoudness(
-            request, project, tuple(enabled), choice.ceiling, squeeze
+            request, project, tuple(enabled), choice.ceiling, squeeze, redo
         )
         self.request_check(request)
         # 同じ頼みを前に測り終えていれば、知らせを待たずにそのまま当てる
@@ -4984,14 +5010,17 @@ class MainWindow(QMainWindow):
             target=pending.request.limits.loudness_target,
             ceiling=pending.ceiling,
             squeeze=pending.squeeze,
-            raise_ceiling=raise_cap(pending.targets, pending.ceiling),
+            raise_ceiling=None if pending.redo else raise_cap(pending.targets, pending.ceiling),
+            predict=loudness_predictor(report.dynamics, pending.ceiling),
         )
         moved = abs(decided.gain_db) >= 0.05
         # 音量を変えなくても、山が天井を越えていればリミッターは積む
         squeezed = decided.squeeze_db >= 0.05
         target = pending.request.limits.loudness_target
-        if not moved and not squeezed:
-            short = target - report.loudness
+        settled = squeezed and bool(pending.redo) and all(has_limiter(clip) for clip in clips)
+        if not moved and (not squeezed or settled):
+            after = decided.limited_lufs
+            short = target - (report.loudness if after is None else after)
             if abs(short) < 0.05 or not decided.limited_by:
                 self.statusBar().showMessage("すでに基準の音量です", 5000)
             else:
@@ -5014,8 +5043,10 @@ class MainWindow(QMainWindow):
             return
         stopped = " 音の山か音量の上限で、基準の手前で止めた" if decided.limited_by else ""
         if squeezed:
-            stopped += (
-                f" 山はリミッターで {decided.squeeze_db:.1f} dB 抑えた（その分、音量は少し下がる）"
+            stopped += f" 山はリミッターで {decided.squeeze_db:.1f} dB 抑えた" + (
+                "（その分、音量は少し下がる）"
+                if decided.limited_lufs is None
+                else f"（抑えた後は約 {decided.limited_lufs:.1f} LUFS）"
             )
             held = limited_peak(pending.targets, pending.ceiling)
             if held > pending.ceiling + 0.05:
@@ -5026,7 +5057,7 @@ class MainWindow(QMainWindow):
                     " 重なって鳴る所は音が割れることがある AI アシスタントの check_output で"
                     "音割れを確かめてください"
                 )
-        elif moved and any(has_limiter(clip) for clip in clips):
+        elif moved and not pending.redo and any(has_limiter(clip) for clip in clips):
             stopped += " 前に積んだリミッターを通る音なので、音量は変えた量どおりには動かない"
         changed = f"音量を {decided.gain_db:+.1f} dB 変えた" if moved else "音量は変えていない"
         self.statusBar().showMessage(
@@ -5550,3 +5581,5 @@ class _PendingLoudness:
     ceiling: float
     #: リミッターで抑えてよい山の量（dB #414） 0 なら抑えない
     squeeze: float = 0.0
+    #: 外して測ったリミッター（#494） 測った値は抑える前の音
+    redo: frozenset[EffectId] = frozenset()

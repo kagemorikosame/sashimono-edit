@@ -144,6 +144,8 @@ class FakeHost:
         self.loudness = -14.0
         #: 音量をそろえるときに山をリミッターで抑えるか（#414 本人の設定の既定は入り）
         self.limiter = True
+        #: そのとき抑えてよい山の量（#494 本人の設定の既定）
+        self.depth = 12.0
         #: 字幕の時刻の合わせ方（#426 本人の設定の既定）
         self.timing = SubtitleTiming()
         #: 書き出しのビットレートの決め方（#414） 試験の素材の大きさに左右されないよう決め打ち
@@ -480,6 +482,10 @@ class FakeHost:
     @property
     def subtitle_timing(self) -> SubtitleTiming:
         return self.timing
+
+    @property
+    def loudness_depth(self) -> float:
+        return self.depth
 
     @property
     def loudness_limiter(self) -> bool:

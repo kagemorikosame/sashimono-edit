@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from fractions import Fraction
 
-from sashimono.core.model import Word
-from sashimono.core.words import phrases
+from sashimono.core.model import Transcript, Word
+from sashimono.core.words import CUT_IN, CUT_OUT, WordMap, phrases
 from sashimono.engine.audio.word_cuts import (
     JOINED,
     PAUSE,
@@ -15,7 +15,7 @@ from sashimono.engine.audio.word_cuts import (
     cut_points,
     level_at,
 )
-from tests.words_helpers import sample_transcript, wave
+from tests.words_helpers import sample_transcript, segment, spoken, wave
 
 _WORDS = phrases(sample_transcript())
 
@@ -116,3 +116,45 @@ class TestLevelAt:
     def test_past_the_end(self) -> None:
         # 壊れると、素材の終わりより後を見た所で検査が落ちる
         assert level_at(wave(seconds=2.0), Fraction(9)) is None
+
+
+class TestShortLastWord:
+    """文節の端の短い語（#494）"""
+
+    @staticmethod
+    def _map() -> WordMap:
+        # 「動画から」の「から」は 0.16 秒 その後に次の行が続く
+        head = (
+            Word(Fraction(200, 100), Fraction(210, 100), "動"),
+            Word(Fraction(210, 100), Fraction(222, 100), "画"),
+            Word(Fraction(222, 100), Fraction(238, 100), "から"),
+        )
+        after = spoken(Fraction(238, 100), "始めます")
+        return WordMap(Transcript((segment(head), segment(after)), language="ja"))
+
+    def test_the_middle_of_a_short_last_word_is_inside(self) -> None:
+        """壊れると、短い語を落とした切り抜きを検査が通し、言葉が切れたまま書き出す"""
+        word = self._map().word_at(Fraction(230, 100), CUT_OUT)
+        assert word is not None
+        assert word.text == "動画から"
+
+    def test_only_the_side_that_loses_the_word(self) -> None:
+        """逆の向き（入り）で残るのは端の 0.08 秒 数えると誤報が倍になる"""
+        assert self._map().word_at(Fraction(230, 100), CUT_IN) is None
+
+    def test_the_word_boundary_is_still_clean(self) -> None:
+        """狭めすぎると、語の境目で切った所まで語切れと読み、検査が使えない"""
+        words = self._map()
+        for seconds in (Fraction(238, 100), Fraction(233, 100)):
+            assert words.word_at(seconds, CUT_OUT) is None
+
+    def test_the_offered_cut_is_not_inside(self) -> None:
+        """声の続く所で語の中を勧めると、その通りに切った AI が語を落とす"""
+        words = self._map()
+        sound = wave(((0.0, 2.0), (3.2, 12.0)))
+        points = cut_points(words.units, sound, Fraction(238, 100), Fraction(1, 2), words)
+        assert points
+        for point in points:
+            if point.kind == JOINED:
+                assert words.word_at(point.out_seconds, CUT_OUT) is None
+                assert words.word_at(point.in_seconds, CUT_IN) is None

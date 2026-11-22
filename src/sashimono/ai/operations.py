@@ -37,10 +37,12 @@ from sashimono.ai.auto_fix import (
     limited_ceiling,
     limited_peak,
     limiter_commands,
+    loudness_predictor,
     picture_clip,
     plan_color_fix,
     plan_noise_fix,
     raise_cap,
+    redoable_limiters,
 )
 from sashimono.ai.direction_plan import (
     ProposalView,
@@ -245,6 +247,7 @@ from sashimono.core.commands.edit import (
     split_refusal,
     split_targets,
 )
+from sashimono.core.commands.fit import placed_small
 from sashimono.core.commands.fixed import FADE_EFFECT_KIND, VOLUME_EFFECT_KIND, with_fixed_items
 from sashimono.core.commands.history import REPLACED_REFUSAL
 from sashimono.core.commands.insert import (
@@ -293,7 +296,6 @@ from sashimono.core.mixing import (
     DUCK_ATTACK_MS_RANGE,
     DUCK_DEPTH_DB_RANGE,
     DUCK_RELEASE_MS_RANGE,
-    MAX_LIMITER_DB,
     VOLUME_LIMIT,
     DuckShape,
     audible_clips,
@@ -5211,7 +5213,28 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
         added.append(f"{media.name} ({media.id})")
 
     host.apply_commands(commands, f"素材を読み込み: {len(paths)} 件")
-    return {"imported": added}
+    return {"imported": added} | _small_placed(project, commands)
+
+
+def _small_placed(project: Project, commands: Sequence[Command]) -> dict[str, Any]:
+    """置いた動画が小さく入ったら、その知らせと合わせ方（#494） AI は絵を見るまで気付かない"""
+    added = [c.clip for c in commands if isinstance(c, AddClip)]
+    small = [(clip, placed_small(project, clip)) for clip in added]
+    rows = [
+        {"clip_id": str(clip.id), "screen_percent": round(share * 100)}
+        for clip, share in small
+        if share is not None
+    ]
+    if not rows:
+        return {}
+    return {
+        "small": rows,
+        "small_note": (
+            "動画が画面より小さく中央に入っています（画素で置く） 画面いっぱいにするなら"
+            " set_clip_property で native_size を false にします（拡大率は 100 のまま）"
+            " ワイプなど小さく置く頼みならそのままにします"
+        ),
+    }
 
 
 def _relink_media(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -5377,7 +5400,7 @@ def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not commands:
         raise ToolError(f"{media.name} は長さが無いので置けません")
     host.apply_commands(commands, f"配置: {media.name}")
-    return {"placed": media.name}
+    return {"placed": media.name} | _small_placed(_project(host), commands)
 
 
 def _place_spans(
@@ -7471,10 +7494,14 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     target = _limit_number(arguments, "target_lufs", float(host.loudness_target), -40.0, -5.0)
     ceiling = _limit_number(arguments, "peak_ceiling_db", DEFAULT_PEAK_CEILING_DB, -20.0, 0.0)
     # 山を抑えるかは本人の設定（#414） 測る前に読む 測り終えてから断ると測り直しになる
-    squeeze = MAX_LIMITER_DB if _flag_argument(arguments, "limiter", host.loudness_limiter) else 0.0
-    if any(has_limiter(clip) for _, clip in targets):
-        # 前に積んだリミッターで抑えた後の音を測るので、もう 1 度抑えると上限の 6 dB を越えて重なる
-        # 1 本でも積んであれば抑えない 後から足したクリップに引かれて抑えた所を上げ直すと、
+    squeeze = (
+        host.loudness_depth if _flag_argument(arguments, "limiter", host.loudness_limiter) else 0.0
+    )
+    # 前にそろえたときのリミッターは外して測る 抑える前の音から数え直すので、重ならない（#494）
+    redo = redoable_limiters(targets, ceiling) if squeeze else frozenset()
+    if not redo and any(has_limiter(clip) for _, clip in targets):
+        # 前に積んだリミッターで抑えた後の音を測るので、もう 1 度抑えると本人の上限を越えて重なる
+        # 人の整えたリミッターが 1 本でもあれば抑えない 後から足したクリップに引かれて上げ直すと、
         # 前のクリップだけが積み重ねて潰れる（PR #451 の Codex の指摘）
         squeeze = 0.0
     wait = _limit_number(arguments, "wait_seconds", DEFAULT_CHECK_WAIT, 0.0, MAX_CHECK_WAIT)
@@ -7482,7 +7509,7 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     end = max(clip.timeline_end for _, clip in targets)
     request = CheckRequest(
         CheckLimits(loudness_target=target, kinds=frozenset({LOUDNESS})),
-        project=measure_project(project, (clip.id for _, clip in targets)),
+        project=measure_project(project, (clip.id for _, clip in targets), redo),
         start=start,
         end=end,
         scene=str(host.active_scene) if host.active_scene is not None else None,
@@ -7490,7 +7517,7 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
     host.request_check(request)
 
     def finish() -> object:
-        return _apply_loudness(host, project, request, targets, ceiling, squeeze)
+        return _apply_loudness(host, project, request, targets, ceiling, squeeze, redo)
 
     if not host.check_state().running or wait <= 0:
         return finish()
@@ -7499,6 +7526,8 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 #: これより小さい差は基準に合っていると読む（LU） 掛けても聞き分けられない
 _ON_TARGET_LU = 0.05
+#: 抑えた後の見積もりで基準に合っていると読む差（LU #494） 5 ms の区切りで見積もる細かさ
+_ESTIMATE_LU = 0.1
 
 
 def _apply_loudness(
@@ -7508,11 +7537,12 @@ def _apply_loudness(
     targets: list[tuple[Track, Clip]],
     ceiling: float,
     squeeze: float = 0.0,
+    redo: frozenset[EffectId] = frozenset(),
 ) -> object:
     """測り終えた音量から、全部のクリップへ同じ dB を掛ける 測り終えていなければ何も変えない
 
     ``squeeze`` はリミッターで抑えてよい山の量（dB #414） 山が天井を越える分だけ、どのクリップにも
-    リミッターを積む
+    リミッターを積む ``redo`` は外して測ったリミッター（測った値は抑える前の音 #494）
     """
     clips = [clip for _, clip in targets]
     state = host.check_state()
@@ -7553,13 +7583,17 @@ def _apply_loudness(
         target=request.limits.loudness_target,
         ceiling=ceiling,
         squeeze=squeeze,
-        raise_ceiling=raise_cap(targets, ceiling),
+        # 外して測り、上限も置き直すリミッターは、上げる量を止めない
+        raise_ceiling=None if redo else raise_cap(targets, ceiling),
+        predict=loudness_predictor(report.dynamics, ceiling),
     )
     gain = decided.gain_db
     limited = list(decided.limited_by)
+    estimate = decided.limited_lufs
     # 掛けた後に基準へ届くか 掛ける量が小さいことと基準に合っていることは別
-    short = request.limits.loudness_target - measured - gain
-    reached = abs(short) < _ON_TARGET_LU
+    after = measured + gain if estimate is None else estimate
+    short = request.limits.loudness_target - after
+    reached = abs(short) < (_ON_TARGET_LU if estimate is None else _ESTIMATE_LU)
     result: dict[str, Any] = {
         "measured_lufs": round(measured, 1),
         "target_lufs": request.limits.loudness_target,
@@ -7573,8 +7607,19 @@ def _apply_loudness(
     # 丸めの誤差ほどの越えでは積まない 0.05 dB は聞き分けられず、効かないリミッターが残るだけ
     # 音量を変えなくても山が天井を越えていれば積む 基準に合った音の山を割れたまま残さない
     squeezed = decided.squeeze_db >= _ON_TARGET_LU
-    if not moved and not squeezed:
+    if redo:
+        result["measured_before_limiter"] = True
+    # もう同じ形で抑えてあり、掛ける量も変わらない 積み直すと何も変わらない取り消しの段が増える
+    settled = squeezed and bool(redo) and all(has_limiter(clip) for clip in clips)
+    if not moved and (not squeezed or settled):
         result["gain_db"] = 0.0
+        if settled and estimate is not None:
+            if clips_overlap(clips):
+                # リミッターはクリップごと 重なって鳴る音の和は見積もりほど抑えられない
+                result |= {"reached": None if reached else False, "loudness_rechecked": False}
+            else:
+                # 測った値は抑える前の音 これだけ返すと、基準に合った音を大きすぎると読む
+                result["expected_lufs"] = round(estimate, 1)
         if reached:
             result["note"] = "すでに基準に合っています 何も変えていません"
         else:
@@ -7607,7 +7652,7 @@ def _apply_loudness(
             else "音量の欄は変えていません 基準には届いていません"
         ]
     )
-    if moved and any(has_limiter(clip) for clip in clips):
+    if moved and not redo and any(has_limiter(clip) for clip in clips):
         # 前に積んだリミッターを通る音は、掛けた dB どおりには動かない 下げると抑えていた分が
         # 戻り、上げるとクリップの山が上限に当たって潰れる 測る前の値から届いたと言い切らない
         result |= {
@@ -7633,14 +7678,19 @@ def _apply_loudness(
             # 測る前の値から言い切ると、目標より大きく下がっても届いたと答える 届かないと
             # 分かっている所は、抑えるとさらに下がるだけなので false のまま
             "reached": None if reached else False,
-            "expected_lufs": None,
+            "expected_lufs": None if overlap or estimate is None else round(estimate, 1),
             "loudness_rechecked": False,
         }
         notes.append(
             f"音の山が {ceiling:g} dBFS を {decided.squeeze_db:.1f} dB 越えるので、"
             "どの音のクリップにも"
-            "最後にリミッター（上限は同じ値）を積みました 山だけを抑えるので、音量は見込みより"
-            "下がります 基準に届いたかは check_output の loudness で測り直してください"
+            "最後にリミッター（上限は同じ値）を積みました"
+            + (
+                " 山だけを抑えるので、音量は見込みより下がります"
+                if estimate is None
+                else " 抑えて下がる分は見込んで掛けています"
+            )
+            + " 基準に届いたかは check_output の loudness で測り直してください"
         )
         if held > ceiling + _ON_TARGET_LU:
             notes.append(
@@ -7663,8 +7713,9 @@ def _apply_loudness(
             )
         elif "peak" in limited and squeezed:
             notes.append(
-                f"リミッターで {MAX_LIMITER_DB:g} dB 抑えても山が {ceiling:g} dBFS を超えるので、"
-                "基準の手前で止めました"
+                f"リミッターで {squeeze:g} dB 抑えても山が {ceiling:g} dBFS を超えるので、"
+                "基準の手前で止めました もっと抑えてよいかは本人の設定"
+                "（音量をそろえるときに抑える山の上限）で、AI からは変えられません"
             )
         elif "peak" in limited:
             notes.append(f"音の山が {ceiling:g} dBFS を超えるので、基準の手前で止めました")
@@ -8122,7 +8173,8 @@ def _word_boundaries(host: EditorHost, arguments: dict[str, Any]) -> object:
     words = spoken.units
     level = level_at(waveform, seconds)
     rows = []
-    for point in cut_points(words, waveform, seconds, Fraction(round(window * 100), 100)):
+    reach = Fraction(round(window * 100), 100)
+    for point in cut_points(words, waveform, seconds, reach, spoken):
         row: dict[str, object] = {
             "kind": point.kind,
             "in_seconds": round(float(point.in_seconds), 3),
@@ -11726,6 +11778,7 @@ OPERATIONS: tuple[Operation, ...] = (
             "止まった絵（freeze）・無音（silence）・音割れ（clipping）・音量の基準（loudness "
             "ITU-R BS.1770 の積分ラウドネス）・字幕のはみ出し（text_overflow"
             " 画面の外へ出て切れる字）・"
+            "書体に無い字（missing_glyph 選んだ書体に無くて代わりの書体で出る字 characters）・"
             "長さ（length expected_seconds を渡したとき）・言葉の途中の切れ目（word_cut クリップの"
             "音の入りと出が語の途中で、切った所に声が続く シーンの中と速度変更も元の時刻で見る"
             " suggested_head_delta か suggested_tail_delta は trim_clip へそのまま渡せる）・"
@@ -13851,8 +13904,10 @@ OPERATIONS: tuple[Operation, ...] = (
                     "type": "boolean",
                     "description": (
                         "山が上限に当たって基準に届かないとき、音のクリップの最後にリミッターを"
-                        f"積んで山を {MAX_LIMITER_DB:g} dB まで抑え、基準まで上げるか（省くと本人の"
-                        "設定 既定は true） false なら山の手前で止める"
+                        "積んで山を本人の設定の深さ（6・9・12 dB 既定 12）まで抑え、"
+                        "基準まで上げるか（省くと本人の設定 既定は true）"
+                        " false なら山の手前で止める"
+                        " もう 1 度呼んでも抑える前の音から数え直すので重ねて潰れない"
                     ),
                 },
                 "wait_seconds": _number(

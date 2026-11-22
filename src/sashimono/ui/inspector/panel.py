@@ -70,6 +70,7 @@ from sashimono.core.commands import (
     SetParam,
     SetStrokeEnabled,
 )
+from sashimono.core.commands.fit import fit_commands, placed_small, small_note
 from sashimono.core.commands.fixed import (
     FADE_EFFECT_KIND,
     FLIP_EFFECT_KIND,
@@ -93,6 +94,7 @@ from sashimono.core.model import (
     ClipId,
     Effect,
     EffectId,
+    GeneratedSource,
     ParamValue,
     Project,
     Stroke,
@@ -124,6 +126,7 @@ from sashimono.effects.strokes import (
 )
 from sashimono.effects.unlock import unlock_commands
 from sashimono.engine.gpu import BlendMode
+from sashimono.engine.sources import missing_glyphs
 from sashimono.ui import library_dialog, library_save
 from sashimono.ui.flow_layout import ElidedLabel
 from sashimono.ui.inspector.alias import IdSwap
@@ -714,7 +717,7 @@ class InspectorPanel(QWidget):
             return None
         track, clip = located
         picture, sound = self._picture_and_sound(track, clip)
-        source: tuple[str, frozenset[str], frozenset[tuple[str, str]]] | None = None
+        source: tuple[str, frozenset[str], frozenset[tuple[str, str]], str] | None = None
         if clip.source is not None:
             definition = source_registry.get(clip.source.kind)
             unused = (
@@ -730,9 +733,15 @@ class InspectorPanel(QWidget):
                 if definition is not None
                 else frozenset()
             )
-            source = (clip.source.kind, unused, locked)
+            absent = missing_glyphs(clip.source)
+            # 書体に無い字の添え書き（#494） 字か書体を変えたら出し直す
+            missing = _absent_note(clip.source, absent) if absent else ""
+            source = (clip.source.kind, unused, locked, missing)
+        # 小さく入った知らせ（#494） 拡大率や解像度を変えたら出し直す
+        small = None if self._project is None else placed_small(self._project, clip)
         return (
             clip.id,
+            None if small is None else small_note(small),
             picture,
             sound,
             source,
@@ -1230,7 +1239,25 @@ class InspectorPanel(QWidget):
                 clip.native_size,
                 tooltip="拡大率 100% を素材の画素の大きさにします 外すと画面に収めます",
             )
+            self._small_note(section, clip)
         return section
+
+    def _small_note(self, section: _Section, clip: Clip) -> None:
+        """小さく入った動画の添え書きと、画面に合わせるボタン（#494）
+
+        置き方の欄だけでは、外すと画面いっぱいになることに気付かない
+        """
+        share = None if self._project is None else placed_small(self._project, clip)
+        if share is None:
+            return
+        button = QPushButton("画面に合わせる")
+        button.setObjectName("fit_to_screen")
+        button.setToolTip(
+            "画素で置くのをやめ、拡大率を 100% に戻して画面に収めます（取り消しで戻せます）\n"
+            "素材の細部は増えないので、拡大した分だけ甘く見えます"
+        )
+        button.clicked.connect(lambda: self._send(fit_commands(clip), "画面に合わせる"))
+        section.add_note(small_note(share), button)
 
     def _alignment_grid(self, parent: QWidget) -> QWidget:
         """配置のテンプレート 画面の 9 か所（四隅・辺の中央・中央）へ見えている範囲ごと寄せる
@@ -1465,6 +1492,9 @@ class InspectorPanel(QWidget):
                 " 部分モザイク・ぼかしと部分フィルタの範囲は、画面の中央から数えます"
                 "（右と上が正）"
             )
+        absent = missing_glyphs(clip.source)
+        if absent:
+            section.add_note(_absent_note(clip.source, absent))
         unused = definition.unused_names(clip.source.params)
         if clip.source.kind == "text":
             # 縁取りの太さと色は、縁取りの層の組（:meth:`_build_strokes`）で見せる 層を持たない字の
@@ -2933,3 +2963,16 @@ def _key_style(colour: QColor) -> str:
         f"QToolButton {{ color: {colour.name()}; padding: 0px; border: none; }}"
         f" QToolButton:disabled {{ color: {Colors.BORDER.name()}; }}"
     )
+
+
+#: 添え書きに並べる、書体に無い字の数 読めない書体を選ぶと本文の全部が並ぶ
+_ABSENT_SHOWN = 12
+
+
+def _absent_note(source: GeneratedSource, absent: str) -> str:
+    """書体に無い字の添え書き（#494）"""
+    shown = absent[:_ABSENT_SHOWN] + ("…" if len(absent) > _ABSENT_SHOWN else "")
+    note = f"この書体に無い字「{shown}」は、代わりの書体で出ます"
+    if source.params.get("layout") == "aviutl" or source.params.get("match_fallback", False):
+        return note
+    return f"{note} 細く浮くときは「無い字の太さをそろえる」を入れてください"

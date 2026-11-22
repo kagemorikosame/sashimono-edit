@@ -25,6 +25,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from sashimono.core.model import MediaItem, Project
+from sashimono.engine.checks.loudness import Dynamics
 from sashimono.engine.checks.profile import SoundProfile
 from sashimono.engine.checks.scan import (
     BLACK,
@@ -32,6 +33,7 @@ from sashimono.engine.checks.scan import (
     FREEZE,
     LENGTH,
     LOUDNESS,
+    MISSING_GLYPH,
     SILENCE,
     SUBTITLE_TIMING,
     SUBTITLE_WORDS,
@@ -154,6 +156,8 @@ class CheckReport:
     #: 混ぜた音の推移（100 ms ごと #322） 最初の区切りは ``start`` のフレームの頭 音を
     #: 調べなければ ``None``
     sound: SoundProfile | None = None
+    #: 抑えた後の音量を見積もる手がかり（#494） 測り終えたラウドネスの検査だけが持つ
+    dynamics: Dynamics | None = None
 
     @property
     def checked(self) -> frozenset[str]:
@@ -201,6 +205,7 @@ def assemble(
     notes: tuple[str, ...] = (),
     skipped: frozenset[str] = frozenset(),
     sound: SoundProfile | None = None,
+    dynamics: Dynamics | None = None,
 ) -> CheckReport:
     """区間に程度と説明を付けて並べる ``length_seconds`` は長さを比べられるときだけ渡す"""
     problems = [_problem(run, start, end, index) for run in runs if run.kind in limits.kinds]
@@ -263,6 +268,7 @@ def assemble(
         notes=notes,
         skipped=skipped,
         sound=sound,
+        dynamics=dynamics,
     )
 
 
@@ -320,6 +326,17 @@ def _problem(run: Run, start: int, end: int, index: ClipIndex | None) -> Problem
         return Problem(
             run.kind, severity, run.start, run.end, detail, values, run.clip_ids, run.ongoing
         )
+    if run.kind == MISSING_GLYPH:
+        shown = f"書体「{values.get('font', '')}」に無い字「{values.get('characters', '')}」"
+        if values.get("matched"):
+            severity = LOW
+            detail = f"{shown} 代わりの書体で出るが、太さはそろえてある"
+        else:
+            severity = MEDIUM
+            detail = f"{shown}が代わりの書体で出る 太い書体では、その字だけ細く浮く"
+        return Problem(
+            run.kind, severity, run.start, run.end, detail, values, run.clip_ids, run.ongoing
+        )
     return Problem(
         run.kind, MEDIUM, run.start, run.end, run.kind, values, run.clip_ids, run.ongoing
     )
@@ -344,6 +361,7 @@ KIND_NAMES: Mapping[str, str] = {
     CLIPPING: "音割れ",
     LOUDNESS: "音量の基準",
     TEXT_OVERFLOW: "字幕のはみ出し",
+    MISSING_GLYPH: "書体に無い字",
     LENGTH: "長さ",
     WORD_CUT: "言葉の途中の切れ目",
     SUBTITLE_WORDS: "字幕と音の食い違い",

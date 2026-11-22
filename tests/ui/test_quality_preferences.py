@@ -19,6 +19,7 @@ from tests.waiting import wait_until
 #: 変えた値（既定と違う物）
 CHANGED: dict[str, Any] = {
     "loudness_limiter": False,
+    "loudness_depth": 6,
     "ai_auto_approve": True,
     "export_bitrate_auto": False,
     "export_bitrate_mbps": 30,
@@ -29,6 +30,7 @@ def test_the_defaults_help_people_who_do_not_know() -> None:
     """既定を逆にすると、知らない人が基準に届かない音・大きすぎるファイル・黙って進む編集に困る"""
     plain = Preferences()
     assert plain.loudness_limiter is True
+    assert plain.loudness_depth == 12
     assert plain.export_bitrate_auto is True
     assert plain.export_bitrate_mbps == DEFAULT_BITRATE_MBPS
     # 取り消せる編集でも黙って進むと困る人がいるので、任せるのは本人が入れたときだけ
@@ -49,11 +51,13 @@ def test_broken_values_fall_back(tmp_path: Path) -> None:
     """壊れた値で起動を止めず、その項目だけ既定へ戻す"""
     path = tmp_path / "preferences.json"
     path.write_text(
-        json.dumps({"export_bitrate_mbps": 0, "loudness_limiter": "いいえ"}), encoding="utf-8"
+        json.dumps({"export_bitrate_mbps": 0, "loudness_limiter": "いいえ", "loudness_depth": 100}),
+        encoding="utf-8",
     )
     loaded = PreferenceStore(path).load()
     assert loaded.export_bitrate_mbps == DEFAULT_BITRATE_MBPS
     assert loaded.loudness_limiter is True
+    assert loaded.loudness_depth == 12
 
 
 @pytest.mark.parametrize("changed", [True, False])

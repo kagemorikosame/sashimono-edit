@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from sashimono.engine.checks.loudness import Dynamics
 from sashimono.engine.checks.profile import SoundProfile, SoundProfiler
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "LENGTH",
     "LOUDNESS",
     "LOUDNESS_TARGETS",
+    "MISSING_GLYPH",
     "PICTURE_KINDS",
     "SILENCE",
     "SOUND_KINDS",
@@ -46,6 +48,8 @@ CLIPPING = "clipping"
 LOUDNESS = "loudness"
 TEXT_OVERFLOW = "text_overflow"
 LENGTH = "length"
+#: 選んだ書体に無く、代わりの書体で出る字（#494）
+MISSING_GLYPH = "missing_glyph"
 #: 言葉の途中で切れた音（#420）
 WORD_CUT = "word_cut"
 #: 字幕の文言のうち、残した音に入っていない語（#420）
@@ -60,6 +64,7 @@ KINDS = (
     CLIPPING,
     LOUDNESS,
     TEXT_OVERFLOW,
+    MISSING_GLYPH,
     LENGTH,
     WORD_CUT,
     SUBTITLE_WORDS,
@@ -419,6 +424,12 @@ class AudioScan:
         if LOUDNESS not in self._limits.kinds:
             return None
         return self._profiler.meter.integrated()
+
+    def dynamics(self) -> Dynamics | None:
+        """抑えた後の音量の見積もりに使う手がかり（#494） ラウドネスを頼まれたときだけ"""
+        if LOUDNESS not in self._limits.kinds:
+            return None
+        return self._profiler.meter.dynamics()
 
     def profile(self) -> SoundProfile:
         """ここまでの音の推移の写し（#322）"""

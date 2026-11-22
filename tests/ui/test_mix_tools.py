@@ -404,10 +404,11 @@ class TestRightClick:
         # 壊れると、右クリックでそろえても基準の音量にならないか、測る間に画面が固まる
         asked: list[float] = []
 
-        def answer(_parent: object, target: float, limiter: bool) -> LoudnessChoice:
+        def answer(_parent: object, target: float, limiter: bool, depth: float) -> LoudnessChoice:
             asked.append(target)
             # リミッターの初めの値は本人の設定（#414 既定は入り）
             assert limiter is True
+            assert depth == 12.0  # 抑えてよい量も本人の設定（#494）
             return LoudnessChoice(-14.0)
 
         monkeypatch.setattr(main_window_module, "ask_loudness", answer)

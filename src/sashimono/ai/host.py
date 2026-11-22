@@ -524,6 +524,13 @@ class EditorHost(Protocol):
         ...
 
     @property
+    def loudness_depth(self) -> float:
+        """音量をそろえるときにリミッターで抑えてよい山の量（dB #494）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.loudness_depth`）
+        """
+        ...
+
+    @property
     def loudness_limiter(self) -> bool:
         """音量をそろえるとき、届かなければ山をリミッターで抑えるか（#414）
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.loudness_limiter`）

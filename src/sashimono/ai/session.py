@@ -175,6 +175,9 @@ _PROMPT = """\
   頼みに合わせて選びます
 - 「えーと」「あのー」などの言いよどみを詰めるよう頼まれたら cut_fillers を使います
   字幕起こしが書かなかった言いよどみは見つからず、その数も分からないと伝えます
+- 動画が画面より小さく中央に入っていたら（get_clip の native_size が真で、preview_frame の
+  周りが黒い）、小さく置く頼みでない限り set_clip_property で native_size を false にして
+  画面に合わせます
 - 全体の音量は normalize_loudness でそろえます 音の山が上限に当たると、本人の設定に従って
   リミッターで山を抑えて基準まで上げます（limiter_db） reached が false のままなら、
   届かなかった量をユーザーに伝えます

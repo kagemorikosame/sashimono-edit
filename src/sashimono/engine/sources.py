@@ -64,6 +64,7 @@ from sashimono.engine.audio_shapes import (
     waveform_points,
 )
 from sashimono.engine.fills import Paint, gradient_brush, paint_of
+from sashimono.engine.glyphs import absent_characters, thickened
 from sashimono.engine.motion_shapes import (
     TrailPath,
     TrailPaths,
@@ -933,6 +934,12 @@ def _text_layers(
             plain.addText(QPointF(plain_x, baseline), plain_font, line)
             drift = _bold_drift(plain, placed)
             placed.translate(drift, 0.0)
+        if bool(values.get("match_fallback", False)):
+            # 中心戻しの後に足す 前に足すと、行の端の太らせた分だけ行の全部が横へずれる
+            heavier = thickened(font, line, QPointF(x + drift, baseline))
+            if heavier is not None:
+                # 重ねた輪郭は合わせる 合わせないと縁取りが元の細い字の縁にも沿って中に線が出る
+                placed = placed.united(heavier)
         path.addPath(placed)
         if cells is not None:
             # 字の置き場は行の頭からの送り幅で測る 行を 1 度に組んだ字と同じ所に来る
@@ -1019,6 +1026,32 @@ def _text_font(values: Mapping[str, object], size: int) -> QFont:
     if bool(values.get("bold", False)):
         _embolden(font)
     return font
+
+
+def missing_glyphs(source: GeneratedSource) -> str:
+    """テキストの本文のうち、選んだ書体に無くて代わりの書体で出る字（#494）
+
+    検査と設定パネルが使う 描く所と同じ書体で調べる AviUtl2 の組み方の横書きは制御文字を
+    読んでから、区切りごとの書体で調べる 入れていない書体は Qt が選んだ書体で調べる
+    """
+    if source.kind != "text":
+        return ""
+    values = {
+        name: value.static if isinstance(value, AnimatedValue) else value
+        for name, value in source.params.items()
+    }
+    text = str(values.get("text", ""))
+    if not text or str(values.get("timer_format", "") or ""):
+        return ""
+    if values.get("layout") != "aviutl" or bool(values.get("vertical", False)):
+        return absent_characters(_text_font(values, 64), text)
+    family = aviutl_font_family(str(values.get("font", AVIUTL_DEFAULT_FONT)))
+    found = ""
+    for line in parse_tags(text, 64.0):
+        for run in line.runs:
+            name = family if run.style.font is None else aviutl_font_family(run.style.font)
+            found += absent_characters(QFont(name), run.text)
+    return "".join(dict.fromkeys(found))
 
 
 #: 太字の太さ（OpenType の wght） Qt の太字（``QFont.Weight.Bold``）と同じ値
@@ -1521,7 +1554,14 @@ def _vertical_text_path(
                     baseline = cell_top + pitch / 2.0 - ink.boundingRect().center().y()
                 # 字の書体には字間が足してある（Qt の字間は 1 字ごとの送り幅に入る）
                 offset = (metrics.horizontalAdvance(character) - letter) / 2.0
-            path.addText(QPointF(x - offset, baseline), font, character)
+            origin = QPointF(x - offset, baseline)
+            fuller = None
+            if not aviutl and bool(values.get("match_fallback", False)):
+                fuller = thickened(font, character, origin)
+            if fuller is not None:
+                path.addPath(fuller)
+            else:
+                path.addText(origin, font, character)
             if cells is not None:
                 glyph = QPainterPath()
                 glyph.addText(QPointF(x - offset, baseline), font, character)

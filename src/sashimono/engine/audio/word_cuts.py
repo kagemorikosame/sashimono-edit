@@ -10,14 +10,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from itertools import pairwise
 
 import numpy as np
 
 from sashimono.core.model import Word
-from sashimono.core.words import WordMap
+from sashimono.core.words import CUT_IN, CUT_OUT, WordMap
 from sashimono.engine.audio.waveform import Waveform
 
 __all__ = [
@@ -160,14 +160,16 @@ class CutReading:
     known: bool
 
 
-def read_cut(words: WordMap, waveform: Waveform | None, seconds: Fraction) -> CutReading:
+def read_cut(
+    words: WordMap, waveform: Waveform | None, seconds: Fraction, side: str | None = None
+) -> CutReading:
     """``seconds`` が語の途中かを読む
 
     語の時刻が届かない所は、字幕の行の中でも外でも、声が続くと分かる所と波形がまだの所だけを
     「言えない」にする 語の間の無音はふつうにあり、雑音のある素材では静かと言い切れるほど下がらない
-    語の時刻のある所の判定（語の途中か）はここでは変えない
+    語の時刻のある所の判定（語の途中か）はここでは変えない ``side`` は音の入りか出か（#494）
     """
-    word = words.word_at(seconds)
+    word = words.word_at(seconds, side)
     if word is not None or not words.unworded_at(seconds):
         return CutReading(word, True, True)
     level = level_at(waveform, seconds)
@@ -210,13 +212,36 @@ def _between(waveform: Waveform, before: Word, after: Word, reference: float) ->
     )
 
 
+def _outside_words(point: CutPoint, before: Word, after: Word, spoken: WordMap) -> CutPoint:
+    """声が続く切り所が語の途中に当たれば語の端へ寄せる（#494）
+
+    声が続く所の一番小さい点は語の中の子音の谷のことが多い 実物では語の真ん中を勧め、その位置で
+    切った AI が語を落とした 静かな所（間と谷）は語の時刻のずれなので寄せない
+    """
+    if point.kind != JOINED:
+        return point
+    inside_in = spoken.word_at(point.in_seconds, CUT_IN) is not None
+    inside_out = spoken.word_at(point.out_seconds, CUT_OUT) is not None
+    if not (inside_in or inside_out):
+        return point
+    return replace(
+        point,
+        in_seconds=after.start if inside_in else point.in_seconds,
+        out_seconds=before.end if inside_out else point.out_seconds,
+    )
+
+
 def cut_points(
-    words: Sequence[Word], waveform: Waveform | None, seconds: Fraction, window: Fraction
+    words: Sequence[Word],
+    waveform: Waveform | None,
+    seconds: Fraction,
+    window: Fraction,
+    spoken: WordMap | None = None,
 ) -> list[CutPoint]:
     """``seconds`` の前後 ``window`` 秒の語の境目を、切ってよい順ではなく近い順に返す
 
     波形が無ければ語の時刻だけで返す（:data:`UNCHECKED`） AI の道具が呼ぶので、語の数が多くても
-    見るのは前後の語だけ
+    見るのは前後の語だけ ``spoken`` を渡すと、検査が語切れと読む所を勧めない
     """
     low, high = seconds - window, seconds + window
     if not words:
@@ -239,5 +264,10 @@ def cut_points(
     else:
         reference = _reference(waveform, seconds)
         points = [_between(waveform, before, after, reference) for before, after in pairs]
+        if spoken is not None:
+            points = [
+                _outside_words(point, before, after, spoken)
+                for point, (before, after) in zip(points, pairs, strict=True)
+            ]
     points.sort(key=lambda point: point.distance(seconds))
     return points[:MAX_POINTS]
