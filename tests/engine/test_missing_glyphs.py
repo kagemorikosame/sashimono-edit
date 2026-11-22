@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from fractions import Fraction
 
 import numpy as np
 import pytest
 from PySide6.QtGui import QFontDatabase, QGuiApplication
 
-from sashimono.core.model import Clip, Project, ProjectSettings, Track, TrackKind
+from sashimono.ai.fixes import HANDOFF, fix_for
+from sashimono.core.model import Clip, Project, ProjectSettings, Scene, Track, TrackKind
 from sashimono.effects.sources import TEXT
 from sashimono.engine.checks import KIND_NAMES
 from sashimono.engine.checks.glyphs import glyph_runs
+from sashimono.engine.checks.report import MEDIUM
 from sashimono.engine.checks.scan import MISSING_GLYPH
 from sashimono.engine.sources import missing_glyphs, render_source
 
@@ -67,6 +70,35 @@ class TestFinding:
     def test_outside_the_range_is_not_returned(self) -> None:
         """範囲を絞って調べたのに外の問題を返すと、頼まれていない所を AI が直す"""
         assert glyph_runs(_project("ABC", "字幕"), 0, 30) == []
+
+    def test_supplementary_kanji_are_counted(self) -> None:
+        """絵文字と一緒に外すと、人名の「𠮷」が代わりの書体で出ても知らせない"""
+        assert missing_glyphs(TEXT.create(text="𠮷😀", font=LATIN_ONLY)) == "𠮷"
+
+    def test_the_timer_shows_its_format(self) -> None:
+        """本文だけ見ると、タイマーの「時分秒」が細い字で出ても知らせない"""
+        source = TEXT.create(text="", font=LATIN_ONLY, timer_format="hh時mm分ss秒")
+        assert missing_glyphs(source) == "時分秒"
+
+    @pytest.mark.parametrize(("at", "shown"), [(1, []), (2, [(1, 2)]), (3, []), (4, [(2, 3)])])
+    def test_frames_skipped_by_speed_are_not_returned(
+        self, at: int, shown: list[tuple[int, int]]
+    ) -> None:
+        """倍速で飛ばされる 1 コマの字幕を数えると、映らない字を AI と人に直させる"""
+        text = Clip(timeline_start=at, duration=1, source=TEXT.create(text="字", font=LATIN_ONLY))
+        project = Project.create(ProjectSettings())
+        inner = Track(kind=TrackKind.VIDEO, name="V1", clips=(text,))
+        scene = Scene("字幕", replace(project.timeline, tracks=(inner,)))
+        placed = Clip(timeline_start=0, duration=3, scene_id=scene.id, speed=Fraction(2))
+        outer = Track(kind=TrackKind.VIDEO, name="V1", clips=(placed,))
+        project = replace(project, scenes=(scene,)).with_timeline(
+            replace(project.timeline, tracks=(outer,))
+        )
+        runs = glyph_runs(project, 0, 3)
+        assert [(run.start, run.end) for run in runs] == shown
+        for run in runs:
+            assert run.values["in_scene_clip"] == str(placed.id)
+            assert fix_for(MISSING_GLYPH, MEDIUM, run.values).action == HANDOFF
 
 
 class TestMatching:

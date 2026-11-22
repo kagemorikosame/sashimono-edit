@@ -329,17 +329,33 @@ class LoudnessGain:
 def _compensated(
     predict: Callable[[float], float | None], target: float, low: float, high: float
 ) -> float:
-    """抑えた後の音量が ``target`` になる量 ``high`` でも届かなければ ``high``
+    """抑えた後の音量が ``target`` になる量 どこでも届かなければ一番大きく鳴る量
 
-    抑えた後の音量は掛ける量に対して増える一方なので、二分で詰める
+    たいていは掛けた量とともに増えるので二分で詰める ただし増える一方とは限らない 静かな所が
+    相対ゲートを越えて平均に入ると下がるので、上端で届かないときだけ下から順に見て、初めて届いた
+    所（一番浅く抑える側）の手前から詰める
     """
     if high <= low:
         return high
     top = predict(high)
     if top is None:
         return low
-    if top <= target:
-        return high
+    if top < target:
+        best, loudest_value = high, top
+        below = low
+        for step in range(math.ceil((high - low) / _SCAN_DB)):
+            at = low + step * _SCAN_DB
+            value = predict(at)
+            if value is None:
+                continue
+            if value >= target:
+                low, high = below, at
+                break
+            if value > loudest_value:
+                best, loudest_value = at, value
+            below = at
+        else:
+            return best
     for _ in range(_COMPENSATION_STEPS):
         middle = (low + high) / 2.0
         value = predict(middle)
@@ -354,6 +370,8 @@ def _compensated(
 _SHORT_LU = 0.05
 #: 二分の回数 12 dB の幅が 0.003 dB まで詰まる
 _COMPENSATION_STEPS = 12
+#: 上端で届かないときに下から見る幅（dB） 見積もりは 1 回が長い作品で 0.1 秒ほど掛かる
+_SCAN_DB = 1.0
 
 
 def loudness_gain(

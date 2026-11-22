@@ -5231,7 +5231,8 @@ def _small_placed(project: Project, commands: Sequence[Command]) -> dict[str, An
         "small": rows,
         "small_note": (
             "動画が画面より小さく中央に入っています（画素で置く） 画面いっぱいにするなら"
-            " set_clip_property で native_size を false にします（拡大率は 100 のまま）"
+            " set_clip_property で native_size を false にします（拡大率が 100 でなければ"
+            " set_param で scale を 100 へ戻す 動かしている拡大率は変えない）"
             " ワイプなど小さく置く頼みならそのままにします"
         ),
     }
@@ -7585,7 +7586,7 @@ def _apply_loudness(
         squeeze=squeeze,
         # 外して測り、上限も置き直すリミッターは、上げる量を止めない
         raise_ceiling=None if redo else raise_cap(targets, ceiling),
-        predict=loudness_predictor(report.dynamics, ceiling),
+        predict=loudness_predictor(report, ceiling, clips),
     )
     gain = decided.gain_db
     limited = list(decided.limited_by)
@@ -7613,14 +7614,18 @@ def _apply_loudness(
     settled = squeezed and bool(redo) and all(has_limiter(clip) for clip in clips)
     if not moved and (not squeezed or settled):
         result["gain_db"] = 0.0
-        if settled and estimate is not None:
-            if clips_overlap(clips):
-                # リミッターはクリップごと 重なって鳴る音の和は見積もりほど抑えられない
-                result |= {"reached": None if reached else False, "loudness_rechecked": False}
-            else:
-                # 測った値は抑える前の音 これだけ返すと、基準に合った音を大きすぎると読む
-                result["expected_lufs"] = round(estimate, 1)
-        if reached:
+        if settled and estimate is None:
+            # 重なって鳴る音などは抑えた後を見積もれない 抑える前の音から届いたと言い切らない
+            result |= {"reached": None if reached else False, "loudness_rechecked": False}
+        elif settled and estimate is not None:
+            # 測った値は抑える前の音 これだけ返すと、基準に合った音を大きすぎると読む
+            result["expected_lufs"] = round(estimate, 1)
+        if result["reached"] is None:
+            result["note"] = (
+                "そろえたときのままなので何も変えていません 抑えた後の音量は見積もれないので"
+                " check_output の loudness で確かめてください"
+            )
+        elif reached:
             result["note"] = "すでに基準に合っています 何も変えていません"
         else:
             result["note"] = (

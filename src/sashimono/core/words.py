@@ -352,6 +352,21 @@ def _past_edge(inside: Fraction, unit: Fraction | None) -> bool:
     return inside >= max(_SHORT_WORD_MARGIN, unit / 2)
 
 
+def _in_short_phrase(word: Word, seconds: Fraction, side: str | None) -> bool:
+    """両端の遊びより短い文節（「はい」だけなど）の、語を落とす側の半分か
+
+    端ごとに見ると向かいの端の遊びが文節の半分より先まで覆い、真ん中で切っても語の途中と読まない
+    """
+    if word.end - word.start > 2 * WORD_MARGIN:
+        return False
+    before, after = seconds - word.start, word.end - seconds
+    if min(before, after) < _SHORT_WORD_MARGIN:
+        return False
+    if side == CUT_OUT:
+        return before <= after
+    return side != CUT_IN or after <= before
+
+
 class WordMap:
     """1 つの音の語の読み取り 語の途中か・語で確かめられる所かを、道具と検査が同じ答えで読む
 
@@ -399,6 +414,8 @@ class WordMap:
             head = None if side == CUT_OUT else self._head_units.get(word.start)
             tail = None if side == CUT_IN else self._tail_units.get(word.end)
             if _past_edge(seconds - word.start, head) and _past_edge(word.end - seconds, tail):
+                return word
+            if _in_short_phrase(word, seconds, side):
                 return word
         return None
 

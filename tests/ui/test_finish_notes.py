@@ -11,8 +11,17 @@ from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from sashimono.ai.operations import find_operation
+from sashimono.core.commands.effects import ParamPath, SetParam
 from sashimono.core.commands.insert import insert_media
-from sashimono.core.model import Clip, MediaItem, Project, ProjectSettings, Track, TrackKind
+from sashimono.core.model import (
+    AnimatedValue,
+    Clip,
+    MediaItem,
+    Project,
+    ProjectSettings,
+    Track,
+    TrackKind,
+)
 from sashimono.effects.sources import TEXT
 from sashimono.ui.main_window import MainWindow
 from tests.ai.conftest import FakeHost
@@ -56,6 +65,30 @@ def test_the_button_fits_a_small_video(opened: list[MainWindow], video_media: Me
     )
     button.click()
     assert not _picture(window.document.project).native_size
+
+
+def test_the_button_reads_the_clip_when_pressed(
+    opened: list[MainWindow], video_media: MediaItem
+) -> None:
+    """作った時のクリップで作ると、知らせの数が同じ間に変えた拡大率が残って画面に収まらない"""
+    project = Project.create(ProjectSettings(width=1920, height=1080))
+    for command in insert_media(project, _small(video_media), at_frame=0):
+        project = command.apply(project)
+    clip = _picture(project)
+    window = _selected(opened, project, clip)
+    (button,) = (
+        b for b in window._inspector.findChildren(QPushButton) if b.objectName() == "fit_to_screen"
+    )
+    transform = next(e for e in clip.effects if e.kind == "transform")
+    path = ParamPath.of_effect(clip.id, transform.id, "scale")
+    assert window.execute_all([SetParam(path, AnimatedValue(static=99.8))], "拡大率")
+    QApplication.processEvents()
+    button.click()
+    after = _picture(window.document.project)
+    assert not after.native_size
+    scale = next(e for e in after.effects if e.kind == "transform").params["scale"]
+    assert isinstance(scale, AnimatedValue)
+    assert scale.static == 100.0
 
 
 def test_the_assistant_is_told_of_a_small_video(video_media: MediaItem) -> None:

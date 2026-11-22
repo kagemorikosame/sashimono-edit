@@ -1256,7 +1256,14 @@ class InspectorPanel(QWidget):
             "画素で置くのをやめ、拡大率を 100% に戻して画面に収めます（取り消しで戻せます）\n"
             "素材の細部は増えないので、拡大した分だけ甘く見えます"
         )
-        button.clicked.connect(lambda: self._send(fit_commands(clip), "画面に合わせる"))
+
+        def fit() -> None:
+            # 押した時のクリップで作る 欄は値が動いても作り直さないので、作った時の物は古い
+            located = self._located()
+            if located is not None:
+                self._send(fit_commands(located[1]), "画面に合わせる")
+
+        button.clicked.connect(fit)
         section.add_note(small_note(share), button)
 
     def _alignment_grid(self, parent: QWidget) -> QWidget:

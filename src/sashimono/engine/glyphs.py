@@ -30,13 +30,14 @@ _SAMPLE_SIZE = 120
 _SAMPLES = ("田永書", "あのま", "AHO8")
 #: これより差が小さければ太らせない（字の大きさに対する割合） 揃っている字まで滲ませない
 _SAME_WEIGHT = 0.01
-#: ここから先は絵文字 代わりの書体で出すのがふつうで、知らせも太らせもしない
-_EMOJI_FROM = 0x1F000
+#: 絵文字の面 代わりの書体で出すのがふつうで、知らせも太らせもしない 下限だけで切らない
+#: その上の面（U+20000 から）は補助漢字で、人名の「𠮷」などがある
+_EMOJI = range(0x1F000, 0x20000)
 
 
 def _expected(character: str) -> bool:
     """書体が持っているはずの字か 空白・制御・異体字の選び・絵文字は数えない"""
-    if character.isspace() or ord(character) >= _EMOJI_FROM:
+    if character.isspace() or ord(character) in _EMOJI:
         return False
     category = unicodedata.category(character)
     return category not in ("Cc", "Cf", "Cs", "Mn", "So")

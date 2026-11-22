@@ -12,7 +12,13 @@ from typing import Any
 import numpy as np
 import pytest
 
-from sashimono.ai.auto_fix import clips_overlap, limited_ceiling, raise_cap
+from sashimono.ai.auto_fix import (
+    clips_overlap,
+    limited_ceiling,
+    limiter_commands,
+    loudness_predictor,
+    raise_cap,
+)
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
 from sashimono.ai.operations import find_operation
@@ -563,17 +569,18 @@ class TestAnotherCall:
         assert dynamics is not None
         target = dynamics.limited_loudness(0.0, -1.0)
         assert target is not None
-        _run(work, target_lufs=target)
+        assert clips_overlap([work.clip(work.voice.id), work.clip(work.bgm.id)])
+        _run(work, target_lufs=loudness)
         _measured(work.host, loudness, float(20 * np.log10(meter.peak)))
         state = work.host.check
         assert state.report is not None
         work.host.check = replace(state, report=replace(state.report, dynamics=dynamics))
-        result = _run(work, target_lufs=target)
+        result = _run(work, target_lufs=loudness)
         assert result["gain_db"] == 0.0
-        if clips_overlap([work.clip(work.voice.id), work.clip(work.bgm.id)]):
-            # 声と BGM が重なる 和は見積もりほど抑えられないので言い切らない
-            assert result["reached"] is None
-            assert "expected_lufs" not in result
+        # 声と BGM が重なる 和は抑えた後を見積もれないので、届いたとも合っているとも言い切らない
+        assert result["reached"] is None
+        assert "expected_lufs" not in result
+        assert "すでに基準" not in result["note"]
         alone = [str(work.voice.id)]
         _run(work, clip_ids=alone, target_lufs=target)
         _measured(work.host, loudness, float(20 * np.log10(meter.peak)))
@@ -584,3 +591,70 @@ class TestAnotherCall:
         assert result["gain_db"] == 0.0
         assert result["reached"] is True
         assert result["expected_lufs"] == pytest.approx(target, abs=0.15)
+
+
+class TestWhereTheEstimateHolds:
+    """見積もりが実際のミキサと合う所でだけ使う（PR #495 のレビュー）"""
+
+    def test_overlapping_sounds_are_not_predicted(self, work: _Work) -> None:
+        """混ぜた山を抑える見込みで上げると、クリップごとには抑えられず基準より大きくなる"""
+        _run(work)
+        _measured(work.host, -20.0, -6.0)
+        state = work.host.check
+        assert state.report is not None
+        report = replace(state.report, dynamics=_meter(_peaky()).dynamics())
+        voice, bgm = work.clip(work.voice.id), work.clip(work.bgm.id)
+        assert loudness_predictor(report, -1.0, [voice, bgm]) is None
+        assert loudness_predictor(report, -1.0, [voice]) is not None
+        work.host.check = replace(state, report=report)
+        result = _run(work)
+        assert result["gain_db"] == pytest.approx(6.0)
+        assert result["reached"] is None
+        assert result["expected_lufs"] is None
+
+    def test_the_hold_does_not_cross_a_clip_head(self) -> None:
+        """持ち越すと次のクリップの頭を小さく見積もり、上げすぎて基準より大きくなる"""
+        times = np.arange(int(RATE * 0.2)) / RATE
+        tone_mono = np.sin(2 * np.pi * 440 * times)
+        parts, starts, limited = [], [], []
+        context = AudioContext(offset=0, sample_rate=RATE, duration=len(times))
+        for index in range(30):
+            mono = (tone_mono * (2.5 if index % 2 == 0 else 0.6)).astype(np.float32)
+            part = np.stack([mono, mono], axis=1)
+            parts.append(part)
+            starts.append(index * 0.2)
+            limited.append(limit(part.copy(), {"ceiling": -1.0, "release": 150.0}, context))
+        dynamics = _meter(np.concatenate(parts)).dynamics()
+        assert dynamics is not None
+        real = _meter(np.concatenate(limited)).integrated()
+        assert real is not None
+        assert dynamics.limited_loudness(0.0, -1.0, starts) == pytest.approx(real, abs=0.2)
+        carried = dynamics.limited_loudness(0.0, -1.0)
+        assert carried is not None
+        assert carried < real - 0.2
+
+    @pytest.mark.parametrize(("target", "found"), [(-16.4, 4.1), (-15.5, 4.2)])
+    def test_the_loudness_may_fall_as_the_gain_rises(self, target: float, found: float) -> None:
+        """上端だけで諦めると、途中で届くのに潰せるだけ潰して基準より小さくなる"""
+        decided = loudness_gain(
+            [],
+            measured=target - 3.2,
+            peak_db=-3.0,
+            target=target,
+            ceiling=-1.0,
+            squeeze=11.0,
+            # 4.5 dB で一番大きく、その先は静かな所がゲートを越えて平均が下がる
+            predict=lambda gain: -16.0 - abs(gain - 4.5),
+        )
+        assert decided.gain_db == pytest.approx(found, abs=0.11)
+        assert bool(decided.limited_by) is (target > -16.0)
+
+    def test_the_active_limiter_is_updated(self, work: _Work) -> None:
+        """前にある無効な物を取ると、積み直した物と効いていた物が重なって潰れる"""
+        definition = registry.require(LIMITER_KIND)
+        idle, active = definition.create(), definition.create()
+        clip = work.clip(work.voice.id)
+        clip = replace(clip, effects=(replace(idle, enabled=False), *clip.effects, active))
+        (command,) = limiter_commands([(work.voice_track, clip)], -1.0)
+        assert isinstance(command, SetParam)
+        assert command.path.effect_id == active.id

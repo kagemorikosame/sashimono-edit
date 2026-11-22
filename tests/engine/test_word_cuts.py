@@ -158,3 +158,16 @@ class TestShortLastWord:
             if point.kind == JOINED:
                 assert words.word_at(point.out_seconds, CUT_OUT) is None
                 assert words.word_at(point.in_seconds, CUT_IN) is None
+
+
+def test_overlapping_words_are_not_offered() -> None:
+    """語の時刻が重なる所へ寄せて勧めると、勧めたとおりに切った所を検査が語切れと返す"""
+    lines = (
+        segment((Word(Fraction(1), Fraction(2), "あ"),)),
+        segment((Word(Fraction(182, 100), Fraction(3), "い"),)),
+    )
+    words = WordMap(Transcript(lines, language="ja"))
+    pairs = sorted(words.units, key=lambda word: word.start)
+    at, sound = Fraction(191, 100), wave(((5.0, 12.0),))
+    assert any(p.before == "あ" for p in cut_points(pairs, sound, at, Fraction(1)))
+    assert not any(p.before == "あ" for p in cut_points(pairs, sound, at, Fraction(1), words))

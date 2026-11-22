@@ -147,6 +147,28 @@ class TestImportDoesNotFreeze:
         assert window._import_indicator.isHidden()
         assert window.statusBar().currentMessage() == "2 件を読み込んだ"
 
+    @pytest.mark.parametrize("broken", [(), ("b.mp4",)])
+    def test_a_small_video_is_told_with_the_result(
+        self,
+        window: MainWindow,
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        broken: tuple[str, ...],
+    ) -> None:
+        # 続けて出すと、件数か失敗の訳が合わせ方を上書きして 1 度も読めない
+        stream = replace(video_media.video_streams[0], width=80, height=60)
+        gate = _Gate(replace(video_media, video_streams=(stream,)), broken)
+        gate.release.set()
+        monkeypatch.setattr(main_window_module, "probe_media", gate)
+        # 空の作品は素材の大きさへ合わせに行く 作品より小さく入った形を見る
+        monkeypatch.setattr(window, "_match_project_to", lambda _media: None)
+        window.import_media([tmp_path / "a.mp4", tmp_path / "b.mp4"])
+        assert window.wait_for_imports()
+        message = window.statusBar().currentMessage()
+        assert "画面に合わせる" in message
+        assert ("b.mp4" if broken else "2 件を読み込んだ") in message
+
     def test_cancel_places_nothing(
         self,
         window: MainWindow,

@@ -87,7 +87,7 @@ _AT_CEILING = "at_ceiling"
 #: 天井に当たっているが、リミッターで山を抑えればまだ上げられる物（#414 本人の設定が入りで、
 #: 鳴るクリップにまだリミッターが積まれていない）
 _LIMITABLE = "limitable"
-#: 言葉の途中の切れ目のうち、シーンの中のクリップの間にある物を分ける印
+#: シーンの中のクリップの問題を分ける印（切れ目・字幕・はみ出し・無い字）
 _INSIDE_SCENE = "inside_scene"
 #: 字幕の時刻のずれのうち、焼き込んだ字幕か人が直した行（#414） 合わせ直すと焼き直しが要るか、
 #: 人がわざと決めた時刻を戻すことになる
@@ -118,6 +118,12 @@ _RAISE_WITH_LIMITER = (
     "音の山が天井に当たっている normalize_loudness が音のクリップの最後にリミッターを積んで山だけを"
     "抑え、基準まで上げる（limiter_db に抑えた量） それでも reached が false なら、山の出る音の"
     "クリップだけを set_volume で下げるか、基準に届かないまま進めるかを人に尋ねる"
+)
+
+_TEXT_IN_SCENE = (
+    "シーンの中の文字で、今のタイムラインの set_param では届かない set_active_scene でシーンを"
+    "開いて clip_ids のクリップを直すか、シーンを置いたクリップ（in_scene_clip）を動かすかを"
+    "人に伝える"
 )
 
 #: 種類と程度ごとの直し方 2026-10-20 に本人が決めた表（#339 の Issue の本文）
@@ -191,6 +197,16 @@ FIXES: Mapping[tuple[str, str, str | None], Fix] = {
         " AviUtl2 の組み方では効かないので、その字を人に伝える",
     ),
     (MISSING_GLYPH, LOW, None): Fix(
+        LEAVE, (), "代わりの書体で出るが太さはそろえてある 字の形まで揃えたいかは人が決める"
+    ),
+    # シーンの中の文字は、開いているタイムラインの set_param では見つからない
+    (TEXT_OVERFLOW, HIGH, _INSIDE_SCENE): Fix(HANDOFF, (), _TEXT_IN_SCENE),
+    (TEXT_OVERFLOW, MEDIUM, _INSIDE_SCENE): Fix(HANDOFF, (), _TEXT_IN_SCENE),
+    (TEXT_OVERFLOW, LOW, _INSIDE_SCENE): Fix(
+        LEAVE, (), "動く文字（流れるテロップなど）はわざと外へ出すことが多い"
+    ),
+    (MISSING_GLYPH, MEDIUM, _INSIDE_SCENE): Fix(HANDOFF, (), _TEXT_IN_SCENE),
+    (MISSING_GLYPH, LOW, _INSIDE_SCENE): Fix(
         LEAVE, (), "代わりの書体で出るが太さはそろえてある 字の形まで揃えたいかは人が決める"
     ),
     (BLACK, HIGH, None): Fix(
@@ -319,6 +335,8 @@ def _variant(
 
     分けないと、焼き込んだ字幕や天井に当たった音量まで、ふつうの物と同じ道具で直そうとする
     """
+    if kind in (TEXT_OVERFLOW, MISSING_GLYPH):
+        return _INSIDE_SCENE if measure.get("in_scene_clip") else None
     if kind in (WORD_CUT, SUBTITLE_WORDS):
         return _INSIDE_SCENE if measure.get("inside_scene") else None
     if kind == SUBTITLE_TIMING:

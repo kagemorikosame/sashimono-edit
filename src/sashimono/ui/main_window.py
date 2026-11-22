@@ -2131,9 +2131,12 @@ class MainWindow(QMainWindow):
         for media in loaded:
             self._request_analysis(media)
             self._request_proxy(media)
-        if not lost:
-            self._tell_small(commands)
-        if failures:
+        small = None if lost else self._small_hint(commands)
+        if small is not None:
+            # 1 つの知らせにまとめる 続けて出すと、件数か失敗の訳が合わせ方を上書きする
+            head = failures[0] if failures else f"{batch.total} 件を読み込んだ"
+            self.statusBar().showMessage(f"{head} {small}", 10000)
+        elif failures:
             self.statusBar().showMessage(failures[0], 5000)
         elif lost and commands:
             self.statusBar().showMessage(
@@ -2474,17 +2477,22 @@ class MainWindow(QMainWindow):
 
     def _tell_small(self, commands: Sequence[Command]) -> None:
         """置いた動画が小さく入ったら知らせる（#494） 窓は出さない 小さく置く人の手を止めない"""
+        hint = self._small_hint(commands)
+        if hint is not None:
+            self.statusBar().showMessage(hint, 10000)
+
+    def _small_hint(self, commands: Sequence[Command]) -> str | None:
+        """置いた動画のどれかが小さく入っていれば、その知らせの文"""
         for command in commands:
             if not isinstance(command, AddClip):
                 continue
             share = placed_small(self.view_project, command.clip)
             if share is not None:
-                self.statusBar().showMessage(
+                return (
                     f"{small_note(share)} 画面いっぱいにするには、クリップを選んで"
-                    "設定パネルの〔画面に合わせる〕",
-                    10000,
+                    "設定パネルの〔画面に合わせる〕"
                 )
-                return
+        return None
 
     def _match_project_to(self, media: list[MediaItem]) -> None:
         """空のプロジェクトへ最初の動画を置く前に、プロジェクトを動画の形へ合わせる
@@ -5011,7 +5019,7 @@ class MainWindow(QMainWindow):
             ceiling=pending.ceiling,
             squeeze=pending.squeeze,
             raise_ceiling=None if pending.redo else raise_cap(pending.targets, pending.ceiling),
-            predict=loudness_predictor(report.dynamics, pending.ceiling),
+            predict=loudness_predictor(report, pending.ceiling, clips),
         )
         moved = abs(decided.gain_db) >= 0.05
         # 音量を変えなくても、山が天井を越えていればリミッターは積む
@@ -5021,7 +5029,14 @@ class MainWindow(QMainWindow):
         if not moved and (not squeezed or settled):
             after = decided.limited_lufs
             short = target - (report.loudness if after is None else after)
-            if abs(short) < 0.05 or not decided.limited_by:
+            if settled and after is None and not decided.limited_by:
+                # 測ったのは抑える前の音 基準に合っていると言い切らない
+                self.statusBar().showMessage(
+                    "そろえたときのままなので変えなかった 重なって鳴る音は抑えた後の音量を"
+                    "見積もれないので、仕上がりの検査で確かめてください",
+                    8000,
+                )
+            elif abs(short) < 0.05 or not decided.limited_by:
                 self.statusBar().showMessage("すでに基準の音量です", 5000)
             else:
                 # 上限で 1 dB も上げられなかったのを「基準の音量」と言うと、足りないまま進める

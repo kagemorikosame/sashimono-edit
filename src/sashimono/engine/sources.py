@@ -1041,7 +1041,13 @@ def missing_glyphs(source: GeneratedSource) -> str:
         for name, value in source.params.items()
     }
     text = str(values.get("text", ""))
-    if not text or str(values.get("timer_format", "") or ""):
+    pattern = str(values.get("timer_format", "") or "")
+    if pattern:
+        # タイマーは本文の代わりに書式の字と数字を描く
+        text = format_time(0.0, pattern)
+        if text != format_time(45296.789, pattern):
+            text += "0123456789"
+    if not text:
         return ""
     if values.get("layout") != "aviutl" or bool(values.get("vertical", False)):
         return absent_characters(_text_font(values, 64), text)

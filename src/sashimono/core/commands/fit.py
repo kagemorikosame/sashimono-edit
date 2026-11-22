@@ -49,7 +49,7 @@ def placed_small(project: Project, clip: Clip) -> float | None:
     transform = _transform(clip)
     scale = None if transform is None else transform.params.get("scale")
     if isinstance(scale, AnimatedValue):
-        if scale.is_animated:
+        if scale.is_animated or scale.static > 100.0:
             return None
         share *= scale.static / 100.0
     return share if share < _SMALL_SHARE else None

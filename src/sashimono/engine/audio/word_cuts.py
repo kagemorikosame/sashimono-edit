@@ -212,11 +212,12 @@ def _between(waveform: Waveform, before: Word, after: Word, reference: float) ->
     )
 
 
-def _outside_words(point: CutPoint, before: Word, after: Word, spoken: WordMap) -> CutPoint:
+def _outside_words(point: CutPoint, before: Word, after: Word, spoken: WordMap) -> CutPoint | None:
     """声が続く切り所が語の途中に当たれば語の端へ寄せる（#494）
 
     声が続く所の一番小さい点は語の中の子音の谷のことが多い 実物では語の真ん中を勧め、その位置で
     切った AI が語を落とした 静かな所（間と谷）は語の時刻のずれなので寄せない
+    語の時刻が重なっていて寄せた先も語の中なら ``None``（勧めない）
     """
     if point.kind != JOINED:
         return point
@@ -224,11 +225,16 @@ def _outside_words(point: CutPoint, before: Word, after: Word, spoken: WordMap) 
     inside_out = spoken.word_at(point.out_seconds, CUT_OUT) is not None
     if not (inside_in or inside_out):
         return point
-    return replace(
+    moved = replace(
         point,
         in_seconds=after.start if inside_in else point.in_seconds,
         out_seconds=before.end if inside_out else point.out_seconds,
     )
+    if inside_in and spoken.word_at(moved.in_seconds, CUT_IN) is not None:
+        return None
+    if inside_out and spoken.word_at(moved.out_seconds, CUT_OUT) is not None:
+        return None
+    return moved
 
 
 def cut_points(
@@ -265,9 +271,10 @@ def cut_points(
         reference = _reference(waveform, seconds)
         points = [_between(waveform, before, after, reference) for before, after in pairs]
         if spoken is not None:
-            points = [
+            checked = (
                 _outside_words(point, before, after, spoken)
                 for point, (before, after) in zip(points, pairs, strict=True)
-            ]
+            )
+            points = [point for point in checked if point is not None]
     points.sort(key=lambda point: point.distance(seconds))
     return points[:MAX_POINTS]

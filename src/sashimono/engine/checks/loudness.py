@@ -20,8 +20,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from itertools import pairwise
 
 import numpy as np
 
@@ -138,18 +140,25 @@ class Dynamics:
     #: 100 ms の区切り 1 つのサンプル数
     step: int
 
-    def limited_loudness(self, gain_db: float, ceiling_db: float) -> float | None:
+    def limited_loudness(
+        self, gain_db: float, ceiling_db: float, starts: Sequence[float] = ()
+    ) -> float | None:
         """``gain_db`` 上げて ``ceiling_db`` のリミッターを通した積分ラウドネス
 
         区切りの中は一番強く絞った量で通して数える 見積もりが低めに出るので、届かない側へは外さない
+        ``starts`` はクリップの頭（測り始めからの秒） そこで絞る量の持ち越しを切る
         """
         ratio = 10.0 ** (gain_db / 20.0)
         ceiling = 10.0 ** (ceiling_db / 20.0)
         wanted = 1.0 - np.minimum(1.0, ceiling / np.maximum(self.peak * ratio, 1e-12))
         kept = np.full(len(wanted), ratio)
         if np.any(wanted > 0.0):
-            held = reduction(wanted, 0.1 / _FINE_PARTS, DEFAULT_RELEASE_MS / 1000.0)
-            kept = ratio * (1.0 - held)
+            interval = 0.1 / _FINE_PARTS
+            release = DEFAULT_RELEASE_MS / 1000.0
+            resets = {round(start / interval) for start in starts}
+            bounds = sorted({0, len(wanted), *(at for at in resets if 0 < at < len(wanted))})
+            for low, high in pairwise(bounds):
+                kept[low:high] *= 1.0 - reduction(wanted[low:high], interval, release)
         ticks = (self.energy * kept * kept).reshape(-1, _FINE_PARTS).sum(axis=1)
         if len(ticks) < 4:
             return None

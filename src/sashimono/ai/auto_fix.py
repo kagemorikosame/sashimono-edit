@@ -54,7 +54,7 @@ from sashimono.engine.auto_color import (
     thinned,
 )
 from sashimono.engine.cache.thumbnails import Filmstrip
-from sashimono.engine.checks.loudness import Dynamics
+from sashimono.engine.checks.report import CheckReport
 
 __all__ = [
     "AUTO_GRADE_PARAMS",
@@ -218,15 +218,20 @@ def redoable_limiters(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> 
 
 
 def loudness_predictor(
-    dynamics: Dynamics | None, ceiling: float
+    report: CheckReport, ceiling: float, clips: Sequence[Clip]
 ) -> Callable[[float], float | None] | None:
-    """掛ける量から抑えた後の音量を見積もる手（#494） 手がかりが無ければ ``None``
+    """掛ける量から抑えた後の音量を見積もる手（#494） 見積もれなければ ``None``
 
     トラックの音量は測った音に入っているので、書き出しで止まる所（``ceiling``）で見積もる
+    重なって鳴るクリップでは見積もらない リミッターはクリップごとに掛かるのに、測ったのは混ぜた
+    後の音 混ぜた山を抑える見込みで上げると、抑えられなかった分だけ基準より大きくなる
     """
-    if dynamics is None:
+    dynamics = report.dynamics
+    if dynamics is None or clips_overlap(clips):
         return None
-    return lambda gain: dynamics.limited_loudness(gain, ceiling)
+    # ミキサのリミッターはクリップの頭で絞る量を持ち越さない（前のクリップの音を読まない）
+    starts = [(clip.timeline_start - report.start) / report.fps for clip in clips]
+    return lambda gain: dynamics.limited_loudness(gain, ceiling, starts)
 
 
 def limited_peak(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float:
@@ -250,7 +255,10 @@ def limiter_commands(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> l
     commands: list[Command] = []
     for track, clip in targets:
         local = limiter_ceiling(track, ceiling)
-        found = next((effect for effect in clip.effects if effect.kind == LIMITER_KIND), None)
+        limiters = [effect for effect in clip.effects if effect.kind == LIMITER_KIND]
+        # 外して測った物（:func:`redoable_limiters`）と同じ、効いている物を先に取る 前にある無効な
+        # 物を取ると、積み直した物と効いていた物が 2 つ重なって潰れる
+        found = next((e for e in limiters if e.enabled), limiters[0] if limiters else None)
         if found is None:
             effect = registry.require(LIMITER_KIND).create(ceiling=local)
             commands.append(AddEffect(clip.id, effect))

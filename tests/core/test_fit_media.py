@@ -53,6 +53,11 @@ def _scaled(clip: Clip, value: AnimatedValue) -> Clip:
 
 
 class TestSmall:
+    def test_a_video_enlarged_by_hand_is_not_told(self) -> None:
+        """数えると、ワイプとして 150% に決めた動画にも知らせが出続ける"""
+        project, clip = _placed(640, 360)
+        assert placed_small(project, _scaled(clip, AnimatedValue(static=150.0))) is None
+
     def test_a_360p_video_in_1080p(self) -> None:
         """壊れると、1/3 の大きさで入ったことに書き出すまで気付かない"""
         project, clip = _placed(640, 360)
