@@ -514,7 +514,7 @@ def test_a_soft_tail_at_the_edge_is_not_taken_for_an_edge(
         texture.release()
         processor.release()
         compositor.release()
-    assert np.array_equal(*seen), "ぼけた裾の読む位置が動いた"
+    assert np.array_equal(seen[0], seen[1]), "ぼけた裾の読む位置が動いた"
 
 
 def test_the_rim_of_the_placed_frame_is_not_blurred() -> None:
