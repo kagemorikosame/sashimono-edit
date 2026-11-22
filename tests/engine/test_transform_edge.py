@@ -144,7 +144,9 @@ def _border(image: np.ndarray) -> np.ndarray:
 def _assert_full(image: np.ndarray, alpha: int = 255, level: int = 180) -> None:
     border = _border(image).astype(int)
     assert border[:, 3].min() >= alpha - 2, f"外周が透明と混ざった: {border[:, 3].min()}"
-    assert np.abs(border[:, 0] - level).max() <= 2, f"外周の色が変わった: {border[:, 0].min()}"
+    red = border[:, 0]
+    gap = np.abs(red - level).max()
+    assert gap <= 2, f"外周の色が変わった: {red.min()}〜{red.max()}（{level} との差 {gap}）"
 
 
 @pytest.mark.parametrize(
