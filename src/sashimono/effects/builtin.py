@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from sashimono.core.model import ParamValue
 from sashimono.effects.blending import BLEND_FUNCTIONS, BLEND_MODES
 from sashimono.effects.definition import EffectDefinition, registry
+from sashimono.effects.edges import cropped_edges, transformed_edges
 from sashimono.effects.sampling import AREA_SAMPLING
 from sashimono.effects.spec import (
     GRADIENT_MIXINGS,
@@ -477,6 +478,72 @@ uniform float anchor_y;
 uniform int pivot_h;
 uniform int pivot_v;
 uniform bool move_to_pivot;
+uniform vec4 u_screen;     // 画面がバッファのどこか（画素、左・下・右・上） 幅 0 なら画面に出ない絵
+uniform vec4 u_edges;      // 絵の縁（画素、左・下・右・上）
+uniform vec2 u_edge_soft;  // 縁から何画素離れれば混ざっていないか
+
+// 支点からの位置を、回す前・拡大する前へ戻す
+vec2 unscaled(vec2 pixel, mat2 turn, vec2 zoom) { return turn * pixel / zoom; }
+
+float alpha_at(vec2 pixel) {
+    ivec2 last = textureSize(u_texture, 0) - 1;
+    return texelFetch(u_texture, clamp(ivec2(floor(pixel)), ivec2(0), last), 0).a;
+}
+
+// 縁（内の向きを正に測った位置）から内へ soft_edge 離れた、最初の画素の真ん中
+vec2 clear_of(vec2 edge, vec2 soft_edge) { return ceil(edge + soft_edge - 0.5 - 0.001) + 0.5; }
+
+// 画面の端に掛かった縁 1 本のために、読む位置を axis の向きへどれだけ内へ寄せるか
+// side は内の向き（1 か -1） border は画面の端が入力のどこに当たるか
+// 寄せるのは、縁の外が透明で内に絵があるときだけ 絵の続きを寄せると外周の中身がずれる
+// 画面の端から半画素までは少しずつ寄せる 0 か 1 かで決めると、ズームの終わりで外周が跳ぶ
+float inward(
+    vec2 pixel, vec2 axis, float side,
+    float border, float edge, float soft_edge, float zoom, float spread
+) {
+    float inset = (edge - border) * side * zoom;
+    if (inset >= 0.5) return 0.0;
+    float inner = clear_of(vec2(edge * side), vec2(soft_edge)).x;
+    float at = dot(pixel, axis) * side;
+    if (at >= inner + spread - 0.001) return 0.0;
+    float outer = floor(edge * side - soft_edge - 0.5 + 0.001) + 0.5;
+    vec2 across = pixel * (vec2(1.0) - axis);
+    if (alpha_at(across + axis * outer * side) > 0.0) return 0.0;
+    if (alpha_at(across + axis * inner * side) <= 0.0) return 0.0;
+    return (inner + spread - at) * clamp((0.5 - inset) / 0.49, 0.0, 1.0);
+}
+
+// 画面の端に掛かった縁の外の透明を拾わない読む位置（#493） 透明を拾うと、画面いっぱいへ
+// 拡大した絵の外周が黒と混ざって暗くなる 画面の中に見える縁はなまったまま
+// （YMM4 の拡大 200% も縁は 2 画素にまたがる）
+// 縁は 2 通りに探す 置いた所から数で追った縁と、画面の端に一番近い画素の境目（図形の中の縁や、
+// 数では追えないエフェクトの後の縁）
+vec2 on_screen_edge(vec2 pixel, vec2 low, vec2 high, vec2 zoom, vec2 spread) {
+    vec2 near = 0.5 / zoom;
+    vec2 low_line = floor(low + near);
+    vec2 high_line = ceil(high - near);
+    // 角では、もう片方の向きに寄せた先の列（行）で透明かどうかを見る 寄せる前の列は縁の外に
+    // 掛かっていることがあり、角の 1 画素だけが暗く残る 画素の真ん中へそろえてから挟む
+    // 半端な位置の縁から測っただけでは、塗られていない列（行）に乗る
+    vec2 first_clear = clear_of(u_edges.xy, u_edge_soft);
+    vec2 last_clear = max(-clear_of(-u_edges.zw, u_edge_soft), first_clear);
+    vec2 inside = clamp(pixel, first_clear, last_clear);
+    vec2 moved = pixel;
+    for (int i = 0; i < 2; ++i) {
+        vec2 axis = i == 0 ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+        vec2 at = i == 0 ? vec2(pixel.x, inside.y) : vec2(inside.x, pixel.y);
+        float up = max(
+            inward(at, axis, 1.0, low[i], u_edges[i], u_edge_soft[i], zoom[i], spread[i]),
+            inward(pixel, axis, 1.0, low[i], low_line[i], 0.5, zoom[i], spread[i])
+        );
+        float down = max(
+            inward(at, axis, -1.0, high[i], u_edges[i + 2], u_edge_soft[i], zoom[i], spread[i]),
+            inward(pixel, axis, -1.0, high[i], high_line[i], 0.5, zoom[i], spread[i])
+        );
+        moved[i] += up - down;
+    }
+    return moved;
+}
 
 void main() {
     // 出力の座標から入力の座標を逆算する 前方に写すと隙間が空く
@@ -519,13 +586,13 @@ void main() {
     float angle = radians(-rotation);
     float c = cos(angle);
     float s = sin(angle);
-    pixel = mat2(c, -s, s, c) * pixel;
+    mat2 turn = mat2(c, -s, s, c);
 
     float whole = max(scale / 100.0, 0.0001);
     float sx = max(scale_x / 100.0, 0.0001) * whole;
     float sy = max(scale_y / 100.0, 0.0001) * whole;
-    pixel /= vec2(sx, sy);
-    pixel += anchor;
+    vec2 zoom = vec2(sx, sy);
+    pixel = unscaled(pixel, turn, zoom) + anchor;
 
     // 覆う範囲は分かれ道より前に測る 分かれた先では隣の画素の値が揃わず、測れない
     vec2 uv = pixel / u_size;
@@ -534,6 +601,20 @@ void main() {
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         frag_color = vec4(0.0);
         return;
+    }
+    // 画面の端と平行な縁だけを扱う 斜めの縁に手を入れると、端の近くだけ階段になる
+    if (u_screen.z > u_screen.x && rotation_x == 0.0 && rotation_y == 0.0
+        && min(abs(c), abs(s)) < 1e-5) {
+        vec2 back = move_to_pivot ? anchor - object_center() : vec2(0.0);
+        back -= anchor + vec2(pos_x, pos_y);
+        vec2 first = unscaled(u_screen.xy + back, turn, zoom) + anchor;
+        vec2 second = unscaled(u_screen.zw + back, turn, zoom) + anchor;
+        vec2 dx = du * u_size;
+        vec2 dy = dv * u_size;
+        float steps = float(area_steps(max(length(dx), length(dy))));
+        vec2 spread = (abs(dx) + abs(dy)) * (1.0 - 1.0 / steps) * 0.5;
+        vec2 moved = on_screen_edge(pixel, min(first, second), max(first, second), zoom, spread);
+        if (moved != pixel) uv = moved / u_size;
     }
     // 事前乗算で平均する（:mod:`sashimono.effects.sampling`） 縮めても透明な所の色が
     // 縁へにじまず、細かい格子に縞が浮かない
@@ -1253,6 +1334,7 @@ def register_builtin_effects() -> None:
                 CheckSpec("move_to_pivot", "中心を絵の中央の位置へ寄せる", False),
             ),
             fragment_shader=_TRANSFORM,
+            moves_edges=transformed_edges,
             # 動かさず・拡げず・回さず・寄せなければ、支点（中心と基準）をどこへ置いても
             # 元の位置へ戻る（シェーダは支点を引いてから足し戻す）
             idle_when=(
@@ -1282,6 +1364,7 @@ def register_builtin_effects() -> None:
                 TrackSpec("feather", "ぼかし", 0, 200, 0, unit="px"),
             ),
             fragment_shader=_CROP,
+            moves_edges=cropped_edges,
         )
     )
 

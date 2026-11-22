@@ -17,7 +17,7 @@ from sashimono.engine.gpu.context import (
     opengl_usable,
     preferred_surface_format,
 )
-from sashimono.engine.gpu.effects import EffectProcessor, srgb_to_linear
+from sashimono.engine.gpu.effects import OFF_SCREEN, EffectProcessor, srgb_to_linear
 from sashimono.engine.gpu.glutil import (
     FULL_RECT,
     IDENTITY,
@@ -32,6 +32,7 @@ from sashimono.engine.gpu.glutil import (
 __all__ = [
     "FULL_RECT",
     "IDENTITY",
+    "OFF_SCREEN",
     "VERTEX_SHADER",
     "BlendMode",
     "Compositor",

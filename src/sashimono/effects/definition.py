@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.core.model import AnimatedValue, Effect, ParamValue
+from sashimono.effects.edges import MoveEdges
 from sashimono.effects.spec import ParameterGroup, ParameterSpec, ParamInput, TrackSpec
 
 __all__ = [
@@ -125,6 +126,12 @@ class EffectDefinition:
     keeps_content: bool = False
     #: 画面いっぱいの四角 1 枚ではなく、升目ごとの四角で描くか（:class:`Pieces`）
     pieces: Pieces | None = None
+    #: 絵のまっすぐな縁を動かすエフェクトの、動かした後の縁の求め方
+    #: （:mod:`sashimono.effects.edges`）
+    #:
+    #: 後ろの変形は縁が画面の端に掛かったかをこれで知る 縁を動かす物に付けないと、その後で
+    #: 画面いっぱいへ拡大した絵の外周が暗くなる（#493）
+    moves_edges: MoveEdges | None = field(default=None, compare=False)
     #: この値の組なら絵を変えない、という項目と値（動かない値だけが当たる）
     #:
     #: クリップが最初から持つ配置と反転（固定の項目）は、置いたクリップすべてに付く
