@@ -71,6 +71,8 @@ class EffectDefinition:
     ``u_pass``      複数パスのときの通し番号（0 から）
     ``u_time``      クリップ先頭からの経過秒
     ``u_frame``     クリップ先頭からの経過フレーム
+    ``u_screen``    画面がバッファのどこか（左・下・右・上） 幅 0 なら画面に出ない絵
+    ``u_edges``     絵のまっすぐな縁（:attr:`moves_edges` で追った物 幅は ``u_edge_soft``）
 
     パラメータは名前をそのまま uniform 名にする 数値は ``float``、チェックは
     ``bool``、色は ``vec4``（リニアへ変換済み）、選択肢は番号の ``int``

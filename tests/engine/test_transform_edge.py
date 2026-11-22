@@ -442,6 +442,30 @@ def test_the_exported_video_has_no_dark_rim(gl_context: OffscreenGLContext, tmp_
     assert abs(exported[0, :, 1].mean() - preview[0, :, 1].mean()) <= 4
 
 
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"rotation": float("inf")},
+        {"scale": float("nan")},
+        {"pos_x": float("inf")},
+        {"scale": 1e308},
+        {"scale": 1e200, "pos_x": -1e200, "scale_x": 1e200},
+        {"anchor_y": float("-inf")},
+    ],
+)
+def test_a_broken_number_does_not_stop_the_drawing(
+    gl_context: OffscreenGLContext, tmp_path: Path, broken: dict[str, float]
+) -> None:
+    """壊れた数のファイルで縁の計算が例外を投げると、プレビューも書き出しもそのコマで止まる"""
+    media = _png(tmp_path, _plain(160, 90))
+    first = registry.require("transform").create()
+    for name, value in broken.items():
+        # 項目の範囲で切られないよう、ファイルから読んだ形（AnimatedValue）のまま入れる
+        first = first.with_param(name, AnimatedValue(value))
+    clip = _placed(_media_clip(media), first, scale=300.0)
+    assert _render(_project(clip, media), gl_context).shape == (HEIGHT, WIDTH, 4)
+
+
 def test_the_rim_of_the_placed_frame_is_not_blurred() -> None:
     """縮めて置いた枠の縁までなまったと見積もると、画面の端から少しはみ出した絵（301%）の
     外周の中身が、画質を落としたプレビューでだけ隣の画素へずれる

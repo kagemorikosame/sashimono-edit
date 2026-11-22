@@ -412,7 +412,12 @@ class EffectProcessor:
             pivot=lambda: self._pivot(definition, effect, frame),
             center=((left + right) * 0.5, (bottom + top) * 0.5),
         )
-        self._edges = definition.moves_edges(self._edges, step)
+        moved = definition.moves_edges(self._edges, step)
+        # 桁の外の値（壊れたファイル）は掛け算で無限になる 次の変形が画素へ丸めるときに
+        # 例外になり、そのコマの描画が止まるので、追うのをやめる
+        if moved is not None and not all(map(math.isfinite, (*moved.box, *moved.soft))):
+            moved = None
+        self._edges = moved
 
     def _pivot(
         self, definition: EffectDefinition, effect: Effect, frame: int
