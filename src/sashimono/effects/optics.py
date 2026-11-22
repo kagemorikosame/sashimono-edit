@@ -1224,6 +1224,8 @@ def register_optics_effects() -> None:
             ),
             fragment_shader=_FLIP,
             moves_edges=flipped_edges,
+            # 裏返しはもう 1 度裏返すと戻るので、掛ける前の画面も同じ式
+            screen_before=flipped_edges,
             # どちらも裏返さなければ絵は変わらない クリップが最初から持つ左右反転は
             # この値で付く（:mod:`sashimono.core.commands.fixed`）
             idle_when=(("horizontal", False), ("vertical", False)),

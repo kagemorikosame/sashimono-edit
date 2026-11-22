@@ -133,7 +133,12 @@ class EffectDefinition:
     #:
     #: 後ろの変形は縁が画面の端に掛かったかをこれで知る 縁を動かす物に付けないと、その後で
     #: 画面いっぱいへ拡大した絵の外周が暗くなる（#493）
-    moves_edges: MoveEdges | None = field(default=None, compare=False)
+    moves_edges: MoveEdges | None = field(default=None, compare=False, kw_only=True)
+    #: このエフェクトの後で画面の端に来る所が、掛ける前はどこだったか（画面を縁として渡す）
+    #:
+    #: 無いエフェクト（:attr:`keeps_content` の物を除く）が変形の後ろにあれば、その変形は縁に
+    #: 手を入れない 入れると、硬くした縁を後ろの動きが画面の中へ運んで見せる（#493）
+    screen_before: MoveEdges | None = field(default=None, compare=False, kw_only=True)
     #: この値の組なら絵を変えない、という項目と値（動かない値だけが当たる）
     #:
     #: クリップが最初から持つ配置と反転（固定の項目）は、置いたクリップすべてに付く

@@ -22,6 +22,7 @@ __all__ = [
     "cropped_edges",
     "flipped_edges",
     "placed_edges",
+    "staying_edges",
     "transformed_edges",
 ]
 
@@ -51,8 +52,13 @@ class EdgeStep:
     checked: Callable[[str], bool]
     #: 変形の支点（合成の画素） 支点を持たないエフェクトでは使わない
     pivot: Callable[[], tuple[float, float]]
-    #: 絵の置かれた範囲（``u_object``）の中央
-    center: tuple[float, float]
+    #: 絵の置かれた範囲（``u_object``） 変形では動かない
+    placed: _Box
+
+    @property
+    def center(self) -> tuple[float, float]:
+        left, bottom, right, top = self.placed
+        return ((left + right) * 0.5, (bottom + top) * 0.5)
 
 
 #: エフェクトの後の縁を返す関数 追えなくなったら ``None``
@@ -82,13 +88,23 @@ def cropped_edges(edges: PictureEdges, step: EdgeStep) -> PictureEdges:
     if step.number("feather") > 0.0:
         return replace(edges, known=False)
     left, bottom, right, top = edges.box
-    box = (
-        left + max(step.number("left"), 0.0),
-        bottom + max(step.number("bottom"), 0.0),
-        right - max(step.number("right"), 0.0),
-        top - max(step.number("top"), 0.0),
-    )
-    return replace(edges, box=box)
+    # シェーダは u_object の端から切り、量が 0 の辺は切らない 前の変形で動いた縁から数えると、
+    # 何も切らない切り抜きを挟んだだけで、その後の拡大で縁を見失う
+    base_left, base_bottom, base_right, base_top = step.placed
+    if (cut := step.number("left")) > 0.0:
+        left = max(left, base_left + cut)
+    if (cut := step.number("bottom")) > 0.0:
+        bottom = max(bottom, base_bottom + cut)
+    if (cut := step.number("right")) > 0.0:
+        right = min(right, base_right - cut)
+    if (cut := step.number("top")) > 0.0:
+        top = min(top, base_top - cut)
+    return replace(edges, box=(left, bottom, right, top))
+
+
+def staying_edges(edges: PictureEdges, _step: EdgeStep) -> PictureEdges:
+    """切り抜きは削るだけで、画面の端を別の場所へ運ばない"""
+    return edges
 
 
 def flipped_edges(edges: PictureEdges, step: EdgeStep) -> PictureEdges:

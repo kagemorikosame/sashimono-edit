@@ -16,9 +16,18 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sashimono.core.commands import AddClip, AddMedia, AddTrack, insert_media
+from sashimono.core.commands import (
+    AddClip,
+    AddMedia,
+    AddScene,
+    AddTrack,
+    InScene,
+    insert_media,
+    new_scene,
+)
 from sashimono.core.commands.fixed import TRANSFORM_EFFECT_KIND, with_fixed_items
 from sashimono.core.model import (
+    GROUP_AS_ONE,
     GROUP_KIND,
     GROUP_LAYERS,
     AnimatedValue,
@@ -27,6 +36,7 @@ from sashimono.core.model import (
     GeneratedSource,
     Keyframe,
     MediaItem,
+    ParamValue,
     Project,
     ProjectSettings,
     Track,
@@ -316,6 +326,94 @@ def test_a_second_scale_finds_the_edge_the_first_one_left(
     inner = registry.require("transform").create(**first)
     clip = _placed(_media_clip(media), inner, scale=200.0)
     _assert_full(_render(_project(clip, media), gl_context))
+
+
+@pytest.mark.parametrize(("margin", "outside"), [(0, 0), (200, 85)], ids=["cut", "spilling"])
+def test_an_edge_moved_in_by_a_later_effect_stays_smooth(
+    gl_context: OffscreenGLContext, tmp_path: Path, margin: int, outside: int
+) -> None:
+    """画面いっぱいへ拡大した後でグループ制御や変形が絵を動かすと、硬くした縁や画面の外に
+    伸びた帯が画面の中へ入って見える（PR #496 のレビュー）
+    """
+    media = _png(tmp_path, _plain(160, 90, margin=margin))
+    first = registry.require("transform").create(scale=300.0)
+    moved = _placed(_media_clip(media), first, pos_x=100.0)
+    seen = _render(_project(moved, media), gl_context)[135, 90:106, 3].astype(int)
+    # 画面の大きさのバッファでは外の半分が切れ、はみ出しのバッファ（透明な余白の大きい絵）では残る
+    expected = np.array([0] * 9 + [outside, 170] + [255] * 5)
+    assert np.abs(seen - expected).max() <= 2, f"動かした先の縁が違う: {seen}"
+
+
+@pytest.mark.parametrize("after", ["flip", "colour", "move_along"])
+def test_what_follows_the_scale_does_not_bring_the_rim_back(
+    gl_context: OffscreenGLContext, tmp_path: Path, after: str
+) -> None:
+    """拡大の後に縁を画面の端へ残す物（反転・色・端に沿った動き）を積んでも暗い縁は戻らない"""
+    media = _png(tmp_path, _plain(160, 100))
+    grown = registry.require("transform").create(scale=300.0)
+    later = {
+        "flip": registry.require("flip").create(horizontal=True),
+        "colour": registry.require("color_grade").create(),
+        "move_along": registry.require("transform").create(pos_y=9.0),
+    }[after]
+    image = _render(_project(_placed(_media_clip(media), grown, later), media), gl_context)
+    # 動かすと上下の 9 画素は前の変形で画面に切られた所が入るので、その外を見る
+    sides = np.concatenate((image[12:-12, 0, 3], image[12:-12, -1, 3]))
+    assert sides.min() >= 253, f"外周が透明と混ざった: {sides.min()}"
+
+
+def test_a_crop_after_a_scale_is_measured_from_the_object(
+    gl_context: OffscreenGLContext, tmp_path: Path
+) -> None:
+    """切り抜きは絵の元の範囲の端から切る 拡大した後の縁から数えると、何も切らない切り抜きを
+    挟んだだけで、その後に画面いっぱいへ拡大した辺が暗い（PR #496 のレビュー）
+    """
+    media = _png(tmp_path, _plain(160, 90))
+    grown = registry.require("transform").create(scale=200.0)
+    # 元の範囲（横 160..320）の左から 10 拡大した縁（80）より内なので、切るのは 170 より左
+    crop = registry.require("crop").create(left=10)
+    clip = _placed(
+        _media_clip(media), grown, crop, scale=150.0, scale_x=48000.0 / 230 / 1.5, pos_x=-93.9130435
+    )
+    image = _render(_project(clip, media), gl_context)
+    assert image[135, 0, 3] >= 253, "切った辺が暗い"
+    uncut = registry.require("crop").create(left=1)
+    moved = registry.require("transform").create(scale=150.0, pos_x=80.0)
+    # 横 200..440 縁より外の 161 より左を切るだけなので、縁は 200 のまま
+    clip = _placed(_media_clip(media), moved, uncut, scale=200.0, pos_x=-160.0)
+    assert _render(_project(clip, media), gl_context)[135, 0, 3] >= 253, "切っていない辺が暗い"
+
+
+@pytest.mark.parametrize("outer", [100.0, 50.0])
+@pytest.mark.parametrize("nesting", ["scene", "group"])
+def test_a_filled_scene_is_the_same_as_one_with_a_full_size_picture(
+    gl_context: OffscreenGLContext, tmp_path: Path, nesting: str, outer: float
+) -> None:
+    """入れ子のシーンと 1 枚扱いのグループは、それ自体が画面の大きさの絵 中で補正をやめると等倍で
+    置いたシーンに暗い外周が戻り、縮めて置いても等倍の絵を入れたときに無い暗い枠が付く
+    """
+    seen = []
+    for size, inner in (((160, 90), 300.0), ((WIDTH, HEIGHT), 100.0)):
+        media = _png(tmp_path, _plain(*size))
+        clip = _placed(_media_clip(media), scale=inner)
+        if nesting == "group":
+            params: dict[str, ParamValue] = {GROUP_LAYERS: AnimatedValue(1.0), GROUP_AS_ONE: True}
+            source = GeneratedSource(kind=GROUP_KIND, params=params)
+            group = _placed(Clip(timeline_start=0, duration=30, source=source), scale=outer)
+            project = _project(clip, media, group)
+        else:
+            project = AddMedia(media).apply(Project.create(SETTINGS))
+            scene = new_scene(project, "中")
+            project = AddScene(scene).apply(project)
+            inside, track = Track(TrackKind.VIDEO, "S"), Track(TrackKind.VIDEO, "V")
+            project = InScene(scene.id, AddTrack(inside)).apply(project)
+            project = InScene(scene.id, AddClip(inside.id, clip)).apply(project)
+            project = AddTrack(track).apply(project)
+            placed = _placed(Clip(timeline_start=0, duration=30, scene_id=scene.id), scale=outer)
+            project = AddClip(track.id, placed).apply(project)
+        seen.append(_render(project, gl_context).astype(int))
+    assert seen[1][..., 3].max() >= 253, "何も描かれていない"
+    assert np.abs(seen[0] - seen[1]).max() <= 2, "拡大で埋めた入れ子だけ縁が違う"
 
 
 def test_a_keyframed_zoom_reaches_the_edge_without_a_jump(

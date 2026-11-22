@@ -223,7 +223,7 @@ class EffectProcessor:
 
         #: 開いている部分フィルタ 後ろのエフェクトはこの範囲の中だけに効く
         scope: tuple[_Compiled, Effect] | None = None
-        for effect in effects:
+        for index, effect in enumerate(effects):
             # 何もしない値の物はパスを通さない 通すと 1 回ごとに画素を読み直すだけ遅くなる
             if not effect.enabled or _idle(effect):
                 continue
@@ -243,7 +243,7 @@ class EffectProcessor:
                 self._copy(self._buffers[self._front], self._held_buffer())
                 scope = (compiled, effect)
                 continue
-            self._apply_one(compiled, effect, frame=frame, fps=fps)
+            self._apply_one(compiled, effect, frame=frame, fps=fps, later=effects[index + 1 :])
         if scope is not None:
             self._close_scope(*scope, frame=frame, fps=fps)
 
@@ -309,13 +309,18 @@ class EffectProcessor:
         frame: int,
         fps: float,
         keep_source: bool = False,
+        later: tuple[Effect, ...] = (),
     ) -> None:
         """エフェクト 1 つを、必要なパス数だけ掛ける
 
         ``keep_source`` が真なら ``u_source`` を書き換えない（部分フィルタを閉じるとき）
+        ``later`` はこの後ろに掛かる並び 縁に手を入れてよいかを決める（:meth:`_screen_before`）
         """
         definition = compiled.definition
         program = compiled.program
+        # 縁を見るエフェクトにだけ渡す ほかのシェーダへまで毎回送ると、その分だけ遅い
+        edge_aware = definition.moves_edges is not None
+        screen = self._screen_before(later, frame) if edge_aware else self._screen
 
         # 元の絵を控えておく u_source を使うエフェクト（グロー・影）が要る
         if not keep_source:
@@ -339,13 +344,8 @@ class EffectProcessor:
             program.set_vec4("u_object", self._object)
             program.set_vec2("u_origin", self._origin)
             program.set_vec4("u_content", self._content)
-            program.set_vec4("u_screen", self._screen)
-            # 追えなくなった縁はバッファ全体 画素の境目から探す方だけが効く
-            edges = self._edges
-            whole = (0.0, 0.0, float(target.width), float(target.height))
-            program.set_vec4("u_edges", whole if edges is None else edges.box)
-            program.set_vec2("u_edge_soft", (0.5, 0.5) if edges is None else edges.soft)
-            program.set_bool("u_edge_known", edges is not None and edges.known)
+            if edge_aware:
+                self._set_edges(program, screen)
             program.set_float("u_pixel_scale", self.pixel_scale)
             program.bind_texture("u_texture", source_buffer.color, unit=0)
             program.bind_texture("u_source", self._source.color, unit=1)
@@ -402,6 +402,45 @@ class EffectProcessor:
         self._blit.bind_texture("u_texture", target.color)
         self._quad.draw()
 
+    def _set_edges(self, program: Program, screen: tuple[float, float, float, float]) -> None:
+        """画面の範囲と絵の縁を渡す"""
+        program.set_vec4("u_screen", screen)
+        # 追えなくなった縁はバッファ全体 画素の境目から探す方だけが効く
+        edges = self._edges
+        whole = (0.0, 0.0, float(self.width), float(self.height))
+        program.set_vec4("u_edges", whole if edges is None else edges.box)
+        program.set_vec2("u_edge_soft", (0.5, 0.5) if edges is None else edges.soft)
+        program.set_bool("u_edge_known", edges is not None and edges.known)
+
+    def _screen_before(
+        self, later: tuple[Effect, ...], frame: int
+    ) -> tuple[float, float, float, float]:
+        """``later`` を掛け終えて画面になる所が今のどこか 幅 0 なら縁に手を入れない
+
+        後ろに動かす物（もう 1 つの変形・揺れ）があれば手を入れない 今の画面の端で硬くした縁や、
+        はみ出しのバッファの画面の外へ伸びた帯が、動いた先で画面の中に見える 最後の変形は
+        前の変形でなまった幅（:class:`PictureEdges` の ``soft``）ごと端を満たすので暗くはならない
+        """
+        following: list[tuple[EffectDefinition, Effect]] = []
+        for effect in later:
+            if not effect.enabled or _idle(effect):
+                continue
+            compiled = self._compile(effect)
+            if compiled is None:
+                continue
+            definition = compiled.definition
+            if definition.keeps_content or definition.scopes_following:
+                continue
+            if definition.screen_before is None:
+                return (0.0, 0.0, 0.0, 0.0)
+            following.append((definition, effect))
+        screen: PictureEdges | None = PictureEdges(self._screen, (0.5, 0.5))
+        for definition, effect in reversed(following):
+            if screen is None or definition.screen_before is None:
+                break
+            screen = definition.screen_before(screen, self._edge_step(definition, effect, frame))
+        return (0.0, 0.0, 0.0, 0.0) if screen is None else screen.box
+
     def _move_edges(self, definition: EffectDefinition, effect: Effect, frame: int) -> None:
         """縁を動かすエフェクトの後で、絵の縁を動かす
 
@@ -409,19 +448,21 @@ class EffectProcessor:
         """
         if definition.moves_edges is None or self._edges is None:
             return
-        left, bottom, right, top = self._object
-        step = EdgeStep(
-            number=lambda name: _number(definition, effect, name, frame, self.pixel_scale),
-            checked=lambda name: _checked(definition, effect, name),
-            pivot=lambda: self._pivot(definition, effect, frame),
-            center=((left + right) * 0.5, (bottom + top) * 0.5),
-        )
-        moved = definition.moves_edges(self._edges, step)
+        moved = definition.moves_edges(self._edges, self._edge_step(definition, effect, frame))
         # 桁の外の値（壊れたファイル）は掛け算で無限になる 次の変形が画素へ丸めるときに
         # 例外になり、そのコマの描画が止まるので、追うのをやめる
         if moved is not None and not all(map(math.isfinite, (*moved.box, *moved.soft))):
             moved = None
         self._edges = moved
+
+    def _edge_step(self, definition: EffectDefinition, effect: Effect, frame: int) -> EdgeStep:
+        """縁を動かす関数へ渡す、このエフェクトの手掛かり"""
+        return EdgeStep(
+            number=lambda name: _number(definition, effect, name, frame, self.pixel_scale),
+            checked=lambda name: _checked(definition, effect, name),
+            pivot=lambda: self._pivot(definition, effect, frame),
+            placed=self._object,
+        )
 
     def _pivot(
         self, definition: EffectDefinition, effect: Effect, frame: int

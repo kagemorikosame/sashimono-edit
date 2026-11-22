@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from sashimono.core.model import ParamValue
 from sashimono.effects.blending import BLEND_FUNCTIONS, BLEND_MODES
 from sashimono.effects.definition import EffectDefinition, registry
-from sashimono.effects.edges import cropped_edges, transformed_edges
+from sashimono.effects.edges import cropped_edges, staying_edges, transformed_edges
 from sashimono.effects.sampling import AREA_SAMPLING
 from sashimono.effects.spec import (
     GRADIENT_MIXINGS,
@@ -513,7 +513,12 @@ float inward(
     if (at >= inner + spread - 0.001) return 0.0;
     float outer = floor(edge * side - soft_edge - 0.5 + 0.001) + 0.5;
     vec2 across = pixel * (vec2(1.0) - axis);
-    if (alpha_at(across + axis * outer * side) > 0.0) return 0.0;
+    // 前の変形でなまった縁は、外の半分がバッファの端で切れていることがある そこは透明
+    // 端の画素で代わりに読むと絵の続きと取り違え、2 段に動かした絵の外周が暗いまま残る
+    vec2 beyond = across + axis * outer * side;
+    bool cut_off = known && soft_edge > 0.5
+        && (any(lessThan(beyond, vec2(0.0))) || any(greaterThan(beyond, u_size)));
+    if (!cut_off && alpha_at(beyond) > 0.0) return 0.0;
     float solid = alpha_at(across + axis * inner * side);
     if (solid <= 0.0) return 0.0;
     if (!known && abs(alpha_at(across + axis * (inner + 1.0) * side) - solid) > 0.01) return 0.0;
@@ -1382,6 +1387,7 @@ def register_builtin_effects() -> None:
             ),
             fragment_shader=_CROP,
             moves_edges=cropped_edges,
+            screen_before=staying_edges,
         )
     )
 
