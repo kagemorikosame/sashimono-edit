@@ -37,8 +37,9 @@ class PictureEdges:
     """絵の縁（合成の画素 左・下・右・上 Y は上が正）"""
 
     box: _Box
-    #: 縁から何画素離れれば、透明とも中身とも混ざっていないか（横・縦）
-    soft: tuple[float, float]
+    #: 縁から何画素離れれば、透明とも中身とも混ざっていないか（並びは ``box`` と同じ）
+    #: 辺ごとに持つ 拡大の後で片側だけ切ると、切った辺だけが硬い縁に戻る
+    soft: _Box
     #: 確かにここが縁か 中身を動かしうるエフェクト（粒・ぼかし）の後は偽 偽なら、内側の
     #: 濃さが平らな所だけを縁と読む（ぼけた裾を縁と読むと、粒の端が濃くなる）
     known: bool = True
@@ -80,26 +81,32 @@ def placed_edges(box: _Box, rect: _Box, source: tuple[int, int]) -> PictureEdges
         # 平均した範囲の分だけなまる
         return zoom / 2.0 if zoom > 1.0 else (1.0 + zoom) / 2.0
 
-    return PictureEdges(box, (softness(0), softness(1)))
+    across, upright = softness(0), softness(1)
+    return PictureEdges(box, (across, upright, across, upright))
 
 
 def cropped_edges(edges: PictureEdges, step: EdgeStep) -> PictureEdges:
     """切り抜きで内へ入った縁 ぼかして切った縁は本物の濃淡なので追わない"""
     if step.number("feather") > 0.0:
         return replace(edges, known=False)
-    left, bottom, right, top = edges.box
-    # シェーダは u_object の端から切り、量が 0 の辺は切らない 前の変形で動いた縁から数えると、
-    # 何も切らない切り抜きを挟んだだけで、その後の拡大で縁を見失う
-    base_left, base_bottom, base_right, base_top = step.placed
-    if (cut := step.number("left")) > 0.0:
-        left = max(left, base_left + cut)
-    if (cut := step.number("bottom")) > 0.0:
-        bottom = max(bottom, base_bottom + cut)
-    if (cut := step.number("right")) > 0.0:
-        right = min(right, base_right - cut)
-    if (cut := step.number("top")) > 0.0:
-        top = min(top, base_top - cut)
-    return replace(edges, box=(left, bottom, right, top))
+    box, soft = list(edges.box), list(edges.soft)
+    for side, name in enumerate(("left", "bottom", "right", "top")):
+        amount = step.number(name)
+        # 内の向きを正に測る（右と上は裏返す）
+        inward = 1.0 if side < 2 else -1.0
+        # シェーダは u_object の端から切り、量が 0 の辺は切らない 前の変形で動いた縁から数えると、
+        # 何も切らない切り抜きを挟んだだけで、その後の拡大で縁を見失う
+        line = step.placed[side] + inward * amount
+        further = (line - edges.box[side]) * inward
+        if amount <= 0.0 or further <= 0.0:
+            continue
+        box[side] = line
+        # 切り口より内に残ったなまりの分だけ 前の幅のままだと、外周が切り口の列ではなく
+        # その 1 画素内の列の色になる
+        soft[side] = max(edges.soft[side] - further, 0.5)
+    return replace(
+        edges, box=(box[0], box[1], box[2], box[3]), soft=(soft[0], soft[1], soft[2], soft[3])
+    )
 
 
 def staying_edges(edges: PictureEdges, _step: EdgeStep) -> PictureEdges:
@@ -110,12 +117,17 @@ def staying_edges(edges: PictureEdges, _step: EdgeStep) -> PictureEdges:
 def flipped_edges(edges: PictureEdges, step: EdgeStep) -> PictureEdges:
     """反転で入れ替わった縁 片側だけ切った絵は、裏返すと縁の場所が変わる"""
     left, bottom, right, top = edges.box
+    at_left, at_bottom, at_right, at_top = edges.soft
     x, y = step.center
     if step.checked("horizontal"):
         left, right = 2.0 * x - right, 2.0 * x - left
+        at_left, at_right = at_right, at_left
     if step.checked("vertical"):
         bottom, top = 2.0 * y - top, 2.0 * y - bottom
-    return replace(edges, box=(left, bottom, right, top))
+        at_bottom, at_top = at_top, at_bottom
+    return replace(
+        edges, box=(left, bottom, right, top), soft=(at_left, at_bottom, at_right, at_top)
+    )
 
 
 def transformed_edges(edges: PictureEdges, step: EdgeStep) -> PictureEdges | None:
@@ -155,16 +167,19 @@ def transformed_edges(edges: PictureEdges, step: EdgeStep) -> PictureEdges | Non
 
     # 縮めるときに読む点の散らばり（:data:`~sashimono.effects.sampling.AREA_SAMPLING` と同じ数）
     count = min(max(math.ceil(1.0 / min(zoom) - _SLACK), 1), 8)
-    soft = []
-    for axis in (0, 1):
+    soft = [0.5] * 4
+    for side in range(4):
+        axis, high = side % 2, side >= 2
         # 読んだ所が混ざらないのは、縁から離れた最初の画素の真ん中より奥 そこまでが次の縁の幅
-        reach = max(
-            _clear_of(edges.box[axis], edges.soft[axis]),
-            _clear_of(-edges.box[axis + 2], edges.soft[axis]),
-        )
+        edge = -edges.box[side] if high else edges.box[side]
+        reach = _clear_of(edge, edges.soft[side])
         spread = (1.0 - 1.0 / count) / (2.0 * zoom[axis])
-        soft.append(max((reach + spread) * zoom[axis], 0.5))
-    return replace(edges, box=box, soft=(soft[1], soft[0]) if sideways else (soft[0], soft[1]))
+        # 回すと辺が入れ替わる 入力の軸の正の向きが、出力のどの軸のどちら向きへ行くか
+        across = 1 - axis if sideways else axis
+        forward = ((c, s), (-s, c))[axis][across] > 0.0
+        lands = across + 2 if high == forward else across
+        soft[lands] = max((reach + spread) * zoom[axis], 0.5)
+    return replace(edges, box=box, soft=(soft[0], soft[1], soft[2], soft[3]))
 
 
 def _clear_of(edge: float, soft: float) -> float:

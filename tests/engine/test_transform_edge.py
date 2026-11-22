@@ -44,7 +44,7 @@ from sashimono.core.model import (
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry
-from sashimono.effects.edges import placed_edges
+from sashimono.effects.edges import EdgeStep, PictureEdges, placed_edges, transformed_edges
 from sashimono.engine.decode import VideoDecoder, probe_media
 from sashimono.engine.encode import ExportSettings, export_project
 from sashimono.engine.gpu import (
@@ -384,6 +384,59 @@ def test_a_crop_after_a_scale_is_measured_from_the_object(
     assert _render(_project(clip, media), gl_context)[135, 0, 3] >= 253, "切っていない辺が暗い"
 
 
+@pytest.mark.parametrize("flipped", [False, True])
+def test_a_cut_side_reads_the_column_at_the_cut(
+    gl_context: OffscreenGLContext, tmp_path: Path, flipped: bool
+) -> None:
+    """切った辺に前の拡大のぼけ幅が残ると、外周が切り口の列でなく 1 画素内の列の色になる
+    単色の素材では見えない（PR #496 のレビュー）
+    """
+    pixels = _plain(160, 90, (0, 0, 0, 255))
+    # 2 倍に拡大すると、切り口（170）の列は黒、その 1 画素内の列は白が混ざる
+    pixels[:, 46:, :3] = 255
+    media = _png(tmp_path, pixels)
+    before = [
+        registry.require("transform").create(scale=200.0),
+        registry.require("crop").create(left=10),
+    ]
+    shift = -93.9130435
+    if flipped:
+        before.append(registry.require("flip").create(horizontal=True))
+        shift = -shift
+    clip = _placed(
+        _media_clip(media), *before, scale=150.0, scale_x=48000.0 / 230 / 1.5, pos_x=shift
+    )
+    seen = _render(_project(clip, media), gl_context)[135, -1 if flipped else 0]
+    assert seen[3] >= 253, "切った辺が暗い"
+    assert seen[0] <= 8, f"切り口より内の列の色が出た: {seen[0]}"
+
+
+@pytest.mark.parametrize(
+    ("rotation", "expected"),
+    [
+        (0.0, (0.5, 1.5, 2.5, 3.5)),
+        (90.0, (1.5, 2.5, 3.5, 0.5)),
+        (180.0, (2.5, 3.5, 0.5, 1.5)),
+        (-90.0, (3.5, 0.5, 1.5, 2.5)),
+    ],
+)
+def test_the_width_of_each_side_turns_with_it(
+    rotation: float, expected: tuple[float, float, float, float]
+) -> None:
+    """回した後で辺ごとの幅を取り違えると、切った辺と切っていない辺の外周の読み方が入れ替わる"""
+    values = {"rotation": rotation, "scale": 100.0, "scale_x": 100.0, "scale_y": 100.0}
+    step = EdgeStep(
+        number=lambda name: values.get(name, 0.0),
+        checked=lambda name: False,
+        pivot=lambda: (240.0, 135.0),
+        placed=(160.0, 90.0, 320.0, 180.0),
+    )
+    edges = PictureEdges((160.0, 90.0, 320.0, 180.0), (0.5, 1.5, 2.5, 3.5))
+    moved = transformed_edges(edges, step)
+    assert moved is not None
+    assert moved.soft == expected
+
+
 @pytest.mark.parametrize("outer", [100.0, 50.0])
 @pytest.mark.parametrize("nesting", ["scene", "group"])
 def test_a_filled_scene_is_the_same_as_one_with_a_full_size_picture(
@@ -620,9 +673,9 @@ def test_the_rim_of_the_placed_frame_is_not_blurred() -> None:
     外周の中身が、画質を落としたプレビューでだけ隣の画素へずれる
     """
     rect = (52.0, 29.0, 68.0, 38.0)
-    assert placed_edges(rect, rect, (64, 36)).soft == (0.5, 0.5)
+    assert placed_edges(rect, rect, (64, 36)).soft == (0.5,) * 4
     inner = (56.0, 31.0, 64.0, 36.0)
-    assert placed_edges(inner, rect, (64, 36)).soft == (0.625, 0.625)
+    assert placed_edges(inner, rect, (64, 36)).soft == (0.625,) * 4
 
 
 def test_a_work_area_is_not_taken_for_the_screen(gl_context: OffscreenGLContext) -> None:

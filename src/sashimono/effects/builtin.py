@@ -480,7 +480,7 @@ uniform int pivot_v;
 uniform bool move_to_pivot;
 uniform vec4 u_screen;     // 画面がバッファのどこか（画素、左・下・右・上） 幅 0 なら画面に出ない絵
 uniform vec4 u_edges;      // 絵の縁（画素、左・下・右・上）
-uniform vec2 u_edge_soft;  // 縁から何画素離れれば混ざっていないか
+uniform vec4 u_edge_soft;  // 縁から何画素離れれば混ざっていないか（並びは u_edges と同じ）
 uniform bool u_edge_known; // u_edges が確かに縁か（中身を動かしうる物の後は偽）
 
 // 支点からの位置を、回す前・拡大する前へ戻す
@@ -534,15 +534,15 @@ vec2 on_screen_edge(vec2 pixel, vec2 low, vec2 high, vec2 zoom, vec2 spread) {
     vec2 near = 0.5 / zoom;
     // 寄せうるのは端から縁の幅の内だけ 画面のほとんどの画素はここで抜ける 抜けずに探すと
     // 4K で拡大した絵 1 枚あたり 0.25ms 遅くなる（#493）
-    vec2 band = near + max(u_edge_soft, vec2(0.5)) + 1.0 + spread;
+    vec2 band = near + max(max(u_edge_soft.xy, u_edge_soft.zw), vec2(0.5)) + 1.0 + spread;
     if (all(greaterThan(pixel, low + band)) && all(lessThan(pixel, high - band))) return pixel;
     vec2 low_line = floor(low + near);
     vec2 high_line = ceil(high - near);
     // 角では、もう片方の向きに寄せた先の列（行）で透明かどうかを見る 寄せる前の列は縁の外に
     // 掛かっていることがあり、角の 1 画素だけが暗く残る 画素の真ん中へそろえてから挟む
     // 半端な位置の縁から測っただけでは、塗られていない列（行）に乗る
-    vec2 first_clear = clear_of(u_edges.xy, u_edge_soft);
-    vec2 last_clear = max(-clear_of(-u_edges.zw, u_edge_soft), first_clear);
+    vec2 first_clear = clear_of(u_edges.xy, u_edge_soft.xy);
+    vec2 last_clear = max(-clear_of(-u_edges.zw, u_edge_soft.zw), first_clear);
     vec2 inside = clamp(pixel, first_clear, last_clear);
     vec2 moved = pixel;
     for (int i = 0; i < 2; ++i) {
@@ -557,7 +557,7 @@ vec2 on_screen_edge(vec2 pixel, vec2 low, vec2 high, vec2 zoom, vec2 spread) {
         );
         float down = max(
             inward(
-                at, axis, -1.0, high[i], u_edges[i + 2], u_edge_soft[i], zoom[i], spread[i],
+                at, axis, -1.0, high[i], u_edges[i + 2], u_edge_soft[i + 2], zoom[i], spread[i],
                 u_edge_known
             ),
             inward(pixel, axis, -1.0, high[i], high_line[i], 0.5, zoom[i], spread[i], false)

@@ -409,7 +409,7 @@ class EffectProcessor:
         edges = self._edges
         whole = (0.0, 0.0, float(self.width), float(self.height))
         program.set_vec4("u_edges", whole if edges is None else edges.box)
-        program.set_vec2("u_edge_soft", (0.5, 0.5) if edges is None else edges.soft)
+        program.set_vec4("u_edge_soft", (0.5,) * 4 if edges is None else edges.soft)
         program.set_bool("u_edge_known", edges is not None and edges.known)
 
     def _screen_before(
@@ -434,7 +434,7 @@ class EffectProcessor:
             if definition.screen_before is None:
                 return (0.0, 0.0, 0.0, 0.0)
             following.append((definition, effect))
-        screen: PictureEdges | None = PictureEdges(self._screen, (0.5, 0.5))
+        screen: PictureEdges | None = PictureEdges(self._screen, (0.5, 0.5, 0.5, 0.5))
         for definition, effect in reversed(following):
             if screen is None or definition.screen_before is None:
                 break
