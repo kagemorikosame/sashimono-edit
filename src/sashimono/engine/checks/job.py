@@ -86,8 +86,8 @@ class CheckRequest:
     #: 調べ始めたときに開いていたシーン（ID） メインなら ``None`` 結果を返すときに添える
     #: 返す時点のシーンを添えると、待つ間に人が別のシーンを開いたとき取り違える
     scene: str | None = None
-    #: 重なって鳴る音を組に分けても測るか（#494） 音量をそろえるときだけ
-    #: 組の数だけ手間と場所が増える
+    #: 組に分け、リミッターの見る山も測るか（#494 重なり・定位・トラックの音量）
+    #: 音量をそろえるときだけ 組の数だけ手間と場所が増える
     separate: bool = False
 
 
@@ -499,14 +499,16 @@ def _check_timeline(
                 if renderer is not None and progress.video is not None
                 else None
             )
-            sound = sounds = None
+            sound = sounds = detected = None
             if mixer is not None and lanes is not None:
-                sound, sounds = mixer.render_frames_apart(frame, 1, lanes.lane_of, lanes.count)
+                sound, sounds, detected = mixer.render_frames_apart(
+                    frame, 1, lanes.lane_of, lanes.count
+                )
             elif mixer is not None:
                 sound = mixer.render_frames(frame, 1)
             with progress.lock:
-                if lanes is not None and sounds is not None:
-                    lanes.add(sounds)
+                if lanes is not None and sounds is not None and detected is not None:
+                    lanes.add(sounds, detected)
                 if luma is not None and progress.video is not None:
                     progress.video.add(frame, luma)
                 if sound is not None and progress.audio is not None:

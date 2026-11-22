@@ -6,6 +6,10 @@ AI の ``normalize_loudness`` と人の〔音量を基準にそろえる…〕�
 0 dBFS を越えて割れる（実物の話し声に合成の BGM で 1.097） そこで組ごとに測った手がかり
 （:class:`~sashimono.engine.checks.loudness.LoudnessLane`）から、和の越えない所までリミッターの
 上限を一緒に下げる 下げた分も、本人の設定の抑える深さに数える
+
+リミッターはトラックの音量と定位の前に掛かる 深さと抑えた後の音量は、その所の山と、クリップごとに
+実際に置ける上限で数える 混ぜた後の音で数えると、音量 -20 dB のトラックが -20 dBFS で潰れているのに
+届いたと答える
 """
 
 from __future__ import annotations
@@ -14,7 +18,13 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
-from sashimono.ai.auto_fix import clips_overlap, has_limiter, limited_peak, loudness_predictor
+from sashimono.ai.auto_fix import (
+    clips_overlap,
+    has_limiter,
+    limited_peak,
+    loudness_predictor,
+    measures_apart,
+)
 from sashimono.core.mixing import LoudnessGain, loudness_gain
 from sashimono.core.model import Clip, Track
 from sashimono.engine.checks.loudness import Dynamics, Headroom
@@ -39,7 +49,7 @@ class LoudnessPlan:
     lowered: float = 0.0
     #: 重なって鳴る音の和が越えないと見積もった所（dBFS） 見積もれなければ ``None``
     held_db: float | None = None
-    #: 重なって鳴るのに組に分けて測れなかったか リミッターの効いた後の音量を言い切れない
+    #: 分けて測る形（重なり・定位・トラックの音量）なのに測れなかったか 抑えた後の音量を言い切れない
     unchecked: bool = False
 
 
@@ -56,10 +66,12 @@ def plan_loudness(
 
     重なって鳴るときは、上限に収めて届く形、割れずに届く形、割れずに一番大きい形の順に取る
     どれも上限を下げずに掛けた音より小さくなるなら下げない（届かない分と割れを知らせるに留める）
+    抑えて掛けた音が、抑えずに掛けた音より小さくなるなら抑えない
     """
     assert report.loudness is not None
     measured, peak = report.loudness, report.peak_db
     clips = [clip for _, clip in targets]
+    apart = measures_apart(targets, ceiling)
     plain = loudness_gain(
         clips,
         measured=measured,
@@ -68,33 +80,72 @@ def plan_loudness(
         ceiling=ceiling,
         squeeze=squeeze,
         raise_ceiling=raise_ceiling,
-        predict=loudness_predictor(report, ceiling, clips),
+        predict=None if apart else loudness_predictor(report, ceiling, clips),
     )
-    if not clips_overlap(clips) or peak is None or squeeze <= 0:
+    if not apart or peak is None or squeeze <= 0:
         return LoudnessPlan(plain)
     dynamics = report.dynamics
     if dynamics is None or not dynamics.lanes:
         return LoudnessPlan(plain, unchecked=True)
-    loudest_lane = dynamics.loudest_lane_db()
-    if loudest_lane > peak and (plain.squeeze_db > 0 or any(has_limiter(c) for c in clips)):
-        # リミッターに当たるのは組の山 逆相で重なると混ぜた山より高く、混ぜた山で深さを数えると
-        # 本人の設定より深く潰す
-        peak = loudest_lane
-        plain = loudness_gain(
-            clips,
-            measured=measured,
-            peak_db=peak,
-            target=target,
-            ceiling=ceiling,
-            squeeze=squeeze,
-            raise_ceiling=raise_ceiling,
-        )
-    if (
-        plain.squeeze_db <= 0
-        or raise_ceiling is not None
-        # トラックの音量でリミッターの上限の範囲を越えると、組の山が止まる所を言えない
-        or limited_peak(targets, ceiling) > ceiling + _REACHED_LU
-    ):
+    installed = any(has_limiter(clip) for clip in clips)
+    if plain.squeeze_db <= 0 and not installed:
+        # 混ぜた山が上限に当たらない リミッターを積まないので、掛けた量どおりに動く
+        return LoudnessPlan(plain)
+    plan = _limited(
+        dynamics,
+        targets,
+        measured=measured,
+        # 深さは、混ぜた山と、一番深く絞るリミッターの高い方で数える
+        peak=max(peak, ceiling + dynamics.deepest_db(ceiling)),
+        target=target,
+        ceiling=ceiling,
+        squeeze=squeeze,
+        raise_ceiling=raise_ceiling,
+    )
+    if installed:
+        return plan
+    free = loudness_gain(
+        clips,
+        measured=measured,
+        peak_db=peak,
+        target=target,
+        ceiling=ceiling,
+        raise_ceiling=raise_ceiling,
+    )
+    after = plan.decided.limited_lufs
+    if after is None:
+        after = measured + plan.decided.gain_db
+    # 低いトラックの上限は 0 dBFS で頭打ちになり、深さの中では上げられないことがある
+    # 抑えて下げるより、抑えずに山の手前まで上げる
+    return LoudnessPlan(free) if after < measured + free.gain_db else plan
+
+
+def _limited(
+    dynamics: Dynamics,
+    targets: Sequence[tuple[Track, Clip]],
+    *,
+    measured: float,
+    peak: float,
+    target: float,
+    ceiling: float,
+    squeeze: float,
+    raise_ceiling: float | None,
+) -> LoudnessPlan:
+    """リミッターを積む（か、もう積んである）ときの形 ``peak`` は深さを数える山"""
+    clips = [clip for _, clip in targets]
+    overlap = clips_overlap(clips)
+    plain = loudness_gain(
+        clips,
+        measured=measured,
+        peak_db=peak,
+        target=target,
+        ceiling=ceiling,
+        squeeze=squeeze,
+        raise_ceiling=raise_ceiling,
+        # 重ならなければ上限を下げる要が無いので、ここで見込んで掛ける
+        predict=None if overlap else (lambda gain: dynamics.limited_loudness(gain, ceiling)),
+    )
+    if plain.squeeze_db <= 0 or raise_ceiling is not None or not overlap:
         return LoudnessPlan(plain)
     loudest = dynamics.limited_loudness(plain.gain_db, ceiling)
     if loudest is None:
@@ -103,6 +154,9 @@ def plan_loudness(
     if loudest < target - _REACHED_LU and "peak" not in plain.limited_by:
         plain = replace(plain, limited_by=(*plain.limited_by, "peak"))
     chosen = LoudnessPlan(plain)
+    if limited_peak(targets, ceiling) > ceiling + _REACHED_LU:
+        # トラックの音量でリミッターの上限の範囲を越えると、組の山が止まる所を言えない
+        return chosen
     headroom = Headroom(dynamics.lanes)
     for top in dict.fromkeys((min(ceiling, _NO_CLIP_DB), _NO_CLIP_DB)):
         found = _within(

@@ -56,6 +56,16 @@ def limiter_history(values: dict[str, float]) -> float:
     return _release_seconds(values) * _HISTORY_TIMES
 
 
+def ceiling_before_fader(ceiling_db: float, fader_db: float) -> float:
+    """後に掛かる倍率 ``fader_db`` の分を引いた、リミッターの欄に置ける上限
+
+    置く所と、抑えた後の見積もり（#494）が同じ式を通る 範囲で止まると、書き出しで止まる所は
+    頼んだ上限から離れる
+    """
+    low, high = CEILING_DB_RANGE
+    return float(np.clip(ceiling_db - fader_db, low, high))
+
+
 def reduction(wanted: np.ndarray, interval: float, release: float) -> np.ndarray:
     """絞りたい量の並び（``interval`` 秒おき）を、戻る速さ ``release`` 秒で均した絞る量
 

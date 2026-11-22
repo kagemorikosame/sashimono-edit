@@ -39,6 +39,7 @@ from sashimono.ai.auto_fix import (
     limited_peak,
     limiter_commands,
     limiters_match,
+    measures_apart,
     picture_clip,
     plan_color_fix,
     plan_noise_fix,
@@ -7515,8 +7516,8 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
         start=start,
         end=end,
         scene=str(host.active_scene) if host.active_scene is not None else None,
-        # 重なって鳴る音は組ごとにも測る（#494） リミッターはクリップごとに掛かる
-        separate=squeeze > 0 and clips_overlap([clip for _, clip in targets]),
+        # リミッターの見る所も測る（#494） クリップごとに、トラックの音量と定位の前で掛かる
+        separate=squeeze > 0 and measures_apart(targets, ceiling),
     )
     host.request_check(request)
 

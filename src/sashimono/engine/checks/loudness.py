@@ -27,7 +27,7 @@ from itertools import pairwise
 
 import numpy as np
 
-from sashimono.effects.limiter import DEFAULT_RELEASE_MS, reduction
+from sashimono.effects.limiter import DEFAULT_RELEASE_MS, ceiling_before_fader, reduction
 
 __all__ = [
     "ABSOLUTE_GATE",
@@ -126,6 +126,8 @@ def channel_weights(channels: int) -> np.ndarray:
 #: 100 ms の区切りを、抑えた後の見積もりのためにいくつへ割って覚えるか（1 つ 5 ms #494）
 #: 戻る速さ（150 ms）より十分に短く、3 時間の作品でも 17 MB に収まる
 _FINE_PARTS = 20
+#: 1 秒あたりの区切りの数
+_FINE_RATE = _FINE_PARTS * 10
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -138,6 +140,25 @@ class LoudnessLane:
     starts: tuple[float, ...] = ()
     #: 100 ms に満たない末尾の、5 ms ごとの山 音量の窓には入らないが、書き出す音には入る
     tail: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    #: リミッターが見る山（トラックの音量と定位の前 末尾も含む） ``peak`` は掛けた後の山なので、
+    #: 絞る量はこちらで読む（片側へ振ると、振った先に無い側の山で両方が絞られる）
+    detected: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    #: 組のクリップごとの、リミッターの後に掛かる倍率（dB ``starts`` と同じ並び）
+    faders: tuple[float, ...] = ()
+
+    def spans(self) -> list[tuple[int, int, float]]:
+        """``detected`` の中でクリップごとの区切りと、その倍率"""
+        count = len(self.detected)
+        heads = [min(count, max(0, round(start * _FINE_RATE))) for start in self.starts[1:]]
+        found = zip([0, *heads], [*heads, count], self.faders, strict=True)
+        return [(low, high, fader) for low, high, fader in found if high > low]
+
+    def ceilings(self, ceiling_db: float) -> np.ndarray:
+        """区切りごとの、リミッターの欄に入る上限（倍率）"""
+        found = np.ones(len(self.detected))
+        for low, high, fader in self.spans():
+            found[low:high] = 10.0 ** (ceiling_before_fader(ceiling_db, fader) / 20.0)
+        return found
 
     @property
     def peaks(self) -> np.ndarray:
@@ -190,10 +211,19 @@ class Dynamics:
     #: 組どうしの掛け合わせ（組, 組, 5 ms ごとの K 特性を掛けた音の積の和） 相殺の具合を表す
     crosses: tuple[tuple[int, int, np.ndarray], ...] = ()
 
-    def loudest_lane_db(self) -> float:
-        """組の中で一番高い山（dBFS） 逆相で重なると、混ぜた山より高い"""
-        loudest = max((float(lane.peaks.max()) for lane in self.lanes), default=0.0)
-        return 20.0 * math.log10(max(loudest, 1e-12))
+    def deepest_db(self, ceiling_db: float) -> float:
+        """掛ける量 0 dB で、一番深く絞るリミッターの量（dB） どれも当たらなければ負
+
+        混ぜた山からは読めない 逆相・定位・トラックの音量で、リミッターの見る山と止まる所が違う
+        """
+        deepest = -math.inf
+        for lane in self.lanes:
+            for low, high, fader in lane.spans():
+                top = float(lane.detected[low:high].max())
+                if top > 0.0:
+                    local = ceiling_before_fader(ceiling_db, fader)
+                    deepest = max(deepest, 20.0 * math.log10(top) - local)
+        return deepest
 
     def limited_loudness(
         self, gain_db: float, ceiling_db: float, starts: Sequence[float] = ()
@@ -210,7 +240,11 @@ class Dynamics:
         ratio = 10.0 ** (gain_db / 20.0)
         ceiling = 10.0 ** (ceiling_db / 20.0) / ratio
         if self.lanes:
-            kept_by = [_kept(lane.peak, ceiling, lane.starts) for lane in self.lanes]
+            count = len(self.energy)
+            kept_by = [
+                _kept(lane.detected[:count], lane.ceilings(ceiling_db)[:count] / ratio, lane.starts)
+                for lane in self.lanes
+            ]
             summed = np.zeros(len(self.energy))
             for lane, kept in zip(self.lanes, kept_by, strict=True):
                 summed += lane.energy * kept * kept
@@ -229,7 +263,7 @@ class Dynamics:
         )
 
 
-def _kept(peak: np.ndarray, ceiling: float, starts: Sequence[float]) -> np.ndarray:
+def _kept(peak: np.ndarray, ceiling: float | np.ndarray, starts: Sequence[float]) -> np.ndarray:
     """区切りごとに、リミッターの後へ残る割合 ``starts`` で絞る量の持ち越しを切る"""
     wanted = 1.0 - np.minimum(1.0, ceiling / np.maximum(peak, 1e-12))
     kept = np.ones(len(wanted))
@@ -244,10 +278,14 @@ def _kept(peak: np.ndarray, ceiling: float, starts: Sequence[float]) -> np.ndarr
 
 
 class FineSums:
-    """サンプルごとの値を、:class:`Dynamics` と同じ境目の 5 ms ごとの和にして覚える"""
+    """サンプルごとの値を、:class:`Dynamics` と同じ境目の 5 ms ごとに畳んで覚える
 
-    def __init__(self, step: int) -> None:
+    ``fold`` は畳み方 和（既定）か、山なら ``np.maximum``
+    """
+
+    def __init__(self, step: int, fold: np.ufunc = np.add) -> None:
         self._step = step
+        self._fold = fold
         self._cuts = np.arange(_FINE_PARTS) * step // _FINE_PARTS
         self._partial = np.zeros(0)
         self._found: list[np.ndarray] = []
@@ -257,7 +295,7 @@ class FineSums:
         whole = len(joined) // self._step * self._step
         if whole:
             rows = joined[:whole].reshape(-1, self._step)
-            summed = np.add.reduceat(rows, self._cuts, axis=1)
+            summed = self._fold.reduceat(rows, self._cuts, axis=1)
             self._found.append(summed.ravel().astype(np.float32))
         self._partial = joined[whole:]
 
@@ -267,6 +305,14 @@ class FineSums:
         if len(self._found) > 1:
             self._found = [np.concatenate(self._found)]
         return self._found[0]
+
+    def tail(self) -> np.ndarray:
+        """100 ms に満たない末尾の分"""
+        count = len(self._partial)
+        if not count:
+            return np.zeros(0, dtype=np.float32)
+        cuts = self._cuts[self._cuts < count]
+        return np.asarray(self._fold.reduceat(self._partial, cuts), dtype=np.float32)
 
 
 class LoudnessMeter:

@@ -16,6 +16,7 @@ from sashimono.ai.auto_fix import (
     FITTED_CEILING,
     clips_overlap,
     limited_ceiling,
+    limiter_ceiling,
     limiter_commands,
     limiters_match,
     loudness_predictor,
@@ -756,7 +757,8 @@ class TestOverlappingSounds:
         assert meters is not None
         mixer = AudioMixer(project)
         try:
-            mixed, parts = mixer.render_frames_apart(30, 5, meters.lane_of, meters.count)
+            mixed, parts, seen = mixer.render_frames_apart(30, 5, meters.lane_of, meters.count)
+            assert seen == pytest.approx(np.abs(parts).max(axis=2), abs=1e-6)
             assert meters.count == 2
             assert parts.sum(axis=0) == pytest.approx(mixed, abs=1e-6)
             assert mixed == pytest.approx(mixer.render_frames(30, 5), abs=1e-6)
@@ -908,6 +910,11 @@ class TestTheSumOfTheLanes:
         base = _peaky() * 0.98
         project, targets = _stacked(tmp_path, base, base * -0.5)
         report = _checked(project)
+        # もう積んである形で見る 積んでいなければ、抑えて相殺するより抑えない方を選ぶ
+        limiting = project
+        for command in limiter_commands(targets, -1.0):
+            limiting = command.apply(limiting)
+        targets = [(track, track.clips[0]) for track in limiting.timeline.tracks]
         assert report.loudness is not None
         depth = 9.0
         plan = plan_loudness(
@@ -971,3 +978,63 @@ class TestLeftLimiters:
         path = ParamPath.of_effect(clip.id, limiter.id, "ceiling")
         work.host.apply_commands([SetParam(path, AnimatedValue(static=-3.5))], "人が直した")
         assert not redoable_limiters([(work.voice_track, work.clip(work.voice.id))], -1.0)
+
+
+class TestTheLimiterComesBeforeTheFader:
+    """リミッターはトラックの音量と定位の前に掛かる（PR #495 の 3 回目のレビュー）"""
+
+    @pytest.mark.parametrize("installed", [False, True])
+    @pytest.mark.parametrize("overlap", [False, True])
+    @pytest.mark.parametrize("pan", [0.0, 0.9])
+    @pytest.mark.parametrize("volume", [-20.0, -6.0, 0.0, 3.0])
+    def test_the_answer_is_what_is_exported(
+        self, tmp_path: Path, volume: float, pan: float, overlap: bool, installed: bool
+    ) -> None:
+        """後の音で見積もると、届いたと答えた音が小さく書き出され、本人の深さも越えて潰す"""
+        voice = _peaky() * np.array([0.98, 0.098])
+        sounds = [voice, _music(0.02)] if overlap else [voice]
+        project, targets = _stacked(tmp_path, *sounds)
+        first = replace(project.timeline.tracks[0], volume_db=volume, pan=pan)
+        tracks = (first, *project.timeline.tracks[1:])
+        project = project.with_timeline(replace(project.timeline, tracks=tracks))
+        bare = project
+        targets = [(track, track.clips[0]) for track in project.timeline.tracks]
+        if installed:
+            for command in limiter_commands(targets, -1.0):
+                project = command.apply(project)
+            targets = [(track, track.clips[0]) for track in project.timeline.tracks]
+        report = _checked(bare)
+        assert report.loudness is not None
+        depth = 12.0
+        plan = plan_loudness(
+            report,
+            targets,
+            target=report.loudness + 5.0,
+            ceiling=-1.0,
+            squeeze=depth,
+            raise_ceiling=None,
+        )
+        assert not plan.unchecked
+        gain = plan.decided.gain_db
+        commands = gain_commands([clip for _, clip in targets], gain)
+        squeezed = plan.decided.squeeze_db >= 0.05
+        if squeezed:
+            commands += limiter_commands(targets, -1.0, plan.lowered)
+        changed = project
+        for command in commands:
+            changed = command.apply(changed)
+        said = plan.decided.limited_lufs
+        if said is None:
+            said = report.loudness + gain
+        assert _meter(_mixed(changed)).integrated() == pytest.approx(said, abs=0.25)
+        if not squeezed:
+            return
+        # 本物のリミッターが潰す量 数えた深さと、本人の設定の深さに収まる
+        cuts = [
+            float(20 * np.log10(np.abs(sound).max()))
+            + gain
+            - limiter_ceiling(track, -1.0 - plan.lowered)
+            for sound, (track, _clip) in zip(sounds, targets, strict=True)
+        ]
+        assert max(cuts) <= plan.decided.squeeze_db + 0.1
+        assert plan.decided.squeeze_db <= depth + 0.1

@@ -57,8 +57,9 @@ RAW_BUDGET_BYTES = 256 * 1024 * 1024
 _TAPE_SLACK = 2 * HISTORY_WINDOW
 
 
-#: 混ぜた音の内訳の受け皿 クリップの組と、組ごとの音（:meth:`AudioMixer.render_frames_apart`）
-type _Apart = tuple[Mapping[ClipId, int], np.ndarray]
+#: 混ぜた音の内訳の受け皿 クリップの組・組ごとの音・組ごとの音量と定位の前の山
+#: （:meth:`AudioMixer.render_frames_apart`）
+type _Apart = tuple[Mapping[ClipId, int], np.ndarray, np.ndarray]
 
 
 class AudioMixer:
@@ -159,8 +160,9 @@ class AudioMixer:
 
     def render_frames_apart(
         self, start_frame: int, frame_count: int, lane_of: Mapping[ClipId, int], lanes: int
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """:meth:`render_frames` と同じ音と、その内訳（組, サンプル, チャンネル）
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """:meth:`render_frames` と同じ音と、その内訳（組, サンプル, チャンネル）と、組ごとの
+        トラックの音量・定位の前の山（組, サンプル クリップの最後のリミッターが見る所）
 
         音量の見積もり（#494）が使う 組ごとに混ぜ直すと、その回数だけ読むので待ち時間が延びる
         """
@@ -170,10 +172,11 @@ class AudioMixer:
         start = _frame_to_sample(start_frame, rate, self.sample_rate)
         count = _frame_to_sample(start_frame + frame_count, rate, self.sample_rate) - start
         sounds = np.zeros((lanes, count, self.channels), dtype=np.float32)
+        detected = np.zeros((lanes, count), dtype=np.float32)
         mixed = self._render_timeline(
-            self._project.timeline, start, count, depth=0, apart=(lane_of, sounds)
+            self._project.timeline, start, count, depth=0, apart=(lane_of, sounds, detected)
         )
-        return mixed, sounds
+        return mixed, sounds, detected
 
     def render(self, start_sample: int, count: int) -> np.ndarray:
         """``[start_sample, start_sample + count)`` のミックス結果を返す
@@ -271,6 +274,9 @@ class AudioMixer:
             out[offset : offset + len(samples)] += placed
             if apart is not None and (lane := apart[0].get(clip.id)) is not None:
                 apart[1][lane, offset : offset + len(samples)] += placed
+                # 音量と定位の前 リミッターは左右の大きい方を見て両方を同じだけ絞る
+                seen = apart[2][lane, offset : offset + len(samples)]
+                np.maximum(seen, np.abs(samples).max(axis=1), out=seen)
 
     def _windowed(
         self,

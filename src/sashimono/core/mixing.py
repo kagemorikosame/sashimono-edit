@@ -508,6 +508,24 @@ def sounds_now(project: Project, track: Track, clip: Clip) -> bool:
     return clip.enabled and id(track) in _heard_tracks(project) and project.plays_sound(track, clip)
 
 
+def track_gain_db(track: Track) -> float:
+    """クリップのエフェクトの後に掛かる、トラックの音量と定位のいちばん大きい倍率（dB）
+
+    リミッターはクリップのエフェクトなので、その後のトラックの音量が山を動かす +6 dB のトラックで
+    上限 -1 dBFS に抑えても書き出しは +5 dBFS になる（PR #451 の CodeRabbit の指摘）
+    映像トラックは音量と定位を使わない（ミキサと同じ決まり）
+    """
+    if track.kind is TrackKind.VIDEO:
+        return 0.0
+    pan = min(1.0, max(-1.0, float(track.pan)))
+    if pan == 0.0:
+        return track.volume_db
+    angle = (pan + 1.0) * math.pi / 4.0
+    # 定電力パンは片側を最大 √2 倍（+3 dB）にする 中央の 0 では倍率 1
+    panned = math.sqrt(2.0) * max(math.cos(angle), math.sin(angle))
+    return track.volume_db + 20.0 * math.log10(panned)
+
+
 def audible_clips(project: Project) -> list[tuple[Track, Clip]]:
     """書き出しで音が鳴るクリップすべて（:func:`sounds_now` が真の物）"""
     heard = _heard_tracks(project)

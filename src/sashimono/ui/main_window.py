@@ -69,6 +69,7 @@ from sashimono.ai.auto_fix import (
     limited_peak,
     limiter_commands,
     limiters_match,
+    measures_apart,
     plan_color_fix,
     plan_noise_fix,
     raise_cap,
@@ -4989,7 +4990,7 @@ class MainWindow(QMainWindow):
             end=max(clip.timeline_end for clip in clips),
             scene=str(self._active_scene) if self._active_scene is not None else None,
             # 抑えないなら組の手がかりは使わない 測ると待ちだけが延びる（AI の道具と同じ）
-            separate=squeeze > 0 and clips_overlap(clips),
+            separate=squeeze > 0 and measures_apart(enabled, choice.ceiling),
         )
         self._pending_loudness = _PendingLoudness(
             request, project, tuple(enabled), choice.ceiling, squeeze, redo

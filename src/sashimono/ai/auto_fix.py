@@ -27,6 +27,7 @@ from sashimono.core.commands import (
     SetEffectEnabled,
     SetParam,
 )
+from sashimono.core.mixing import track_gain_db
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -42,7 +43,12 @@ from sashimono.core.model import (
 )
 from sashimono.effects import registry
 from sashimono.effects.audio import DENOISE_KIND, LIMITER_KIND
-from sashimono.effects.limiter import CEILING_DB_RANGE, DEFAULT_CEILING_DB, DEFAULT_RELEASE_MS
+from sashimono.effects.limiter import (
+    CEILING_DB_RANGE,
+    DEFAULT_CEILING_DB,
+    DEFAULT_RELEASE_MS,
+    ceiling_before_fader,
+)
 from sashimono.engine.audio.noise import QUIET_NOISE_DB, NoiseEstimate, estimate_noise
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.auto_color import (
@@ -73,6 +79,7 @@ __all__ = [
     "limiter_ceiling",
     "limiter_commands",
     "limiters_match",
+    "measures_apart",
     "picture_clip",
     "plan_color_fix",
     "plan_noise_fix",
@@ -104,22 +111,6 @@ def clips_overlap(clips: Sequence[Clip]) -> bool:
 #: 補間の行き過ぎ（back・elastic）を拾うため、キーフレームの間を何点で見るか 上限の山と谷は
 #: 区間の 1/32 より細かくは動かない
 _CURVE_SAMPLES = 32
-
-
-def track_gain_db(track: Track) -> float:
-    """クリップのエフェクトの後に掛かる、トラックの音量と定位のいちばん大きい倍率（dB）
-
-    リミッターはクリップのエフェクトなので、その後のトラックの音量が山を動かす +6 dB のトラックで
-    上限 -1 dBFS に抑えても書き出しは +5 dBFS になる（PR #451 の CodeRabbit の指摘）
-    映像トラックは音量と定位を使わない（ミキサと同じ決まり）
-    """
-    if track.kind is TrackKind.VIDEO:
-        return 0.0
-    pan = float(np.clip(track.pan, -1.0, 1.0))
-    angle = (pan + 1.0) * np.pi / 4.0
-    # 定電力パンは片側を最大 √2 倍（+3 dB）にする 中央の 0 では倍率 1
-    panned = 1.0 if pan == 0.0 else float(np.sqrt(2.0) * max(np.cos(angle), np.sin(angle)))
-    return track.volume_db + 20.0 * float(np.log10(panned))
 
 
 def _lowest_ceiling(effect: Effect) -> float:
@@ -184,8 +175,7 @@ def limiter_ceiling(track: Track, ceiling: float) -> float:
     トラックの倍率の分だけ下げる 範囲（-20〜0 dBFS）を越える分は収め切れないので、
     :func:`limited_peak` で書き出しの山を言い直す
     """
-    low, high = CEILING_DB_RANGE
-    return float(np.clip(ceiling - track_gain_db(track), low, high))
+    return ceiling_before_fader(ceiling, track_gain_db(track))
 
 
 #: 重なる分だけ下げて置いた上限の控え（#494） 欄には無く、音にも効かない 上限がこの値のままなら
@@ -227,6 +217,22 @@ def redoable_limiters(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> 
                 return frozenset()
         found.add(active[0].id)
     return frozenset(found)
+
+
+def measures_apart(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> bool:
+    """混ぜた後の音からは、リミッターの抑える量が読めない形か（#494）
+
+    重なって鳴る・定位を振っている・トラックの音量で止まる所が頼んだ上限と違う のどれか
+    その形だけ、クリップの組とリミッターの前の山を分けて測る（手間が増える）
+    """
+    if clips_overlap([clip for _, clip in targets]):
+        return True
+    for track, _clip in targets:
+        if track.kind is not TrackKind.VIDEO and track.pan != 0.0:
+            return True
+        if abs(limiter_ceiling(track, ceiling) + track_gain_db(track) - ceiling) > 1e-6:
+            return True
+    return False
 
 
 def loudness_predictor(
