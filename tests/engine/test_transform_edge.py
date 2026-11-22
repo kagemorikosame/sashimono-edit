@@ -466,6 +466,57 @@ def test_a_broken_number_does_not_stop_the_drawing(
     assert _render(_project(clip, media), gl_context).shape == (HEIGHT, WIDTH, 4)
 
 
+@pytest.mark.parametrize(
+    ("inset", "expected"), [(0.2, 204), (0.4, 153)], ids=["fifth", "two_fifths"]
+)
+def test_a_move_alone_keeps_the_exact_fraction(
+    gl_context: OffscreenGLContext, tmp_path: Path, inset: float, expected: int
+) -> None:
+    """拡大率 100 で端数だけ動かした縁は元から正しい濃さ 寄せると、読み込んだ動きの端が濃くなる"""
+    media = _png(tmp_path, _plain(100, 60))
+    clip = _placed(_media_clip(media), pos_x=-190.0 + inset)
+    assert abs(int(_render(_project(clip, media), gl_context)[135, 0, 3]) - expected) <= 2
+
+
+@pytest.mark.parametrize("scale", [100.0, 120.0, 170.0, 300.0])
+@pytest.mark.parametrize("shift", [0.0, -0.8, 0.3])
+def test_a_soft_tail_at_the_edge_is_not_taken_for_an_edge(
+    gl_context: OffscreenGLContext, scale: float, shift: float
+) -> None:
+    """ぼかしや粒の裾を縁と読むと、画面の端を横切る粒の端の 1 画素が濃くなり、YMM4 の書き出しから
+    離れる（実物のテンプレートの雪で、違った画素の差が 31.75 から 36.75 へ開いた）
+    """
+    with gl_context:
+        compositor = Compositor(WIDTH, HEIGHT)
+        processor = EffectProcessor(WIDTH, HEIGHT, compositor.quad)
+        # 画面の左端が入力のどこに当たるか そこから内へ濃くなる裾を置く
+        border = round(WIDTH / 2 + (-WIDTH / 2 - shift) * 100.0 / scale)
+        pixels = _plain(WIDTH, HEIGHT, (255, 255, 255, 0))
+        for step, alpha in enumerate((12, 60, 130, 190, 230, 250)):
+            pixels[:, border + step, 3] = alpha
+        pixels[:, border + 6 : border + 40, 3] = 255
+        texture = Texture.from_array(pixels)
+        effects = (
+            # 絵を動かしうる物の後 置いたときの縁はもう当てにならない（粒・ぼかし）
+            registry.require("blur").create(radius=0.0),
+            registry.require("transform").create(scale=scale, pos_x=shift),
+        )
+        seen = []
+        for screen in (None, OFF_SCREEN):
+            result = processor.apply(
+                texture, effects, frame=0, fps=30.0, source_rect=FULL_RECT, screen=screen
+            )
+            compositor.begin((0.0, 0.0, 0.0, 0.0))
+            compositor.draw_handle(
+                result.color, Placement(0.0, 0.0, float(WIDTH), float(HEIGHT)), flip=False
+            )
+            seen.append(compositor.read(straight=True))
+        texture.release()
+        processor.release()
+        compositor.release()
+    assert np.array_equal(*seen), "ぼけた裾の読む位置が動いた"
+
+
 def test_the_rim_of_the_placed_frame_is_not_blurred() -> None:
     """縮めて置いた枠の縁までなまったと見積もると、画面の端から少しはみ出した絵（301%）の
     外周の中身が、画質を落としたプレビューでだけ隣の画素へずれる

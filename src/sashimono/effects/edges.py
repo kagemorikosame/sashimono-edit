@@ -38,6 +38,9 @@ class PictureEdges:
     box: _Box
     #: 縁から何画素離れれば、透明とも中身とも混ざっていないか（横・縦）
     soft: tuple[float, float]
+    #: 確かにここが縁か 中身を動かしうるエフェクト（粒・ぼかし）の後は偽 偽なら、内側の
+    #: 濃さが平らな所だけを縁と読む（ぼけた裾を縁と読むと、粒の端が濃くなる）
+    known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +80,7 @@ def placed_edges(box: _Box, rect: _Box, source: tuple[int, int]) -> PictureEdges
 def cropped_edges(edges: PictureEdges, step: EdgeStep) -> PictureEdges:
     """切り抜きで内へ入った縁 ぼかして切った縁は本物の濃淡なので追わない"""
     if step.number("feather") > 0.0:
-        return edges
+        return replace(edges, known=False)
     left, bottom, right, top = edges.box
     box = (
         left + max(step.number("left"), 0.0),
@@ -145,7 +148,7 @@ def transformed_edges(edges: PictureEdges, step: EdgeStep) -> PictureEdges | Non
         )
         spread = (1.0 - 1.0 / count) / (2.0 * zoom[axis])
         soft.append(max((reach + spread) * zoom[axis], 0.5))
-    return PictureEdges(box, (soft[1], soft[0]) if sideways else (soft[0], soft[1]))
+    return replace(edges, box=box, soft=(soft[1], soft[0]) if sideways else (soft[0], soft[1]))
 
 
 def _clear_of(edge: float, soft: float) -> float:

@@ -481,6 +481,7 @@ uniform bool move_to_pivot;
 uniform vec4 u_screen;     // 画面がバッファのどこか（画素、左・下・右・上） 幅 0 なら画面に出ない絵
 uniform vec4 u_edges;      // 絵の縁（画素、左・下・右・上）
 uniform vec2 u_edge_soft;  // 縁から何画素離れれば混ざっていないか
+uniform bool u_edge_known; // u_edges が確かに縁か（中身を動かしうる物の後は偽）
 
 // 支点からの位置を、回す前・拡大する前へ戻す
 vec2 unscaled(vec2 pixel, mat2 turn, vec2 zoom) { return turn * pixel / zoom; }
@@ -496,11 +497,15 @@ vec2 clear_of(vec2 edge, vec2 soft_edge) { return ceil(edge + soft_edge - 0.5 - 
 // 画面の端に掛かった縁 1 本のために、読む位置を axis の向きへどれだけ内へ寄せるか
 // side は内の向き（1 か -1） border は画面の端が入力のどこに当たるか
 // 寄せるのは、縁の外が透明で内に絵があるときだけ 絵の続きを寄せると外周の中身がずれる
+// known が偽（画素から見つけた縁）なら、内の 2 画素の濃さが同じときだけ ぼかしや粒の裾は
+// 内へ向かって濃くなる そこを縁と読むと、画面の端を横切る粒の端が濃くなる
+// 拡大率 100 の軸では寄せない 端数だけ動かした縁は補間の値がそのまま正しい濃さ
 // 画面の端から半画素までは少しずつ寄せる 0 か 1 かで決めると、ズームの終わりで外周が跳ぶ
 float inward(
     vec2 pixel, vec2 axis, float side,
-    float border, float edge, float soft_edge, float zoom, float spread
+    float border, float edge, float soft_edge, float zoom, float spread, bool known
 ) {
+    if (abs(zoom - 1.0) < 1e-5 && soft_edge <= 0.5) return 0.0;
     float inset = (edge - border) * side * zoom;
     if (inset >= 0.5) return 0.0;
     float inner = clear_of(vec2(edge * side), vec2(soft_edge)).x;
@@ -509,7 +514,9 @@ float inward(
     float outer = floor(edge * side - soft_edge - 0.5 + 0.001) + 0.5;
     vec2 across = pixel * (vec2(1.0) - axis);
     if (alpha_at(across + axis * outer * side) > 0.0) return 0.0;
-    if (alpha_at(across + axis * inner * side) <= 0.0) return 0.0;
+    float solid = alpha_at(across + axis * inner * side);
+    if (solid <= 0.0) return 0.0;
+    if (!known && abs(alpha_at(across + axis * (inner + 1.0) * side) - solid) > 0.01) return 0.0;
     return (inner + spread - at) * clamp((0.5 - inset) / 0.49, 0.0, 1.0);
 }
 
@@ -533,12 +540,18 @@ vec2 on_screen_edge(vec2 pixel, vec2 low, vec2 high, vec2 zoom, vec2 spread) {
         vec2 axis = i == 0 ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
         vec2 at = i == 0 ? vec2(pixel.x, inside.y) : vec2(inside.x, pixel.y);
         float up = max(
-            inward(at, axis, 1.0, low[i], u_edges[i], u_edge_soft[i], zoom[i], spread[i]),
-            inward(pixel, axis, 1.0, low[i], low_line[i], 0.5, zoom[i], spread[i])
+            inward(
+                at, axis, 1.0, low[i], u_edges[i], u_edge_soft[i], zoom[i], spread[i],
+                u_edge_known
+            ),
+            inward(pixel, axis, 1.0, low[i], low_line[i], 0.5, zoom[i], spread[i], false)
         );
         float down = max(
-            inward(at, axis, -1.0, high[i], u_edges[i + 2], u_edge_soft[i], zoom[i], spread[i]),
-            inward(pixel, axis, -1.0, high[i], high_line[i], 0.5, zoom[i], spread[i])
+            inward(
+                at, axis, -1.0, high[i], u_edges[i + 2], u_edge_soft[i], zoom[i], spread[i],
+                u_edge_known
+            ),
+            inward(pixel, axis, -1.0, high[i], high_line[i], 0.5, zoom[i], spread[i], false)
         );
         moved[i] += up - down;
     }

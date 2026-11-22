@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from OpenGL import GL
 
@@ -345,6 +345,7 @@ class EffectProcessor:
             whole = (0.0, 0.0, float(target.width), float(target.height))
             program.set_vec4("u_edges", whole if edges is None else edges.box)
             program.set_vec2("u_edge_soft", (0.5, 0.5) if edges is None else edges.soft)
+            program.set_bool("u_edge_known", edges is not None and edges.known)
             program.set_float("u_pixel_scale", self.pixel_scale)
             program.bind_texture("u_texture", source_buffer.color, unit=0)
             program.bind_texture("u_source", self._source.color, unit=1)
@@ -359,6 +360,9 @@ class EffectProcessor:
         self._move_edges(definition, effect, frame)
         self._grow_object(definition, effect, frame)
         if not definition.keeps_content:
+            if self._edges is not None and definition.moves_edges is None:
+                # 縁をどう動かしたか分からない物（粒・ぼかし）の後の縁は、当てにしない
+                self._edges = replace(self._edges, known=False)
             # 中身をどこへ動かしたかは分からない（変形・揺れ・散らす物）ので、後ろの
             # エフェクトにはバッファ全体を中身の範囲として渡す u_object で決めると、
             # 前の変形で広げた絵の粒や欠片が元の大きさで切れる（#199）
