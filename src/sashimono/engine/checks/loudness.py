@@ -147,18 +147,27 @@ class LoudnessLane:
     faders: tuple[float, ...] = ()
 
     def spans(self) -> list[tuple[int, int, float]]:
-        """``detected`` の中でクリップごとの区切りと、その倍率"""
+        """``detected`` の中でクリップごとの区切りと、その倍率
+
+        クリップの頭が 5 ms の区切りの途中に来ると、その区切りは前後どちらの範囲にも入れる
+        区切りの山からはどちらのクリップの山か分からない 片方へ丸めると、倍率の大きい側の頭の山を
+        浅く数え、本人の深さを越えて潰す（PR #495 の 4 回目のレビュー）
+        """
         count = len(self.detected)
-        heads = [min(count, max(0, round(start * _FINE_RATE))) for start in self.starts[1:]]
-        found = zip([0, *heads], [*heads, count], self.faders, strict=True)
+        # 区切りちょうどの頭は割り算の誤差で前の区切りへ掛からないよう、わずかに寄せて丸める
+        heads = [start * _FINE_RATE for start in self.starts[1:]]
+        ends = [min(count, max(0, math.ceil(head - 1e-6))) for head in heads]
+        begins = [min(count, max(0, math.floor(head + 1e-6))) for head in heads]
+        found = zip([0, *begins], [*ends, count], self.faders, strict=True)
         return [(low, high, fader) for low, high, fader in found if high > low]
 
     def ceilings(self, ceiling_db: float) -> np.ndarray:
-        """区切りごとの、リミッターの欄に入る上限（倍率）"""
-        found = np.ones(len(self.detected))
+        """区切りごとの、リミッターの欄に入る上限（倍率） 2 つのクリップが入る区切りは低い方"""
+        found = np.full(len(self.detected), math.inf)
         for low, high, fader in self.spans():
-            found[low:high] = 10.0 ** (ceiling_before_fader(ceiling_db, fader) / 20.0)
-        return found
+            here = 10.0 ** (ceiling_before_fader(ceiling_db, fader) / 20.0)
+            found[low:high] = np.minimum(found[low:high], here)
+        return np.where(np.isinf(found), 1.0, found)
 
     @property
     def peaks(self) -> np.ndarray:
