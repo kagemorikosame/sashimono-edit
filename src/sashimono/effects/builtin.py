@@ -527,6 +527,10 @@ float inward(
 // 数では追えないエフェクトの後の縁）
 vec2 on_screen_edge(vec2 pixel, vec2 low, vec2 high, vec2 zoom, vec2 spread) {
     vec2 near = 0.5 / zoom;
+    // 寄せうるのは端から縁の幅の内だけ 画面のほとんどの画素はここで抜ける 抜けずに探すと
+    // 4K で拡大した絵 1 枚あたり 0.25ms 遅くなる（#493）
+    vec2 band = near + max(u_edge_soft, vec2(0.5)) + 1.0 + spread;
+    if (all(greaterThan(pixel, low + band)) && all(lessThan(pixel, high - band))) return pixel;
     vec2 low_line = floor(low + near);
     vec2 high_line = ceil(high - near);
     // 角では、もう片方の向きに寄せた先の列（行）で透明かどうかを見る 寄せる前の列は縁の外に
