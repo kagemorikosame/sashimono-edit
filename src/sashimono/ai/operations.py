@@ -34,6 +34,7 @@ from sashimono.ai.auto_fix import (
     NoiseRequest,
     clips_overlap,
     has_limiter,
+    left_limiters,
     limited_ceiling,
     limited_peak,
     limiter_commands,
@@ -7613,9 +7614,12 @@ def _apply_loudness(
         result["measured_before_limiter"] = True
     # もう同じ形で抑えてあり、掛ける量も変わらない 積み直すと何も変わらない取り消しの段が増える
     settled = squeezed and bool(redo) and limiters_match(targets, ceiling - plan.lowered)
-    if not moved and (not squeezed or settled):
+    # 抑える量が 0 でも、外して測った低い上限を残すと書き出しでは効く 測った形へ戻す
+    left = [] if squeezed else left_limiters(targets, ceiling, redo)
+    unsure = bool(redo) and plan.unchecked
+    if not moved and not left and (not squeezed or settled):
         result["gain_db"] = 0.0
-        if settled and estimate is None:
+        if (settled and estimate is None) or unsure:
             # 重なって鳴る音などは抑えた後を見積もれない 抑える前の音から届いたと言い切らない
             result |= {"reached": None if reached else False, "loudness_rechecked": False}
         elif settled and estimate is not None:
@@ -7639,6 +7643,8 @@ def _apply_loudness(
     commands = gain_commands(clips, gain) if moved else []
     if squeezed:
         commands += limiter_commands(targets, ceiling, plan.lowered)
+    elif left:
+        commands += limiter_commands(left, ceiling)
     host.apply_commands(commands, f"音量を {request.limits.loudness_target:g} LUFS へそろえる")
     result |= {
         "gain_db": round(gain, 2) if moved else 0.0,
@@ -7658,7 +7664,9 @@ def _apply_loudness(
             else "音量の欄は変えていません 基準には届いていません"
         ]
     )
-    if moved and not redo and any(has_limiter(clip) for clip in clips):
+    if left:
+        notes.append("前にそろえたとき下げたリミッターの上限は、もう要らないので戻しました")
+    if unsure or (moved and not redo and any(has_limiter(clip) for clip in clips)):
         # 前に積んだリミッターを通る音は、掛けた dB どおりには動かない 下げると抑えていた分が
         # 戻り、上げるとクリップの山が上限に当たって潰れる 測る前の値から届いたと言い切らない
         result |= {

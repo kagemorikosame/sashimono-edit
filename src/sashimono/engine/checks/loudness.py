@@ -20,8 +20,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import pairwise
 
@@ -32,6 +32,7 @@ from sashimono.effects.limiter import DEFAULT_RELEASE_MS, reduction
 __all__ = [
     "ABSOLUTE_GATE",
     "Dynamics",
+    "FineSums",
     "Headroom",
     "LoudnessLane",
     "LoudnessMeter",
@@ -135,6 +136,13 @@ class LoudnessLane:
     peak: np.ndarray
     #: 組のクリップの頭（測り始めからの秒）
     starts: tuple[float, ...] = ()
+    #: 100 ms に満たない末尾の、5 ms ごとの山 音量の窓には入らないが、書き出す音には入る
+    tail: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+
+    @property
+    def peaks(self) -> np.ndarray:
+        """末尾まで含めた山"""
+        return np.concatenate([self.peak, self.tail])
 
 
 class Headroom:
@@ -145,7 +153,7 @@ class Headroom:
     """
 
     def __init__(self, lanes: Sequence[LoudnessLane]) -> None:
-        self._peaks = np.sort(np.stack([lane.peak.astype(np.float64) for lane in lanes]), axis=0)
+        self._peaks = np.sort(np.stack([lane.peaks.astype(np.float64) for lane in lanes]), axis=0)
         self._total = self._peaks.sum(axis=0)
 
     def ceiling(self, gain_db: float, top_db: float) -> float:
@@ -179,6 +187,13 @@ class Dynamics:
     step: int
     #: 重なって鳴るときの、組ごとの手がかり 無ければ混ぜた音へ 1 つのリミッターとして数える
     lanes: tuple[LoudnessLane, ...] = ()
+    #: 組どうしの掛け合わせ（組, 組, 5 ms ごとの K 特性を掛けた音の積の和） 相殺の具合を表す
+    crosses: tuple[tuple[int, int, np.ndarray], ...] = ()
+
+    def loudest_lane_db(self) -> float:
+        """組の中で一番高い山（dBFS） 逆相で重なると、混ぜた山より高い"""
+        loudest = max((float(lane.peaks.max()) for lane in self.lanes), default=0.0)
+        return 20.0 * math.log10(max(loudest, 1e-12))
 
     def limited_loudness(
         self, gain_db: float, ceiling_db: float, starts: Sequence[float] = ()
@@ -188,24 +203,24 @@ class Dynamics:
         区切りの中は一番強く絞った量で通して数える 見積もりが低めに出るので、届かない側へは外さない
         ``starts`` はクリップの頭（測り始めからの秒） そこで絞る量の持ち越しを切る
 
-        組があれば、混ぜた音の大きさへ Σk²E / ΣE（k は組ごとの絞り、E は組ごとの大きさ）を掛ける
-        同じ音の重なりと無関係な音の重なりのどちらでも正しく、59 分の話し声に BGM・打楽器・
-        別の話し声を重ねて 0.06 LU 以内で合った 組の二乗だけを足すと、同じ音の重なりで 3 dB 外す
+        組があれば、和の大きさを Σk²E + 2Σ(ki kj Cij) で数える（k は組ごとの絞り、E は組の大きさ、
+        C は組どうしの掛け合わせ） 混ぜた音へ絞りの比を掛けるだけだと、組ごとに絞りが違うときの
+        相殺を読めない（逆相で 2.25 LU 外した PR #495 の CodeRabbit の指摘）
         """
         ratio = 10.0 ** (gain_db / 20.0)
         ceiling = 10.0 ** (ceiling_db / 20.0) / ratio
         if self.lanes:
-            weighted = np.zeros(len(self.energy))
-            plain = np.zeros(len(self.energy))
-            for lane in self.lanes:
-                kept = _kept(lane.peak, ceiling, lane.starts)
-                weighted += lane.energy * kept * kept
-                plain += lane.energy
-            share = np.divide(weighted, plain, out=np.ones_like(plain), where=plain > 0.0)
+            kept_by = [_kept(lane.peak, ceiling, lane.starts) for lane in self.lanes]
+            summed = np.zeros(len(self.energy))
+            for lane, kept in zip(self.lanes, kept_by, strict=True):
+                summed += lane.energy * kept * kept
+            for first, second, cross in self.crosses:
+                summed += 2.0 * cross * kept_by[first] * kept_by[second]
+            # 打ち消し合う所は丸めで負に触れる
+            energy = np.maximum(summed, 0.0) * (ratio * ratio)
         else:
             kept = _kept(self.peak, ceiling, starts)
-            share = kept * kept
-        energy = self.energy * share * (ratio * ratio)
+            energy = self.energy * kept * kept * (ratio * ratio)
         ticks = energy.reshape(-1, _FINE_PARTS).sum(axis=1)
         if len(ticks) < 4:
             return None
@@ -228,6 +243,32 @@ def _kept(peak: np.ndarray, ceiling: float, starts: Sequence[float]) -> np.ndarr
     return kept
 
 
+class FineSums:
+    """サンプルごとの値を、:class:`Dynamics` と同じ境目の 5 ms ごとの和にして覚える"""
+
+    def __init__(self, step: int) -> None:
+        self._step = step
+        self._cuts = np.arange(_FINE_PARTS) * step // _FINE_PARTS
+        self._partial = np.zeros(0)
+        self._found: list[np.ndarray] = []
+
+    def add(self, values: np.ndarray) -> None:
+        joined = np.concatenate([self._partial, values])
+        whole = len(joined) // self._step * self._step
+        if whole:
+            rows = joined[:whole].reshape(-1, self._step)
+            summed = np.add.reduceat(rows, self._cuts, axis=1)
+            self._found.append(summed.ravel().astype(np.float32))
+        self._partial = joined[whole:]
+
+    def joined(self) -> np.ndarray:
+        if not self._found:
+            return np.zeros(0, dtype=np.float32)
+        if len(self._found) > 1:
+            self._found = [np.concatenate(self._found)]
+        return self._found[0]
+
+
 class LoudnessMeter:
     """音を少しずつ渡して、積分ラウドネスと最大のサンプルを測る
 
@@ -235,7 +276,15 @@ class LoudnessMeter:
     次の塊へ持ち越すので、どんな長さで渡しても同じ値になる
     """
 
-    def __init__(self, sample_rate: int, channels: int) -> None:
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        *,
+        tap: Callable[[np.ndarray], None] | None = None,
+    ) -> None:
+        #: K 特性を掛けた音の受け手（組どうしの掛け合わせ）
+        self._tap = tap
         self._rate = int(sample_rate)
         self._channels = int(channels)
         self._impulse = _impulse(self._rate)
@@ -288,6 +337,8 @@ class LoudnessMeter:
         self._pending = []
         self._pending_count = 0
         weighted = self._filter(block)
+        if self._tap is not None:
+            self._tap(weighted)
         energy = np.sum(weighted * weighted * self._weights, axis=1)
         joined = np.concatenate([self._partial, energy])
         peaks = np.concatenate([self._partial_peaks, np.abs(block).max(axis=1)])
@@ -345,6 +396,15 @@ class LoudnessMeter:
             self._fine_energy = [np.concatenate(self._fine_energy)]
             self._fine_peak = [np.concatenate(self._fine_peak)]
         return Dynamics(self._fine_energy[0], self._fine_peak[0], self._step)
+
+    def tail_peaks(self) -> np.ndarray:
+        """まだ 100 ms に満たない末尾の、5 ms ごとの山 音の山は :attr:`peak` と同じく末尾も数える"""
+        self._flush()
+        count = len(self._partial_peaks)
+        if not count:
+            return np.zeros(0, dtype=np.float32)
+        cuts = self._cuts[self._cuts < count]
+        return np.maximum.reduceat(self._partial_peaks, cuts).astype(np.float32)
 
     def integrated(self) -> float | None:
         """積分ラウドネス（LUFS） 測れる区切りが無ければ（400 ms に満たない・無音）``None``"""

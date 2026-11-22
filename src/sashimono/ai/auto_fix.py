@@ -67,6 +67,7 @@ __all__ = [
     "can_auto_color",
     "clips_overlap",
     "has_limiter",
+    "left_limiters",
     "limited_ceiling",
     "limited_peak",
     "limiter_ceiling",
@@ -266,6 +267,21 @@ def limiters_match(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> boo
     return True
 
 
+def left_limiters(
+    targets: Sequence[tuple[Track, Clip]], ceiling: float, bypassed: frozenset[EffectId]
+) -> list[tuple[Track, Clip]]:
+    """外して測った（``bypassed``）のに、上限が ``ceiling`` と違う値のまま残るリミッターのクリップ
+
+    抑える量が 0 の計画でも、残った低い上限は書き出しで効く 外して測った音量と食い違う
+    """
+    return [
+        (track, clip)
+        for track, clip in targets
+        if any(effect.id in bypassed for effect in clip.effects)
+        and not limiters_match([(track, clip)], ceiling)
+    ]
+
+
 def limiter_commands(
     targets: Sequence[tuple[Track, Clip]], ceiling: float, lowered: float = 0.0
 ) -> list[Command]:
@@ -303,7 +319,8 @@ def limiter_commands(
             continue
         path = ParamPath.of_effect(clip.id, found.id, "ceiling")
         commands.append(SetParam(path, AnimatedValue(static=local)))
-        if lowered > 0:
+        if lowered > 0 or FITTED_CEILING in found.params:
+            # 通常の値へ戻すときも控えを書き換える 残すと、人が前の値へ直した上限をそろえた物と読む
             note = ParamPath.of_effect(clip.id, found.id, FITTED_CEILING)
             commands.append(SetParam(note, AnimatedValue(static=local)))
         if not found.enabled:

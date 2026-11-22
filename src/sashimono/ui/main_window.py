@@ -65,6 +65,7 @@ from sashimono.ai.auto_fix import (
     can_auto_color,
     clips_overlap,
     has_limiter,
+    left_limiters,
     limited_peak,
     limiter_commands,
     limiters_match,
@@ -897,6 +898,8 @@ class MainWindow(QMainWindow):
         self._background_indicator = ProgressIndicator(self)
         #: 最後に出した、小さく入った動画の知らせ（#494） 出ている間は終わりの知らせで上書きしない
         self._small_told: str | None = None
+        #: その知らせに解析の失敗を添えて、いま出している文
+        self._small_shown: str | None = None
         self._import_indicator = ProgressIndicator(self, cancel_text="取り消す")
         cancel = self._import_indicator.cancel_button
         if cancel is not None:
@@ -2486,7 +2489,7 @@ class MainWindow(QMainWindow):
             self._show_small(hint)
 
     def _show_small(self, message: str) -> None:
-        self._small_told = message
+        self._small_told = self._small_shown = message
         self.statusBar().showMessage(message, 10000)
 
     def _small_hint(self, commands: Sequence[Command]) -> str | None:
@@ -2786,13 +2789,14 @@ class MainWindow(QMainWindow):
         failed = proxy.failed or analysis.failed
         # 小さく入った知らせが出ている間は消さない 新しい素材の解析は数秒で終わるので、
         # 上書きすると合わせ方を読む前に消える（#494） 失敗だけは後ろに添えて知らせる
-        told = self._small_told
-        telling = told is not None and self.statusBar().currentMessage() == told
+        shown = self._small_shown
+        telling = shown is not None and self.statusBar().currentMessage() == shown
         if failed or (self._background_shown and not telling):
             text = finished_message(proxy, analysis)
-            self.statusBar().showMessage(
-                f"{told} {text}" if telling else text, 8000 if failed else 4000
-            )
+            if telling:
+                # 添えた文も守る 覚えないと、次に終わった処理の知らせが合わせ方ごと消す
+                text = self._small_shown = f"{self._small_told} {text}"
+            self.statusBar().showMessage(text, 8000 if failed else 4000)
         self._background_shown = False
         # 知らせた分を数え直す 戻さないと、次のひと続きが前の本数と失敗を抱えたまま始まる
         self._proxies.settle(proxy)
@@ -4974,18 +4978,19 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("選んだクリップはどれも無効です", 5000)
             return False
         redo = redoable_limiters(enabled, choice.ceiling) if choice.limiter else frozenset()
+        # 人の整えたリミッターは抑えた後の音を測るので、もう 1 度抑えると上限を越えて重なる
+        # そろえたときのリミッター（redo）は外して測るので重ならない（#494）
+        stacks = not redo and any(has_limiter(c) for c in clips)
+        squeeze = self.loudness_depth if choice.limiter and not stacks else 0.0
         request = CheckRequest(
             CheckLimits(loudness_target=choice.target, kinds=frozenset({LOUDNESS})),
             project=measure_project(project, (clip.id for clip in clips), redo),
             start=min(clip.timeline_start for clip in clips),
             end=max(clip.timeline_end for clip in clips),
             scene=str(self._active_scene) if self._active_scene is not None else None,
-            separate=choice.limiter and clips_overlap(clips),
+            # 抑えないなら組の手がかりは使わない 測ると待ちだけが延びる（AI の道具と同じ）
+            separate=squeeze > 0 and clips_overlap(clips),
         )
-        # 人の整えたリミッターは抑えた後の音を測るので、もう 1 度抑えると上限を越えて重なる
-        # そろえたときのリミッター（redo）は外して測るので重ならない（#494）
-        stacks = not redo and any(has_limiter(c) for c in clips)
-        squeeze = self.loudness_depth if choice.limiter and not stacks else 0.0
         self._pending_loudness = _PendingLoudness(
             request, project, tuple(enabled), choice.ceiling, squeeze, redo
         )
@@ -5043,10 +5048,13 @@ class MainWindow(QMainWindow):
             and bool(pending.redo)
             and limiters_match(pending.targets, pending.ceiling - plan.lowered)
         )
-        if not moved and (not squeezed or settled):
+        # 抑える量が 0 でも、外して測った低い上限を残すと書き出しでは効く 測った形へ戻す
+        left = [] if squeezed else left_limiters(pending.targets, pending.ceiling, pending.redo)
+        unsure = bool(pending.redo) and plan.unchecked
+        if not moved and not left and (not squeezed or settled):
             after = decided.limited_lufs
             short = target - (report.loudness if after is None else after)
-            if settled and after is None and not decided.limited_by:
+            if ((settled and after is None) or unsure) and not decided.limited_by:
                 # 測ったのは抑える前の音 基準に合っていると言い切らない
                 self.statusBar().showMessage(
                     "そろえたときのままなので変えなかった 重なって鳴る音は抑えた後の音量を"
@@ -5068,6 +5076,8 @@ class MainWindow(QMainWindow):
         try:
             if squeezed:
                 commands += limiter_commands(pending.targets, pending.ceiling, plan.lowered)
+            elif left:
+                commands += limiter_commands(left, pending.ceiling)
         except ToolError as error:
             self.statusBar().showMessage(f"音量をそろえられなかった: {error}", 8000)
             return
@@ -5093,7 +5103,11 @@ class MainWindow(QMainWindow):
                     " 重なって鳴る所は音が割れることがある AI アシスタントの check_output で"
                     "音割れを確かめてください"
                 )
-        elif moved and not pending.redo and any(has_limiter(clip) for clip in clips):
+        elif left:
+            stopped += " 前に下げたリミッターの上限は、もう要らないので戻した"
+            if unsure:
+                stopped += " 重なって鳴る音なので、仕上がりの検査で音量を確かめてください"
+        elif unsure or (moved and not pending.redo and any(has_limiter(c) for c in clips)):
             stopped += " 前に積んだリミッターを通る音なので、音量は変えた量どおりには動かない"
         changed = f"音量を {decided.gain_db:+.1f} dB 変えた" if moved else "音量は変えていない"
         self.statusBar().showMessage(

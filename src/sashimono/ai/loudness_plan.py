@@ -14,7 +14,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
-from sashimono.ai.auto_fix import clips_overlap, limited_peak, loudness_predictor
+from sashimono.ai.auto_fix import clips_overlap, has_limiter, limited_peak, loudness_predictor
 from sashimono.core.mixing import LoudnessGain, loudness_gain
 from sashimono.core.model import Clip, Track
 from sashimono.engine.checks.loudness import Dynamics, Headroom
@@ -39,6 +39,8 @@ class LoudnessPlan:
     lowered: float = 0.0
     #: 重なって鳴る音の和が越えないと見積もった所（dBFS） 見積もれなければ ``None``
     held_db: float | None = None
+    #: 重なって鳴るのに組に分けて測れなかったか リミッターの効いた後の音量を言い切れない
+    unchecked: bool = False
 
 
 def plan_loudness(
@@ -68,14 +70,27 @@ def plan_loudness(
         raise_ceiling=raise_ceiling,
         predict=loudness_predictor(report, ceiling, clips),
     )
+    if not clips_overlap(clips) or peak is None or squeeze <= 0:
+        return LoudnessPlan(plain)
     dynamics = report.dynamics
+    if dynamics is None or not dynamics.lanes:
+        return LoudnessPlan(plain, unchecked=True)
+    loudest_lane = dynamics.loudest_lane_db()
+    if loudest_lane > peak and (plain.squeeze_db > 0 or any(has_limiter(c) for c in clips)):
+        # リミッターに当たるのは組の山 逆相で重なると混ぜた山より高く、混ぜた山で深さを数えると
+        # 本人の設定より深く潰す
+        peak = loudest_lane
+        plain = loudness_gain(
+            clips,
+            measured=measured,
+            peak_db=peak,
+            target=target,
+            ceiling=ceiling,
+            squeeze=squeeze,
+            raise_ceiling=raise_ceiling,
+        )
     if (
-        not clips_overlap(clips)
-        or dynamics is None
-        or not dynamics.lanes
-        or peak is None
-        or squeeze <= 0
-        or plain.squeeze_db <= 0
+        plain.squeeze_db <= 0
         or raise_ceiling is not None
         # トラックの音量でリミッターの上限の範囲を越えると、組の山が止まる所を言えない
         or limited_peak(targets, ceiling) > ceiling + _REACHED_LU

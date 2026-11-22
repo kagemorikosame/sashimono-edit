@@ -199,7 +199,10 @@ class _Progress:
         found = self.audio.dynamics() if self.audio is not None else None
         if found is None or self.lanes is None:
             return found
-        return replace(found, lanes=self.lanes.lanes())
+        lanes = self.lanes.lanes()
+        if not lanes:
+            return found
+        return replace(found, lanes=lanes, crosses=self.lanes.crosses())
 
     def fraction(self) -> float:
         span = self.end - self.start

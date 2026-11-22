@@ -187,6 +187,20 @@ class TestImportDoesNotFreeze:
         assert message.startswith("小さく入った 画面に合わせる")
         assert ("失敗 1 件" in message) is bool(failed)
 
+    def test_the_hint_survives_a_failure_and_then_a_success(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 失敗を添えた後の知らせを覚えないと、次に終わった処理が合わせ方を消す
+        window._show_small("小さく入った 画面に合わせる")
+        idle = window._proxies.poll()
+        monkeypatch.setattr(window._proxies, "settle", lambda _snapshot: None)
+        for failed in (1, 0):
+            snapshot = replace(idle, failed=failed)
+            monkeypatch.setattr(window._proxies, "poll", lambda now=snapshot: now)
+            window._background_shown = True
+            window._show_background_progress()
+        assert "画面に合わせる" in window.statusBar().currentMessage()
+
     def test_the_end_of_the_analysis_is_told_without_a_hint(self, window: MainWindow) -> None:
         # 知らせが消えた後まで黙ると、解析が終わったことが分からない
         window._show_small("小さく入った 画面に合わせる")

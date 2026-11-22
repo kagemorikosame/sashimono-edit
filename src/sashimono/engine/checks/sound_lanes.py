@@ -7,17 +7,26 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
+from itertools import combinations
 
 import numpy as np
 
+from sashimono.core.mixing import audible_clips
 from sashimono.core.model import ClipId, Project
-from sashimono.engine.checks.loudness import LoudnessLane, LoudnessMeter
+from sashimono.engine.checks.loudness import (
+    FineSums,
+    LoudnessLane,
+    LoudnessMeter,
+    channel_weights,
+)
 
 __all__ = ["LaneMeters"]
 
-#: 分ける組の上限 1 組ごとに 3 時間で 17 MB と K 特性の計算が増える 越えたら分けない
-MAX_LANES = 6
+#: 分ける組の上限 組と、組どうしの掛け合わせ（組の 2 つ選び）ごとに場所が要る 3 時間・4 組で
+#: 170 MB ほど 越えたら分けない（見積もらずに、届いたかを言い切らない）
+MAX_LANES = 4
 
 
 class LaneMeters:
@@ -34,7 +43,16 @@ class LaneMeters:
         #: クリップがどの組か ミキサへ渡す
         self.lane_of = lane_of
         self._starts = starts
-        self._meters = [LoudnessMeter(sample_rate, channels) for _ in starts]
+        #: まだ掛け合わせていない、K 特性を掛けた組ごとの音
+        self._weighted: list[deque[np.ndarray]] = [deque() for _ in starts]
+        self._meters = [
+            LoudnessMeter(sample_rate, channels, tap=waiting.append) for waiting in self._weighted
+        ]
+        self._weights = channel_weights(channels)
+        self._crosses = {
+            pair: FineSums(self._meters[0].block_samples)
+            for pair in combinations(range(len(starts)), 2)
+        }
 
     @classmethod
     def of(cls, project: Project, start: int, end: int) -> LaneMeters | None:
@@ -42,20 +60,13 @@ class LaneMeters:
 
         重なりが無いか、組が :data:`MAX_LANES` を越えれば ``None``
         """
-        timeline = project.timeline
-        tracks = {
-            track.id: track
-            for track in (*timeline.active_sound_tracks(), *timeline.active_picture_tracks())
-        }
+        # 鳴る音の決まりはミキサと同じ所で見る 絵の側で映る混合トラックまで足すと、音のソロで
+        # 外れた音が組に入る
         sounding = sorted(
             (
                 (clip.timeline_start, clip.timeline_end, clip.id)
-                for track in tracks.values()
-                for clip in track.clips
-                if clip.enabled
-                and clip.timeline_start < end
-                and clip.timeline_end > start
-                and project.plays_sound(track, clip)
+                for _track, clip in audible_clips(project)
+                if clip.timeline_start < end and clip.timeline_end > start
             ),
             key=lambda row: row[:2],
         )
@@ -90,6 +101,14 @@ class LaneMeters:
         """``sounds`` は（組, サンプル, チャンネル）"""
         for meter, sound in zip(self._meters, sounds, strict=True):
             meter.add(sound)
+        self._multiply()
+
+    def _multiply(self) -> None:
+        # どの音量計も同じ長さを受け取るので、畳み込んだ塊の境目もそろう
+        while all(self._weighted):
+            blocks = [waiting.popleft() for waiting in self._weighted]
+            for (first, second), sums in self._crosses.items():
+                sums.add((blocks[first] * blocks[second]) @ self._weights)
 
     def lanes(self) -> tuple[LoudnessLane, ...]:
         found: list[LoudnessLane] = []
@@ -97,5 +116,10 @@ class LaneMeters:
             dynamics = meter.dynamics()
             if dynamics is None:
                 return ()
-            found.append(LoudnessLane(dynamics.energy, dynamics.peak, starts))
+            found.append(LoudnessLane(dynamics.energy, dynamics.peak, starts, meter.tail_peaks()))
         return tuple(found)
+
+    def crosses(self) -> tuple[tuple[int, int, np.ndarray], ...]:
+        """組どうしの掛け合わせ :meth:`lanes` の後で呼ぶ（溜めた音を吐かせてから数える）"""
+        self._multiply()
+        return tuple((*pair, sums.joined()) for pair, sums in self._crosses.items())
