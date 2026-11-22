@@ -895,6 +895,8 @@ class MainWindow(QMainWindow):
         # 進み具合は右端に常駐させる 左の一時的な文言に出すと、ほかの操作の
         # 知らせに上書きされて消える
         self._background_indicator = ProgressIndicator(self)
+        #: 最後に出した、小さく入った動画の知らせ（#494） 出ている間は終わりの知らせで上書きしない
+        self._small_told: str | None = None
         self._import_indicator = ProgressIndicator(self, cancel_text="取り消す")
         cancel = self._import_indicator.cancel_button
         if cancel is not None:
@@ -2134,8 +2136,10 @@ class MainWindow(QMainWindow):
         small = None if lost else self._small_hint(commands)
         if small is not None:
             # 1 つの知らせにまとめる 続けて出すと、件数か失敗の訳が合わせ方を上書きする
-            head = failures[0] if failures else f"{batch.total} 件を読み込んだ"
-            self.statusBar().showMessage(f"{head} {small}", 10000)
+            # 失敗の訳は後ろへ置く パスと理由が長く、前に置くと合わせ方が画面の外へ押し出される
+            self._show_small(
+                f"{small} {failures[0]}" if failures else f"{batch.total} 件を読み込んだ {small}"
+            )
         elif failures:
             self.statusBar().showMessage(failures[0], 5000)
         elif lost and commands:
@@ -2479,7 +2483,11 @@ class MainWindow(QMainWindow):
         """置いた動画が小さく入ったら知らせる（#494） 窓は出さない 小さく置く人の手を止めない"""
         hint = self._small_hint(commands)
         if hint is not None:
-            self.statusBar().showMessage(hint, 10000)
+            self._show_small(hint)
+
+    def _show_small(self, message: str) -> None:
+        self._small_told = message
+        self.statusBar().showMessage(message, 10000)
 
     def _small_hint(self, commands: Sequence[Command]) -> str | None:
         """置いた動画のどれかが小さく入っていれば、その知らせの文"""
@@ -2776,9 +2784,14 @@ class MainWindow(QMainWindow):
         # 終わったことを知らせるのは、進み具合を出していたときと失敗したときだけ
         # キャッシュから一瞬で済んだ分まで知らせると、開くたびに文言が出る
         failed = proxy.failed or analysis.failed
-        if self._background_shown or failed:
+        # 小さく入った知らせが出ている間は消さない 新しい素材の解析は数秒で終わるので、
+        # 上書きすると合わせ方を読む前に消える（#494） 失敗だけは後ろに添えて知らせる
+        told = self._small_told
+        telling = told is not None and self.statusBar().currentMessage() == told
+        if failed or (self._background_shown and not telling):
+            text = finished_message(proxy, analysis)
             self.statusBar().showMessage(
-                finished_message(proxy, analysis), 8000 if failed else 4000
+                f"{told} {text}" if telling else text, 8000 if failed else 4000
             )
         self._background_shown = False
         # 知らせた分を数え直す 戻さないと、次のひと続きが前の本数と失敗を抱えたまま始まる
