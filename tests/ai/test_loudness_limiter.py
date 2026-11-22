@@ -13,14 +13,18 @@ import numpy as np
 import pytest
 
 from sashimono.ai.auto_fix import (
+    FITTED_CEILING,
     clips_overlap,
     limited_ceiling,
     limiter_commands,
+    limiters_match,
     loudness_predictor,
     raise_cap,
+    redoable_limiters,
 )
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
+from sashimono.ai.loudness_plan import plan_loudness
 from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddEffect, SetEffectEnabled, SetParam
 from sashimono.core.commands.effects import ParamPath
@@ -30,7 +34,8 @@ from sashimono.core.commands.fixed import (
     loose_slot,
     with_fixed_items,
 )
-from sashimono.core.mixing import MAX_LIMITER_DB, loudness_gain
+from sashimono.core.io.serialize import effect_from_json, effect_to_json
+from sashimono.core.mixing import MAX_LIMITER_DB, gain_commands, loudness_gain
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -49,9 +54,11 @@ from sashimono.effects.audio import LIMITER_KIND, AudioContext
 from sashimono.effects.limiter import limit, limiter_history
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.audio.mixer import HISTORY_WINDOW
+from sashimono.engine.checks.job import CheckRequest, _check_timeline, _Progress
 from sashimono.engine.checks.loudness import LoudnessMeter
-from sashimono.engine.checks.report import HIGH, MEDIUM
-from sashimono.engine.checks.scan import LOUDNESS
+from sashimono.engine.checks.report import HIGH, MEDIUM, CheckReport
+from sashimono.engine.checks.scan import LOUDNESS, CheckLimits
+from sashimono.engine.checks.sound_lanes import LaneMeters
 from sashimono.engine.decode.probe import probe_media
 from tests.ai.conftest import FakeHost
 from tests.ai.test_mix_tools import _measured, _Work
@@ -633,7 +640,7 @@ class TestWhereTheEstimateHolds:
         assert carried is not None
         assert carried < real - 0.2
 
-    @pytest.mark.parametrize(("target", "found"), [(-16.4, 4.1), (-15.5, 4.2)])
+    @pytest.mark.parametrize(("target", "found"), [(-16.4, 4.1), (-16.05, 4.45), (-15.5, 4.5)])
     def test_the_loudness_may_fall_as_the_gain_rises(self, target: float, found: float) -> None:
         """上端だけで諦めると、途中で届くのに潰せるだけ潰して基準より小さくなる"""
         decided = loudness_gain(
@@ -649,6 +656,42 @@ class TestWhereTheEstimateHolds:
         assert decided.gain_db == pytest.approx(found, abs=0.11)
         assert bool(decided.limited_by) is (target > -16.0)
 
+    @pytest.mark.parametrize("peak_at", [3.25, 4.45, 7.0, 9.91, 12.9])
+    def test_a_band_narrower_than_the_scan_is_found(self, peak_at: float) -> None:
+        """1 dB おきの点の間だけで届く形を飛び越すと、届くのに手前で止めて届かないと答える"""
+        decided = loudness_gain(
+            [],
+            measured=-19.2,
+            peak_db=-3.0,
+            target=-16.0,
+            ceiling=-1.0,
+            squeeze=11.0,
+            predict=lambda gain: -15.96 - abs(gain - peak_at),
+        )
+        assert decided.limited_lufs == pytest.approx(-16.0, abs=0.01)
+        assert decided.gain_db <= peak_at + 1e-3
+        assert not decided.limited_by
+
+    def test_a_rising_end_is_not_searched_again(self) -> None:
+        """届かない長い作品で山を探し直すと、そろえる度に画面が数秒止まる"""
+        asked: list[float] = []
+
+        def rising(gain: float) -> float:
+            asked.append(gain)
+            return -20.0 + gain * 0.1
+
+        decided = loudness_gain(
+            [],
+            measured=-19.2,
+            peak_db=-3.0,
+            target=-16.0,
+            ceiling=-1.0,
+            squeeze=11.0,
+            predict=rising,
+        )
+        assert decided.gain_db == pytest.approx(13.0)
+        assert len(asked) <= 15
+
     def test_the_active_limiter_is_updated(self, work: _Work) -> None:
         """前にある無効な物を取ると、積み直した物と効いていた物が重なって潰れる"""
         definition = registry.require(LIMITER_KIND)
@@ -658,3 +701,126 @@ class TestWhereTheEstimateHolds:
         (command,) = limiter_commands([(work.voice_track, clip)], -1.0)
         assert isinstance(command, SetParam)
         assert command.path.effect_id == active.id
+
+
+def _overlapping(tmp_path: Path, music: np.ndarray) -> Project:
+    """山の立つ声と、その下に通しで鳴る音"""
+    voice = _peaky() * 10 ** (-6.0 / 20)
+    media, tracks = [], []
+    for name, sound in (("voice", voice), ("music", music)):
+        path = tmp_path / f"{name}.wav"
+        write_tone(path, sound)
+        item = probe_media(path)
+        media.append(item)
+        clip = Clip(timeline_start=0, duration=360, media_id=item.id)
+        tracks.append(Track(kind=TrackKind.AUDIO, name=name, clips=(clip,)))
+    project = Project.create(ProjectSettings(frame_rate=FrameRate(30)), media=tuple(media))
+    return project.with_timeline(replace(project.timeline, tracks=tuple(tracks)))
+
+
+def _music(level: float) -> np.ndarray:
+    times = np.arange(RATE * 12) / RATE
+    mono = (level * np.sin(2 * np.pi * 330 * times)).astype(np.float32)
+    return np.stack([mono, mono], axis=1)
+
+
+def _mixed(project: Project) -> np.ndarray:
+    mixer = AudioMixer(project)
+    try:
+        return np.concatenate([mixer.render_frames(at, 30) for at in range(0, 360, 30)])
+    finally:
+        mixer.close()
+
+
+def _checked(project: Project) -> CheckReport:
+    """実際の検査の道で、組に分けて測る"""
+    request = CheckRequest(
+        CheckLimits(kinds=frozenset({LOUDNESS})), project=project, end=360, separate=True
+    )
+    progress = _Progress(request, lambda: None)
+    _check_timeline(request, progress, None, decode_threads=1, smooth_history=True)
+    progress.running = False
+    report = progress.report()
+    assert report is not None
+    return report
+
+
+class TestOverlappingSounds:
+    """声と BGM が重なっても基準へ届き、割れない（#494）"""
+
+    def test_the_parts_add_up_to_the_mix(self, tmp_path: Path) -> None:
+        """内訳が混ぜた音とずれると、違う音から掛ける量と上限を決める"""
+        project = _overlapping(tmp_path, _music(0.05))
+        meters = LaneMeters.of(project, 0, 360)
+        assert meters is not None
+        mixer = AudioMixer(project)
+        try:
+            mixed, parts = mixer.render_frames_apart(30, 5, meters.lane_of, meters.count)
+            assert meters.count == 2
+            assert parts.sum(axis=0) == pytest.approx(mixed, abs=1e-6)
+            assert mixed == pytest.approx(mixer.render_frames(30, 5), abs=1e-6)
+        finally:
+            mixer.close()
+
+    @pytest.mark.parametrize("level", [0.02, 0.05])
+    def test_it_reaches_without_clipping(self, tmp_path: Path, level: float) -> None:
+        """見込まないと 1 LU 手前で止まり、見込むだけだと抑えた音どうしの和が割れる"""
+        project = _overlapping(tmp_path, _music(level))
+        report = _checked(project)
+        assert report.loudness is not None
+        targets = [(track, track.clips[0]) for track in project.timeline.tracks]
+        target = report.loudness + 6.0
+        plan = plan_loudness(
+            report, targets, target=target, ceiling=-1.0, squeeze=12.0, raise_ceiling=None
+        )
+        assert plan.held_db is not None
+        assert plan.decided.squeeze_db <= 12.0 + 1e-6
+        clips = [clip for _, clip in targets]
+        changed = project
+        commands = gain_commands(clips, plan.decided.gain_db)
+        for command in commands + limiter_commands(targets, -1.0, plan.lowered):
+            changed = command.apply(changed)
+        out = _mixed(changed)
+        assert _meter(out).integrated() == pytest.approx(target, abs=0.25)
+        assert float(np.abs(out).max()) <= 10 ** (plan.held_db / 20) + 1e-3
+
+    def test_too_shallow_a_depth_keeps_the_old_way(self, tmp_path: Path) -> None:
+        """余裕を取ると前より小さくなるのに取ると、そろえたせいで声が引っ込む"""
+        project = _overlapping(tmp_path, _peaky() * 0.5)
+        report = _checked(project)
+        assert report.loudness is not None
+        assert report.dynamics is not None
+        targets = [(track, track.clips[0]) for track in project.timeline.tracks]
+        target = report.loudness + 5.0
+        plan = plan_loudness(
+            report, targets, target=target, ceiling=-1.0, squeeze=3.0, raise_ceiling=None
+        )
+        assert plan.lowered == 0.0
+        assert plan.held_db is None
+        assert "peak" in plan.decided.limited_by
+        assert plan.decided.limited_lufs is not None
+
+    def test_the_lowered_limiter_is_our_own_until_a_person_moves_it(self, work: _Work) -> None:
+        """人の物と読むと掛け直せず、人が動かした物まで外すとその人の音を作り直す"""
+        targets = [(work.voice_track, work.clip(work.voice.id))]
+        work.host.apply_commands(limiter_commands(targets, -1.0, 2.5), "そろえた")
+        clip = work.clip(work.voice.id)
+        assert redoable_limiters([(work.voice_track, clip)], -1.0)
+        limiter = next(e for e in clip.effects if e.kind == LIMITER_KIND)
+        assert limiters_match([(work.voice_track, clip)], -3.5)
+        path = ParamPath.of_effect(clip.id, limiter.id, "ceiling")
+        work.host.apply_commands([SetParam(path, AnimatedValue(static=-5.0))], "人が直した")
+        assert not redoable_limiters([(work.voice_track, work.clip(work.voice.id))], -1.0)
+
+    def test_the_note_of_the_lowered_ceiling_is_saved(self) -> None:
+        """保存で落ちると、開き直した作品では掛け直しても基準へ上がらない"""
+        effect = registry.require(LIMITER_KIND).create(ceiling=-3.5)
+        effect = effect.with_param(FITTED_CEILING, AnimatedValue(static=-3.5))
+        assert effect_from_json(effect_to_json(effect)).params == effect.params
+
+    def test_the_request_asks_to_measure_apart(self, work: _Work) -> None:
+        """頼まないと組の手がかりが無く、重なる音は 1 LU 手前で止まる"""
+        _run(work)
+        assert work.host.check_requests[-1].separate
+        _run(work, clip_ids=[str(work.voice.id)])
+        assert not work.host.check_requests[-1].separate

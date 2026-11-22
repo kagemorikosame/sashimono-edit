@@ -67,7 +67,7 @@ from sashimono.ai.auto_fix import (
     has_limiter,
     limited_peak,
     limiter_commands,
-    loudness_predictor,
+    limiters_match,
     plan_color_fix,
     plan_noise_fix,
     raise_cap,
@@ -81,6 +81,7 @@ from sashimono.ai.host import (
     ToolError,
     ViewState,
 )
+from sashimono.ai.loudness_plan import plan_loudness
 from sashimono.ai.operations import (
     NarrationJob,
     narration_consent,
@@ -165,7 +166,6 @@ from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.mixing import (
     DuckShape,
     gain_commands,
-    loudness_gain,
     measure_project,
     plan_ducking,
     sounds_now,
@@ -4980,6 +4980,7 @@ class MainWindow(QMainWindow):
             start=min(clip.timeline_start for clip in clips),
             end=max(clip.timeline_end for clip in clips),
             scene=str(self._active_scene) if self._active_scene is not None else None,
+            separate=choice.limiter and clips_overlap(clips),
         )
         # 人の整えたリミッターは抑えた後の音を測るので、もう 1 度抑えると上限を越えて重なる
         # そろえたときのリミッター（redo）は外して測るので重ならない（#494）
@@ -5024,21 +5025,24 @@ class MainWindow(QMainWindow):
             return
         # 前に積んだリミッターの上限より上へは上げない（AI の normalize_loudness と同じ）
         clips = [clip for _, clip in pending.targets]
-        decided = loudness_gain(
-            clips,
-            measured=report.loudness,
-            peak_db=report.peak_db,
+        plan = plan_loudness(
+            report,
+            pending.targets,
             target=pending.request.limits.loudness_target,
             ceiling=pending.ceiling,
             squeeze=pending.squeeze,
             raise_ceiling=None if pending.redo else raise_cap(pending.targets, pending.ceiling),
-            predict=loudness_predictor(report, pending.ceiling, clips),
         )
+        decided = plan.decided
         moved = abs(decided.gain_db) >= 0.05
         # 音量を変えなくても、山が天井を越えていればリミッターは積む
         squeezed = decided.squeeze_db >= 0.05
         target = pending.request.limits.loudness_target
-        settled = squeezed and bool(pending.redo) and all(has_limiter(clip) for clip in clips)
+        settled = (
+            squeezed
+            and bool(pending.redo)
+            and limiters_match(pending.targets, pending.ceiling - plan.lowered)
+        )
         if not moved and (not squeezed or settled):
             after = decided.limited_lufs
             short = target - (report.loudness if after is None else after)
@@ -5063,7 +5067,7 @@ class MainWindow(QMainWindow):
         commands = gain_commands(clips, decided.gain_db) if moved else []
         try:
             if squeezed:
-                commands += limiter_commands(pending.targets, pending.ceiling)
+                commands += limiter_commands(pending.targets, pending.ceiling, plan.lowered)
         except ToolError as error:
             self.statusBar().showMessage(f"音量をそろえられなかった: {error}", 8000)
             return
@@ -5079,7 +5083,11 @@ class MainWindow(QMainWindow):
             held = limited_peak(pending.targets, pending.ceiling)
             if held > pending.ceiling + 0.05:
                 stopped += f" トラックの音量で、山は {held:g} dBFS まで上がる"
-            if clips_overlap(clips):
+            if plan.lowered > 0:
+                stopped += f" 重なって鳴る分、上限は {plan.lowered:.1f} dB 低く置いた"
+            if plan.held_db is not None and plan.held_db > pending.ceiling + 0.05:
+                stopped += f" 重なって鳴る所の山は {plan.held_db:g} dBFS までに収めた"
+            if clips_overlap(clips) and plan.held_db is None:
                 # リミッターはクリップごと 重なって鳴る音の和は上限を越えうる
                 stopped += (
                     " 重なって鳴る所は音が割れることがある AI アシスタントの check_output で"

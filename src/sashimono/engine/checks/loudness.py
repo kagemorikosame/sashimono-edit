@@ -32,6 +32,8 @@ from sashimono.effects.limiter import DEFAULT_RELEASE_MS, reduction
 __all__ = [
     "ABSOLUTE_GATE",
     "Dynamics",
+    "Headroom",
+    "LoudnessLane",
     "LoudnessMeter",
     "block_loudness",
     "channel_weights",
@@ -126,6 +128,42 @@ _FINE_PARTS = 20
 
 
 @dataclass(frozen=True, slots=True, eq=False)
+class LoudnessLane:
+    """重ならないクリップの組 1 つの手がかり（#494） リミッターはこの音へ別々に掛かる"""
+
+    energy: np.ndarray
+    peak: np.ndarray
+    #: 組のクリップの頭（測り始めからの秒）
+    starts: tuple[float, ...] = ()
+
+
+class Headroom:
+    """組ごとに抑えた音の和が ``top`` を越えない、リミッターの上限（#494）
+
+    区切りごとに Σ min(上限, 山) = top となる上限を解き、一番低い物を取る（山の時刻が揃った
+    最悪の形なので、越える側へは外さない） 掛ける量を変えて何度も引くので、並べた物を覚える
+    """
+
+    def __init__(self, lanes: Sequence[LoudnessLane]) -> None:
+        self._peaks = np.sort(np.stack([lane.peak.astype(np.float64) for lane in lanes]), axis=0)
+        self._total = self._peaks.sum(axis=0)
+
+    def ceiling(self, gain_db: float, top_db: float) -> float:
+        """``gain_db`` 上げた和を ``top_db`` に収める上限（dBFS） どこも越えなければ ``inf``"""
+        allowed = 10.0 ** ((top_db - gain_db) / 20.0)
+        hot = self._total > allowed
+        if not np.any(hot):
+            return math.inf
+        peaks = self._peaks[:, hot]
+        level = np.full(peaks.shape[1], -math.inf)
+        below = np.zeros(peaks.shape[1])
+        for index, row in enumerate(peaks):
+            level = np.maximum(level, (allowed - below) / (len(peaks) - index))
+            below += row
+        return gain_db + 20.0 * math.log10(max(float(level.min()), 1e-12))
+
+
+@dataclass(frozen=True, slots=True, eq=False)
 class Dynamics:
     """リミッターで抑えた後の音量を、混ぜ直さずに見積もる手がかり（#494）
 
@@ -139,6 +177,8 @@ class Dynamics:
     peak: np.ndarray
     #: 100 ms の区切り 1 つのサンプル数
     step: int
+    #: 重なって鳴るときの、組ごとの手がかり 無ければ混ぜた音へ 1 つのリミッターとして数える
+    lanes: tuple[LoudnessLane, ...] = ()
 
     def limited_loudness(
         self, gain_db: float, ceiling_db: float, starts: Sequence[float] = ()
@@ -147,24 +187,45 @@ class Dynamics:
 
         区切りの中は一番強く絞った量で通して数える 見積もりが低めに出るので、届かない側へは外さない
         ``starts`` はクリップの頭（測り始めからの秒） そこで絞る量の持ち越しを切る
+
+        組があれば、混ぜた音の大きさへ Σk²E / ΣE（k は組ごとの絞り、E は組ごとの大きさ）を掛ける
+        同じ音の重なりと無関係な音の重なりのどちらでも正しく、59 分の話し声に BGM・打楽器・
+        別の話し声を重ねて 0.06 LU 以内で合った 組の二乗だけを足すと、同じ音の重なりで 3 dB 外す
         """
         ratio = 10.0 ** (gain_db / 20.0)
-        ceiling = 10.0 ** (ceiling_db / 20.0)
-        wanted = 1.0 - np.minimum(1.0, ceiling / np.maximum(self.peak * ratio, 1e-12))
-        kept = np.full(len(wanted), ratio)
-        if np.any(wanted > 0.0):
-            interval = 0.1 / _FINE_PARTS
-            release = DEFAULT_RELEASE_MS / 1000.0
-            resets = {round(start / interval) for start in starts}
-            bounds = sorted({0, len(wanted), *(at for at in resets if 0 < at < len(wanted))})
-            for low, high in pairwise(bounds):
-                kept[low:high] *= 1.0 - reduction(wanted[low:high], interval, release)
-        ticks = (self.energy * kept * kept).reshape(-1, _FINE_PARTS).sum(axis=1)
+        ceiling = 10.0 ** (ceiling_db / 20.0) / ratio
+        if self.lanes:
+            weighted = np.zeros(len(self.energy))
+            plain = np.zeros(len(self.energy))
+            for lane in self.lanes:
+                kept = _kept(lane.peak, ceiling, lane.starts)
+                weighted += lane.energy * kept * kept
+                plain += lane.energy
+            share = np.divide(weighted, plain, out=np.ones_like(plain), where=plain > 0.0)
+        else:
+            kept = _kept(self.peak, ceiling, starts)
+            share = kept * kept
+        energy = self.energy * share * (ratio * ratio)
+        ticks = energy.reshape(-1, _FINE_PARTS).sum(axis=1)
         if len(ticks) < 4:
             return None
         return gated_loudness(
             (ticks[:-3] + ticks[1:-2] + ticks[2:-1] + ticks[3:]) / (4 * self.step)
         )
+
+
+def _kept(peak: np.ndarray, ceiling: float, starts: Sequence[float]) -> np.ndarray:
+    """区切りごとに、リミッターの後へ残る割合 ``starts`` で絞る量の持ち越しを切る"""
+    wanted = 1.0 - np.minimum(1.0, ceiling / np.maximum(peak, 1e-12))
+    kept = np.ones(len(wanted))
+    if np.any(wanted > 0.0):
+        interval = 0.1 / _FINE_PARTS
+        release = DEFAULT_RELEASE_MS / 1000.0
+        resets = {round(start / interval) for start in starts}
+        bounds = sorted({0, len(wanted), *(at for at in resets if 0 < at < len(wanted))})
+        for low, high in pairwise(bounds):
+            kept[low:high] -= reduction(wanted[low:high], interval, release)
+    return kept
 
 
 class LoudnessMeter:

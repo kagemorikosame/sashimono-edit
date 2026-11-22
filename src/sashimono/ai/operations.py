@@ -37,7 +37,7 @@ from sashimono.ai.auto_fix import (
     limited_ceiling,
     limited_peak,
     limiter_commands,
-    loudness_predictor,
+    limiters_match,
     picture_clip,
     plan_color_fix,
     plan_noise_fix,
@@ -72,6 +72,7 @@ from sashimono.ai.host import (
     SheetCanvas,
     ToolError,
 )
+from sashimono.ai.loudness_plan import plan_loudness
 from sashimono.ai.outbound import (
     ASKED,
     UNKNOWN_FIELD_SENDS,
@@ -302,7 +303,6 @@ from sashimono.core.mixing import (
     db_to_ratio,
     gain_commands,
     loudest,
-    loudness_gain,
     measure_project,
     plan_ducking,
     scaled_volume,
@@ -7514,6 +7514,8 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
         start=start,
         end=end,
         scene=str(host.active_scene) if host.active_scene is not None else None,
+        # 重なって鳴る音は組ごとにも測る（#494） リミッターはクリップごとに掛かる
+        separate=squeeze > 0 and clips_overlap([clip for _, clip in targets]),
     )
     host.request_check(request)
 
@@ -7577,17 +7579,16 @@ def _apply_loudness(
     measured = report.loudness
     # 前に積んだリミッターの上限より上へは上げない 上げた分は潰れて、基準に届いたと嘘を答える
     cap = limited_ceiling(targets, ceiling)
-    decided = loudness_gain(
-        clips,
-        measured=measured,
-        peak_db=report.peak_db,
+    plan = plan_loudness(
+        report,
+        targets,
         target=request.limits.loudness_target,
         ceiling=ceiling,
         squeeze=squeeze,
         # 外して測り、上限も置き直すリミッターは、上げる量を止めない
         raise_ceiling=None if redo else raise_cap(targets, ceiling),
-        predict=loudness_predictor(report, ceiling, clips),
     )
+    decided = plan.decided
     gain = decided.gain_db
     limited = list(decided.limited_by)
     estimate = decided.limited_lufs
@@ -7611,7 +7612,7 @@ def _apply_loudness(
     if redo:
         result["measured_before_limiter"] = True
     # もう同じ形で抑えてあり、掛ける量も変わらない 積み直すと何も変わらない取り消しの段が増える
-    settled = squeezed and bool(redo) and all(has_limiter(clip) for clip in clips)
+    settled = squeezed and bool(redo) and limiters_match(targets, ceiling - plan.lowered)
     if not moved and (not squeezed or settled):
         result["gain_db"] = 0.0
         if settled and estimate is None:
@@ -7637,7 +7638,7 @@ def _apply_loudness(
         return result
     commands = gain_commands(clips, gain) if moved else []
     if squeezed:
-        commands += limiter_commands(targets, ceiling)
+        commands += limiter_commands(targets, ceiling, plan.lowered)
     host.apply_commands(commands, f"音量を {request.limits.loudness_target:g} LUFS へそろえる")
     result |= {
         "gain_db": round(gain, 2) if moved else 0.0,
@@ -7673,23 +7674,29 @@ def _apply_loudness(
         overlap = clips_overlap(clips)
         held = limited_peak(targets, ceiling)
         raised = None if report.peak_db is None else report.peak_db + (gain if moved else 0.0)
+        mixed_peak = plan.held_db if overlap else (held if raised is None else min(raised, held))
+        if plan.lowered > 0:
+            result["ceiling_lowered_db"] = plan.lowered
         result |= {
             "limiter_db": round(decided.squeeze_db, 1),
-            # リミッターはクリップごと 重なって鳴る音の和は上限を越えうるので、言い切らない
-            "expected_peak_dbfs": None
-            if overlap
-            else round(held if raised is None else min(raised, held), 2),
+            # 重なって鳴る音の和は、組ごとに測って余裕を取れたとき（#494）だけ言う
+            "expected_peak_dbfs": None if mixed_peak is None else round(mixed_peak, 2),
             # 抑えた分だけ音量は測った値より下がる どれだけ下がるかは山の続き方で決まり、
             # 測る前の値から言い切ると、目標より大きく下がっても届いたと答える 届かないと
             # 分かっている所は、抑えるとさらに下がるだけなので false のまま
             "reached": None if reached else False,
-            "expected_lufs": None if overlap or estimate is None else round(estimate, 1),
+            "expected_lufs": None if estimate is None else round(estimate, 1),
             "loudness_rechecked": False,
         }
         notes.append(
             f"音の山が {ceiling:g} dBFS を {decided.squeeze_db:.1f} dB 越えるので、"
             "どの音のクリップにも"
-            "最後にリミッター（上限は同じ値）を積みました"
+            + (
+                f"最後にリミッター（上限は重なって鳴る分の {plan.lowered:g} dB を引いた値）を"
+                "積みました"
+                if plan.lowered > 0
+                else "最後にリミッター（上限は同じ値）を積みました"
+            )
             + (
                 " 山だけを抑えるので、音量は見込みより下がります"
                 if estimate is None
@@ -7702,7 +7709,12 @@ def _apply_loudness(
                 f"トラックの音量か定位で、リミッターの後の山が {held:g} dBFS まで上がります"
                 " そのトラックの音量を下げてから呼び直してください"
             )
-        if overlap:
+        if overlap and plan.held_db is not None and plan.held_db > ceiling + _ON_TARGET_LU:
+            notes.append(
+                f"重なって鳴る音の和は {ceiling:g} dBFS に収めると基準に届かないので、割れない"
+                f" {plan.held_db:g} dBFS までに収めました"
+            )
+        elif overlap and plan.held_db is None:
             result["mixed_peak_checked"] = False
             notes.append(
                 "リミッターはクリップごとに掛かるので、重なって鳴る音の和は上限を越えることが"
@@ -13884,6 +13896,8 @@ OPERATIONS: tuple[Operation, ...] = (
             "上げ（limiter_db に抑えた量）、それでも届かないときと音量の欄の上限 400% に"
             "当たるときは、"
             "基準の手前で止めて limited_by に書く（reached が false なら基準に届いていない）"
+            " 声と BGM など重なって鳴る音は、抑えた音どうしの和が割れないようリミッターの上限を"
+            "下げて置く（ceiling_lowered_db 下げた分も抑える深さに数える）"
             " 測るのに時間がかかる 終わらなければ"
             "何も変えずに measuring を返す（同じ引数でもう 1 度呼ぶと続きから）"
             " 取り消し 1 回で戻る"

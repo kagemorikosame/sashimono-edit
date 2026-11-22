@@ -334,6 +334,10 @@ def _compensated(
     たいていは掛けた量とともに増えるので二分で詰める ただし増える一方とは限らない 静かな所が
     相対ゲートを越えて平均に入ると下がるので、上端で届かないときだけ下から順に見て、初めて届いた
     所（一番浅く抑える側）の手前から詰める
+
+    見落としの限り 見るのは :data:`_SCAN_DB` おきと、その中で一番よかった点の前後（:func:`_crest`
+    0.02 dB まで） それより低く見えた別の山にある、幅 1 dB 未満の届く範囲は拾わない そのときも
+    返すのは見た中で一番大きく鳴る量で、基準に届いたとは答えない
     """
     if high <= low:
         return high
@@ -355,7 +359,10 @@ def _compensated(
                 best, loudest_value = at, value
             below = at
         else:
-            return best
+            at, value = _crest(predict, target, best, loudest_value, low, high)
+            if value < target:
+                return at
+            low, high = max(low, best - _SCAN_DB) if at <= best else best, at
     for _ in range(_COMPENSATION_STEPS):
         middle = (low + high) / 2.0
         value = predict(middle)
@@ -366,6 +373,49 @@ def _compensated(
     return high
 
 
+def _crest(
+    predict: Callable[[float], float | None],
+    target: float,
+    best: float,
+    best_value: float,
+    low: float,
+    high: float,
+) -> tuple[float, float]:
+    """1 dB おきに見て一番よかった ``best`` のまわりの、一番大きく鳴る量とその音量
+
+    届く範囲が格子より狭いと、格子のどの点も届かない 黄金分割で詰め、届いた所で止める
+    上端へ向けて増え続けている形（山が無い）は 1 回見て止める 見積もりは 1 回が重い
+    """
+
+    def heard(gain: float) -> float:
+        value = predict(gain)
+        return -math.inf if value is None else value
+
+    if best >= high and heard(high - _CREST_DB) <= best_value:
+        return best, best_value
+    left, right = max(low, best - _SCAN_DB), min(high, best + _SCAN_DB)
+    first, second = right - _GOLDEN * (right - left), left + _GOLDEN * (right - left)
+    first_value, second_value = heard(first), heard(second)
+    while True:
+        at, value = (first, first_value) if first_value >= second_value else (second, second_value)
+        if value > best_value:
+            best, best_value = at, value
+        if best_value >= target or right - left <= _CREST_DB:
+            return best, best_value
+        if first_value >= second_value:
+            right, second, second_value = second, first, first_value
+            first = right - _GOLDEN * (right - left)
+            first_value = heard(first)
+        else:
+            left, first, first_value = first, second, second_value
+            second = left + _GOLDEN * (right - left)
+            second_value = heard(second)
+
+
+#: 格子の間の山を詰める細かさ（dB）
+_CREST_DB = 0.02
+#: 黄金分割の比
+_GOLDEN = (math.sqrt(5.0) - 1.0) / 2.0
 #: これより足りなければ基準に届いていないと読む（LU） 見積もりの細かさと同じくらい
 _SHORT_LU = 0.05
 #: 二分の回数 12 dB の幅が 0.003 dB まで詰まる
