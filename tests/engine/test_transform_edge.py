@@ -34,9 +34,19 @@ from sashimono.core.model import (
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry
+from sashimono.effects.edges import placed_edges
 from sashimono.engine.decode import VideoDecoder, probe_media
 from sashimono.engine.encode import ExportSettings, export_project
-from sashimono.engine.gpu import GLContextError, OffscreenGLContext
+from sashimono.engine.gpu import (
+    OFF_SCREEN,
+    Compositor,
+    EffectProcessor,
+    GLContextError,
+    OffscreenGLContext,
+    Placement,
+    Texture,
+)
+from sashimono.engine.gpu.glutil import FULL_RECT
 from sashimono.engine.render import FrameRenderer, RenderQuality
 from tests.media_fixtures import libx264_available
 
@@ -233,6 +243,19 @@ def test_a_colour_change_before_the_scale_keeps_the_rim(
     )
 
 
+@pytest.mark.parametrize("divisor", [1, 2, 4])
+def test_a_picture_cropped_on_one_side_and_flipped_fills_cleanly(
+    gl_context: OffscreenGLContext, tmp_path: Path, divisor: int
+) -> None:
+    """片側だけ切って裏返すと縁が反対側へ移る 移った先を追わないと、その辺だけ暗く残る"""
+    media = _png(tmp_path, _plain(202, 90))
+    crop = registry.require("crop").create(left=42)
+    flip = registry.require("flip").create(horizontal=True)
+    # 裏返した後の絵（幅 160）の真ん中は、画面の真ん中より 21 左
+    clip = _placed(_media_clip(media), crop, flip, scale=300.0, pos_x=63.0)
+    _assert_full(_render(_project(clip, media), gl_context, divisor=divisor))
+
+
 def test_a_shape_scaled_to_the_screen_fills_cleanly(gl_context: OffscreenGLContext) -> None:
     """図形と文字は画面と同じ大きさの絵で届く 絵の端ではなく中身の端で見ないと背景の板が暗い"""
     source = GeneratedSource(
@@ -273,6 +296,26 @@ def test_a_group_zoom_to_the_screen_fills_cleanly(
     )
     clip = _placed(_media_clip(media), scale=own)
     _assert_full(_render(_project(clip, media, controller), gl_context))
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        {"scale": 150.0, "rotation": 90.0},
+        {"scale": 150.0, "pivot_h": "left", "pos_x": -40.0},
+        {"scale": 150.0, "pivot_h": "left", "move_to_pivot": True, "pos_x": -120.0},
+    ],
+    ids=["turned", "pivot", "moved_to_pivot"],
+)
+def test_a_second_scale_finds_the_edge_the_first_one_left(
+    gl_context: OffscreenGLContext, tmp_path: Path, first: dict[str, float | str | bool]
+) -> None:
+    """縁を追う計算がシェーダの動かし方とずれると、2 段に拡大した辺だけ暗い縁が戻る"""
+    turned = "rotation" in first
+    media = _png(tmp_path, _plain(90, 160) if turned else _plain(160, 90))
+    inner = registry.require("transform").create(**first)
+    clip = _placed(_media_clip(media), inner, scale=200.0)
+    _assert_full(_render(_project(clip, media), gl_context))
 
 
 def test_a_keyframed_zoom_reaches_the_edge_without_a_jump(
@@ -397,3 +440,45 @@ def test_the_exported_video_has_no_dark_rim(gl_context: OffscreenGLContext, tmp_
     ):
         assert abs(line[..., 1].mean() - inner[..., 1].mean()) <= 3, f"{name}の外周が暗い"
     assert abs(exported[0, :, 1].mean() - preview[0, :, 1].mean()) <= 4
+
+
+def test_the_rim_of_the_placed_frame_is_not_blurred() -> None:
+    """縮めて置いた枠の縁までなまったと見積もると、画面の端から少しはみ出した絵（301%）の
+    外周の中身が、画質を落としたプレビューでだけ隣の画素へずれる
+    """
+    rect = (52.0, 29.0, 68.0, 38.0)
+    assert placed_edges(rect, rect, (64, 36)).soft == (0.5, 0.5)
+    inner = (56.0, 31.0, 64.0, 36.0)
+    assert placed_edges(inner, rect, (64, 36)).soft == (0.625, 0.625)
+
+
+def test_a_work_area_is_not_taken_for_the_screen(gl_context: OffscreenGLContext) -> None:
+    """焼き込みの作業場や、後で回して貼る絵の端を画面の端と見ると、画面の中に見える縁が硬くなる"""
+    with gl_context:
+        compositor = Compositor(WIDTH, HEIGHT)
+        processor = EffectProcessor(WIDTH, HEIGHT, compositor.quad)
+        pixels = _plain(WIDTH, HEIGHT, (0, 0, 0, 0))
+        pixels[90:180, 160:320] = GREY
+        texture = Texture.from_array(pixels)
+        scaled = (registry.require("transform").create(scale=300.0),)
+        alphas = []
+        for screen in (None, OFF_SCREEN):
+            result = processor.apply(
+                texture,
+                scaled,
+                frame=0,
+                fps=30.0,
+                source_rect=FULL_RECT,
+                bounds=(160.0, 90.0, 320.0, 180.0),
+                screen=screen,
+            )
+            compositor.begin((0.0, 0.0, 0.0, 0.0))
+            compositor.draw_handle(
+                result.color, Placement(0.0, 0.0, float(WIDTH), float(HEIGHT)), flip=False
+            )
+            alphas.append(int(compositor.read(straight=True)[135, 0, 3]))
+        texture.release()
+        processor.release()
+        compositor.release()
+    assert alphas[0] >= 253
+    assert abs(alphas[1] - 170) <= 2

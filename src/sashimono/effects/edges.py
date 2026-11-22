@@ -56,17 +56,22 @@ class EdgeStep:
 type MoveEdges = Callable[[PictureEdges, EdgeStep], PictureEdges | None]
 
 
-def placed_edges(box: _Box, placed: tuple[float, float], source: tuple[int, int]) -> PictureEdges:
-    """``source`` の大きさの絵を ``placed`` の大きさへ置いた直後の縁"""
+def placed_edges(box: _Box, rect: _Box, source: tuple[int, int]) -> PictureEdges:
+    """``source`` の大きさの絵を ``rect`` へ置いた直後の縁 ``box`` は中身のある範囲"""
 
-    def softness(size: float, pixels: int) -> float:
-        zoom = abs(size) / max(pixels, 1)
-        if abs(zoom - 1.0) < _SLACK:
+    def softness(axis: int) -> float:
+        low, high = rect[axis], rect[axis + 2]
+        zoom = abs(high - low) / max(source[axis], 1)
+        # 置いた枠そのものの縁は四角で切れるのでなまらない なまると見ると、端から少し
+        # はみ出した絵（拡大率 301 など）の外周の中身まで読む位置が動く
+        on_rim = abs(box[axis] - low) < _SLACK and abs(box[axis + 2] - high) < _SLACK
+        if on_rim or abs(zoom - 1.0) < _SLACK:
             return 0.5
-        # 伸ばして置けば補間の幅の半分、縮めて置けば平均した範囲の分だけ縁がなまる
+        # 枠の中の縁（透明な余白のある絵） 伸ばして置けば補間の幅の半分、縮めて置けば
+        # 平均した範囲の分だけなまる
         return zoom / 2.0 if zoom > 1.0 else (1.0 + zoom) / 2.0
 
-    return PictureEdges(box, (softness(placed[0], source[0]), softness(placed[1], source[1])))
+    return PictureEdges(box, (softness(0), softness(1)))
 
 
 def cropped_edges(edges: PictureEdges, step: EdgeStep) -> PictureEdges:

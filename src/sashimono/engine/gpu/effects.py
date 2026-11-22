@@ -191,17 +191,18 @@ class EffectProcessor:
         self._draw_source(source, source_rect, flip_source, premultiplied)
         width, height = float(self.width), float(self.height)
         #: 絵が置かれた範囲（画素、GL の向き） 角丸や中心基準の動きが使う
+        left, bottom, right, top = (float(v) for v in source_rect[:4])
+        placed = (
+            (left + 1.0) * 0.5 * width,
+            (bottom + 1.0) * 0.5 * height,
+            (right + 1.0) * 0.5 * width,
+            (top + 1.0) * 0.5 * height,
+        )
         if bounds is not None:
             left_px, top_px, right_px, bottom_px = bounds
             self._object = (left_px, height - bottom_px, right_px, height - top_px)
         else:
-            left, bottom, right, top = (float(v) for v in source_rect[:4])
-            self._object = (
-                (left + 1.0) * 0.5 * width,
-                (bottom + 1.0) * 0.5 * height,
-                (right + 1.0) * 0.5 * width,
-                (top + 1.0) * 0.5 * height,
-            )
+            self._object = placed
         if origin is not None:
             self._origin = (origin[0], height - origin[1])
         else:
@@ -218,14 +219,7 @@ class EffectProcessor:
             (width + seen_width) * 0.5,
             (height + seen_height) * 0.5,
         )
-        self._edges = placed_edges(
-            self._object,
-            (
-                (float(source_rect[2]) - float(source_rect[0])) * 0.5 * width,
-                (float(source_rect[3]) - float(source_rect[1])) * 0.5 * height,
-            ),
-            (source.width, source.height),
-        )
+        self._edges = placed_edges(self._object, placed, (source.width, source.height))
 
         #: 開いている部分フィルタ 後ろのエフェクトはこの範囲の中だけに効く
         scope: tuple[_Compiled, Effect] | None = None
