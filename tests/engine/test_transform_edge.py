@@ -406,9 +406,10 @@ def test_a_cut_side_reads_the_column_at_the_cut(
     clip = _placed(
         _media_clip(media), *before, scale=150.0, scale_x=48000.0 / 230 / 1.5, pos_x=shift
     )
-    seen = _render(_project(clip, media), gl_context)[135, -1 if flipped else 0]
-    assert seen[3] >= 253, "切った辺が暗い"
-    assert seen[0] <= 8, f"切り口より内の列の色が出た: {seen[0]}"
+    seen = _render(_project(clip, media), gl_context)[:, -1 if flipped else 0]
+    # 1 行だけでなく辺の全部 角を含めてどの行も切り口の列の色と濃さ
+    assert seen[:, 3].min() >= 253, f"切った辺が暗い: {seen[:, 3].min()}"
+    assert seen[:, 0].max() <= 8, f"切り口より内の列の色が出た: {seen[:, 0].max()}"
 
 
 @pytest.mark.parametrize(
