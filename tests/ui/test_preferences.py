@@ -27,6 +27,7 @@ from sashimono.ui.preferences_dialog import (
     PreferencesDialog,
 )
 from sashimono.ui.workspace import AUTO_QUALITY_HEIGHT, Preferences, PreferenceStore
+from tests.ui.export_codecs import settled
 
 
 def _uhd_media() -> MediaItem:
@@ -833,9 +834,12 @@ class TestTheParallelDecodeSetting:
         window = MainWindow(Project.create(), confirm_unsaved=False)
         try:
             window._apply_preferences(Preferences(decode_threads=1))
-            dialog = ExportDialog(
-                window._document.project,
-                decode_threads=window._preferences.decode_threads,
+            # 起動の後の確かめと重なると欄が「確かめています」のままで、設定を読めない
+            dialog = settled(
+                ExportDialog(
+                    window._document.project,
+                    decode_threads=window._preferences.decode_threads,
+                )
             )
             try:
                 settings = dialog._settings()
