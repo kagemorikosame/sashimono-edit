@@ -24,6 +24,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from fractions import Fraction
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -74,7 +75,7 @@ from sashimono.ai.host import (
     SheetCanvas,
     ToolError,
 )
-from sashimono.ai.loudness_plan import plan_loudness
+from sashimono.ai.loudness_plan import LoudnessPlan, PlanJob, plan_loudness
 from sashimono.ai.outbound import (
     ASKED,
     UNKNOWN_FIELD_SENDS,
@@ -7515,7 +7516,7 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
         project=measure_project(project, (clip.id for _, clip in targets), redo),
         start=start,
         end=end,
-        scene=str(host.active_scene) if host.active_scene is not None else None,
+        scene=_scene(host),
         # リミッターの見る所も測る（#494） クリップごとに、トラックの音量と定位の前で掛かる
         separate=squeeze > 0 and measures_apart(targets, ceiling),
     )
@@ -7531,6 +7532,9 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
 
 #: これより小さい差は基準に合っていると読む（LU） 掛けても聞き分けられない
 _ON_TARGET_LU = 0.05
+#: 抑えた後の見積もりを待つ上限（秒 #497） 3 時間分で 4 秒ほど 遅い機械でも越えない長さに取る
+#: 越えたら何も変えずに断る（待ち続けると、中断のほかに AI を止める手が無い）
+_PLAN_WAIT = 120.0
 #: 抑えた後の見積もりで基準に合っていると読む差（LU #494） 5 ms の区切りで見積もる細かさ
 _ESTIMATE_LU = 0.1
 
@@ -7549,7 +7553,6 @@ def _apply_loudness(
     ``squeeze`` はリミッターで抑えてよい山の量（dB #414） 山が天井を越える分だけ、どのクリップにも
     リミッターを積む ``redo`` は外して測ったリミッター（測った値は抑える前の音 #494）
     """
-    clips = [clip for _, clip in targets]
     state = host.check_state()
     if state.request != request:
         raise ToolError("測っている間に別の検査に替わりました もう 1 度呼んでください")
@@ -7578,18 +7581,76 @@ def _apply_loudness(
         raise ToolError(
             "測っている間に作品が変わりました 何も変えていません もう 1 度呼ぶと測り直します"
         )
+    # 抑えた後の見積もりは長い作品で数秒かかる（3 時間分で 1.6 秒、重なると 3.6 秒） 道具は画面の
+    # スレッドで動くので、ここで数えるとその間は描き直しも中断も効かない 裏で数え、待つのは
+    # AI のスレッド（Pending）にする（#497）
+    job = PlanJob(
+        partial(
+            plan_loudness,
+            report,
+            targets,
+            target=request.limits.loudness_target,
+            ceiling=ceiling,
+            squeeze=squeeze,
+            # 外して測り、上限も置き直すリミッターは、上げる量を止めない
+            raise_ceiling=None if redo else raise_cap(targets, ceiling),
+        )
+    )
+
+    def settle() -> object:
+        plan = job.take()
+        if plan is None:
+            job.abandon()
+            raise ToolError(
+                "抑えた後の音量の見積もりが時間内に終わりませんでした 何も変えていません"
+                " もう 1 度呼んでください"
+            )
+        if host.check_state().request != request:
+            # 見積もる間に別の検査が始まった 測り終えたときだけ見ると、見積もりの数秒が抜ける
+            # （PR #498 の Sourcery の指摘）
+            raise ToolError(
+                "見積もっている間に別の検査に替わりました 何も変えていません"
+                " もう 1 度呼んでください"
+            )
+        if _scene(host) != request.scene:
+            # 同じ中身の別の場面へ切り替わると作品の比べでは分からず、測っていない場面を変える
+            raise ToolError(
+                "見積もっている間に場面が切り替わりました 何も変えていません"
+                " 測った場面に戻してから呼び直してください"
+            )
+        if _project(host) != project:
+            # 見積もる間に足した音まで同じだけ上げると、測った音量と合わなくなる
+            raise ToolError(
+                "見積もっている間に作品が変わりました 何も変えていません"
+                " もう 1 度呼ぶと測り直します"
+            )
+        return _settle_loudness(host, request, targets, ceiling, squeeze, redo, report, plan)
+
+    # 中断したら見積もりも止める 止めないと、待つのをやめた見積もりが裏で数秒回り続ける
+    return Pending(wait=job.wait, seconds=_PLAN_WAIT, then=settle, stop=job.abandon)
+
+
+def _scene(host: EditorHost) -> str | None:
+    """検査の頼み（:attr:`CheckRequest.scene`）と同じ形の、今の場面"""
+    return str(host.active_scene) if host.active_scene is not None else None
+
+
+def _settle_loudness(
+    host: EditorHost,
+    request: CheckRequest,
+    targets: list[tuple[Track, Clip]],
+    ceiling: float,
+    squeeze: float,
+    redo: frozenset[EffectId],
+    report: CheckReport,
+    plan: LoudnessPlan,
+) -> object:
+    """見積もった計画どおりに掛け、AI への答えを作る（:func:`_apply_loudness` の続き #497）"""
+    clips = [clip for _, clip in targets]
     measured = report.loudness
+    assert measured is not None
     # 前に積んだリミッターの上限より上へは上げない 上げた分は潰れて、基準に届いたと嘘を答える
     cap = limited_ceiling(targets, ceiling)
-    plan = plan_loudness(
-        report,
-        targets,
-        target=request.limits.loudness_target,
-        ceiling=ceiling,
-        squeeze=squeeze,
-        # 外して測り、上限も置き直すリミッターは、上げる量を止めない
-        raise_ceiling=None if redo else raise_cap(targets, ceiling),
-    )
     decided = plan.decided
     gain = decided.gain_db
     limited = list(decided.limited_by)

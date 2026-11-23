@@ -35,7 +35,7 @@ from sashimono.ai import safety
 from sashimono.ai.command_ledger import COMMANDS_WITHOUT_TOOLS, Why
 from sashimono.ai.host import ToolError
 from sashimono.ai.ledger import CHILD_ISSUES
-from sashimono.ai.operations import OPERATIONS, Pending, find_operation, finish
+from sashimono.ai.operations import OPERATIONS, find_operation
 from sashimono.compat.aviutl.catalog import ScriptCatalog
 from sashimono.compat.looks import capture_preset
 from sashimono.core.commands import (
@@ -65,6 +65,7 @@ from sashimono.effects.sources import TEXT
 from sashimono.engine.audio.voicevox import NarrationSettings
 from sashimono.engine.decode import probe_media
 from tests.ai.conftest import FakeHost
+from tests.ai.pending import run_now, settle
 from tests.ai.test_auto_fix_tools import Work, _strip, _waveform
 from tests.ai.test_cut_fillers import filler_host
 from tests.ai.test_look_tools import (
@@ -149,7 +150,7 @@ Example = Callable[[Material], tuple[FakeHost, str, dict[str, Any]]]
 def _run(host: FakeHost, tool: str, **arguments: Any) -> Any:
     operation = find_operation(tool)
     assert operation is not None
-    return operation(host, arguments)
+    return run_now(tool, operation(host, arguments), arguments)
 
 
 def _text_host(material: Material) -> FakeHost:
@@ -544,18 +545,6 @@ def _write_example(name: str) -> Example:
 
 #: 道具を動かす関数 :data:`OPERATIONS` の 1 つか、試験が作る偽物
 Run = Callable[[Any, dict[str, Any]], Any]
-
-
-def settle(result: object) -> object:
-    """裏で待つ道具の答え（:class:`Pending` #321）を、ブリッジと同じく待ってから辿る
-
-    辿らないと、待った後の ``then`` で積むコマンド（ナレーション #335 の声を置く・表記を
-    足すなど）を数えず、AI が通すコマンドに要らない理由を求める
-    """
-    while isinstance(result, Pending):
-        result.wait(result.seconds)
-        result = finish(result.then())
-    return result
 
 
 def tally(operation: Run, host: FakeHost, arguments: dict[str, Any]) -> tuple[set[str], str | None]:

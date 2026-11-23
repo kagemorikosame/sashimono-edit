@@ -21,6 +21,7 @@ from sashimono.engine.decode import AudioDecoder, probe_media
 from sashimono.engine.encode import export_project
 from sashimono.ui.export_dialog import ExportDialog
 from tests.media_fixtures import make_sample
+from tests.ui.export_codecs import settled
 
 pytestmark = pytest.mark.usefixtures("gpu")
 
@@ -53,7 +54,7 @@ def test_only_the_range_is_exported_with_its_audio(placed_late: Project, tmp_pat
     範囲を渡し忘れると 90 コマの動画になる 音だけ頭から流すと、前半に素材の音が入り、
     後半（素材が映っている所）が無音になる
     """
-    dialog = ExportDialog(placed_late)
+    dialog = settled(ExportDialog(placed_late))
     try:
         settings = dialog._settings()
     finally:

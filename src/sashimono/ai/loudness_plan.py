@@ -7,6 +7,9 @@ AI の ``normalize_loudness`` と人の〔音量を基準にそろえる…〕�
 （:class:`~sashimono.engine.checks.loudness.LoudnessLane`）から、和の越えない所までリミッターの
 上限を一緒に下げる 下げた分も、本人の設定の抑える深さに数える
 
+計算は作品の長さに比例して重い（3 時間分で 1.6 秒、重なると 3.6 秒） 画面のスレッドで回すと
+その間は描き直しも中断も効かないので、:class:`PlanJob` で裏のスレッドへ出す（#497）
+
 リミッターはトラックの音量と定位の前に掛かる 深さと抑えた後の音量は、その所の山と、クリップごとに
 実際に置ける上限で数える 混ぜた後の音で数えると、音量 -20 dB のトラックが -20 dBFS で潰れているのに
 届いたと答える
@@ -15,8 +18,10 @@ AI の ``normalize_loudness`` と人の〔音量を基準にそろえる…〕�
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from typing import Protocol
 
 from sashimono.ai.auto_fix import (
     clips_overlap,
@@ -30,7 +35,7 @@ from sashimono.core.model import Clip, Track
 from sashimono.engine.checks.loudness import Dynamics, Headroom
 from sashimono.engine.checks.report import CheckReport
 
-__all__ = ["LoudnessPlan", "plan_loudness"]
+__all__ = ["LoudnessPlan", "PlanAbandonedError", "PlanJob", "plan_loudness"]
 
 #: 上限に収めると基準へ届かないときに、代わりに和を収める所（dBFS） 割れだけは作らない
 _NO_CLIP_DB = -0.1
@@ -53,6 +58,74 @@ class LoudnessPlan:
     unchecked: bool = False
 
 
+class PlanAbandonedError(Exception):
+    """見積もりを途中でやめた（:meth:`PlanJob.abandon`）"""
+
+
+#: やめたかを尋ねる口 見積もりの重い 1 歩（抑えた後の音量 1 回など）の前に聞く
+type Stopped = Callable[[], bool]
+
+
+def _never() -> bool:
+    return False
+
+
+class _Work(Protocol):
+    """裏で回す見積もり やめたかを尋ねる口を名前で受ける（:func:`plan_loudness` の ``stopped``）"""
+
+    def __call__(self, *, stopped: Stopped) -> LoudnessPlan: ...
+
+
+class PlanJob:
+    """:func:`plan_loudness` を裏のスレッドで回す（#497）
+
+    重い所は numpy が GIL を離すので、回している間も画面のスレッドは 10 ms おきの合図を
+    3 ms の遅れで受ける ``done`` は終わったとき（失敗・やめたときも）に裏のスレッドから呼ぶ
+    画面へは Qt の知らせで渡す（ここは画面の部品を知らない）
+    ``work`` はやめたかを尋ねる口を受ける 待つのをやめた見積もりを最後まで回すと、選び直す度に
+    3 時間分で数秒ずつ裏の仕事が重なる（PR #498 の Sourcery の指摘）
+    """
+
+    def __init__(self, work: _Work, done: Callable[[], None] | None = None) -> None:
+        self._finished = threading.Event()
+        self._abandoned = threading.Event()
+        self._plan: LoudnessPlan | None = None
+        self._error: Exception | None = None
+        self._done = done
+        thread = threading.Thread(
+            target=self._run, args=(work,), name="sashimono-loudness-plan", daemon=True
+        )
+        thread.start()
+
+    def _run(self, work: _Work) -> None:
+        try:
+            self._plan = work(stopped=self._abandoned.is_set)
+        except Exception as error:
+            # ここで落とすと、待つ側は終わった印を受けられず「見積もっています」のまま残る
+            self._error = error
+        finally:
+            self._finished.set()
+            if self._done is not None:
+                self._done()
+
+    def wait(self, seconds: float) -> bool:
+        """終わるまで最長 ``seconds`` 秒待ち、終わっていれば真 どのスレッドから呼んでもよい"""
+        return self._finished.wait(seconds)
+
+    def abandon(self) -> None:
+        """待つのをやめる 裏は次の 1 歩の前で止まる（:exc:`PlanAbandonedError`）"""
+        self._abandoned.set()
+
+    def take(self) -> LoudnessPlan | None:
+        """終わっていれば計画を返す（失敗はここで投げ直す） まだなら ``None``"""
+        if not self._finished.is_set():
+            return None
+        if self._error is not None:
+            raise self._error
+        assert self._plan is not None
+        return self._plan
+
+
 def plan_loudness(
     report: CheckReport,
     targets: Sequence[tuple[Track, Clip]],
@@ -61,12 +134,14 @@ def plan_loudness(
     ceiling: float,
     squeeze: float,
     raise_ceiling: float | None,
+    stopped: Stopped = _never,
 ) -> LoudnessPlan:
     """測り終えた ``report`` から決める
 
     重なって鳴るときは、上限に収めて届く形、割れずに届く形、割れずに一番大きい形の順に取る
     どれも上限を下げずに掛けた音より小さくなるなら下げない（届かない分と割れを知らせるに留める）
     抑えて掛けた音が、抑えずに掛けた音より小さくなるなら抑えない
+    ``stopped`` が真になったら、次の重い 1 歩の前で :exc:`PlanAbandonedError` を投げる
     """
     assert report.loudness is not None
     measured, peak = report.loudness, report.peak_db
@@ -80,7 +155,7 @@ def plan_loudness(
         ceiling=ceiling,
         squeeze=squeeze,
         raise_ceiling=raise_ceiling,
-        predict=None if apart else loudness_predictor(report, ceiling, clips),
+        predict=None if apart else _watched(loudness_predictor(report, ceiling, clips), stopped),
     )
     if not apart or peak is None or squeeze <= 0:
         return LoudnessPlan(plain)
@@ -92,7 +167,7 @@ def plan_loudness(
         # 混ぜた山が上限に当たらない リミッターを積まないので、掛けた量どおりに動く
         return LoudnessPlan(plain)
     plan = _limited(
-        dynamics,
+        _Watched(dynamics, stopped),
         targets,
         measured=measured,
         # 深さは、混ぜた山と、一番深く絞るリミッターの高い方で数える
@@ -121,7 +196,7 @@ def plan_loudness(
 
 
 def _limited(
-    dynamics: Dynamics,
+    dynamics: _Watched,
     targets: Sequence[tuple[Track, Clip]],
     *,
     measured: float,
@@ -157,6 +232,8 @@ def _limited(
     if limited_peak(targets, ceiling) > ceiling + _REACHED_LU:
         # トラックの音量でリミッターの上限の範囲を越えると、組の山が止まる所を言えない
         return chosen
+    # 和の上限は作品全体の配列を結合して並べる やめた後に作らないよう、作る前に尋ねる
+    dynamics.check()
     headroom = Headroom(dynamics.lanes)
     for top in dict.fromkeys((min(ceiling, _NO_CLIP_DB), _NO_CLIP_DB)):
         found = _within(
@@ -181,7 +258,7 @@ def _limited(
 
 
 def _within(
-    dynamics: Dynamics,
+    dynamics: _Watched,
     headroom: Headroom,
     targets: Sequence[tuple[Track, Clip]],
     *,
@@ -197,6 +274,7 @@ def _within(
 
     def lowered(gain: float) -> float:
         if gain not in known:
+            dynamics.check()
             # 0.01 dB へ切り上げる 丸めで上へ外すと和が越える
             short = ceiling - headroom.ceiling(gain, top)
             known[gain] = math.ceil(short * 100.0) / 100.0 if short > 0 else 0.0
@@ -240,3 +318,39 @@ def _within(
     return LoudnessPlan(
         LoudnessGain(decided.gain_db, limited, max(0.0, depth(decided.gain_db)), after), drop, top
     )
+
+
+def _watched(
+    predict: Callable[[float], float | None] | None, stopped: Stopped
+) -> Callable[[float], float | None] | None:
+    """見積もりの 1 回ごとに、やめたかを尋ねる"""
+    if predict is None:
+        return None
+
+    def watched(gain: float) -> float | None:
+        if stopped():
+            raise PlanAbandonedError
+        return predict(gain)
+
+    return watched
+
+
+class _Watched:
+    """抑えた後の見積もり（:class:`Dynamics`）の 1 回ごとに、やめたかを尋ねる
+
+    重いのは 1 回ごとの見積もりと和の上限（3 時間分で数十 ms） その前で聞けば、やめてから
+    止まるまでも同じくらいで済む
+    """
+
+    def __init__(self, dynamics: Dynamics, stopped: Stopped) -> None:
+        self._dynamics = dynamics
+        self._stopped = stopped
+        self.lanes = dynamics.lanes
+
+    def check(self) -> None:
+        if self._stopped():
+            raise PlanAbandonedError
+
+    def limited_loudness(self, gain_db: float, ceiling_db: float) -> float | None:
+        self.check()
+        return self._dynamics.limited_loudness(gain_db, ceiling_db)

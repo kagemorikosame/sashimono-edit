@@ -21,6 +21,7 @@ from sashimono.ui import export_dialog, main_window
 from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.ui.export_codecs import settled
 from tests.ui.test_export_dialog import _non_empty_project
 
 
@@ -118,7 +119,7 @@ class TestExportFolder:
             "information",
             lambda _parent, _title, text: finished.append(text),
         )
-        dialog = ExportDialog(_non_empty_project(), folder=tmp_path)
+        dialog = settled(ExportDialog(_non_empty_project(), folder=tmp_path))
         try:
             assert Path(dialog._path.text()).parent == tmp_path
             assert dialog.started_folder is None

@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from sashimono.ai import loudness_plan
 from sashimono.ai.auto_fix import (
     FITTED_CEILING,
     clips_overlap,
@@ -25,7 +29,13 @@ from sashimono.ai.auto_fix import (
 )
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
-from sashimono.ai.loudness_plan import LoudnessPlan, plan_loudness
+from sashimono.ai.loudness_plan import (
+    LoudnessPlan,
+    PlanAbandonedError,
+    PlanJob,
+    Stopped,
+    plan_loudness,
+)
 from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddEffect, SetEffectEnabled, SetParam
 from sashimono.core.commands.effects import ParamPath
@@ -36,7 +46,7 @@ from sashimono.core.commands.fixed import (
     with_fixed_items,
 )
 from sashimono.core.io.serialize import effect_from_json, effect_to_json
-from sashimono.core.mixing import MAX_LIMITER_DB, gain_commands, loudness_gain
+from sashimono.core.mixing import MAX_LIMITER_DB, LoudnessGain, gain_commands, loudness_gain
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -56,14 +66,16 @@ from sashimono.effects.limiter import limit, limiter_history
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.audio.mixer import HISTORY_WINDOW
 from sashimono.engine.checks.job import CheckRequest, _check_timeline, _Progress
-from sashimono.engine.checks.loudness import LoudnessMeter
+from sashimono.engine.checks.loudness import Dynamics, Headroom, LoudnessLane, LoudnessMeter
 from sashimono.engine.checks.report import HIGH, MEDIUM, CheckReport
 from sashimono.engine.checks.scan import LOUDNESS, CheckLimits
 from sashimono.engine.checks.sound_lanes import LaneMeters
 from sashimono.engine.decode.probe import probe_media
 from tests.ai.conftest import FakeHost
+from tests.ai.pending import settle
 from tests.ai.test_mix_tools import _measured, _Work
 from tests.check_media import tone, write_tone
+from tests.waiting import GUARD_SECONDS, wait_until
 
 RATE = 48_000
 
@@ -71,7 +83,8 @@ RATE = 48_000
 def _run(work: _Work, **arguments: Any) -> Any:
     operation = find_operation("normalize_loudness")
     assert operation is not None
-    return operation(work.host, {"wait_seconds": 0, **arguments})
+    # 抑えた後の見積もりは裏で回る（#497） ブリッジと同じく待ってから辿る
+    return settle(operation(work.host, {"wait_seconds": 0, **arguments}))
 
 
 @pytest.fixture
@@ -1038,3 +1051,103 @@ class TestTheLimiterComesBeforeTheFader:
         ]
         assert max(cuts) <= plan.decided.squeeze_db + 0.1
         assert plan.decided.squeeze_db <= depth + 0.1
+
+
+class TestPlanJob:
+    """抑えた後の見積もりを裏で回す口（#497）"""
+
+    def test_a_failure_is_told_and_raised_again(self) -> None:
+        """裏で落ちたのを知らせないと、待つ側は「見積もっています」のまま止まる"""
+        told = threading.Event()
+
+        def broken() -> LoudnessPlan:
+            raise ValueError("壊れた手がかり")
+
+        job = PlanJob(lambda **_kw: broken(), done=told.set)
+        # 終わった印は知らせより先に立つ 印だけを待つと、知らせの前に読んで落ちることがある
+        assert told.wait(GUARD_SECONDS)
+        assert job.wait(0)
+        with pytest.raises(ValueError, match="壊れた手がかり"):
+            job.take()
+
+    def test_an_abandoned_job_stops(self) -> None:
+        """やめても最後まで回すと、選び直す度に 3 時間分で数秒ずつ裏の仕事が重なる"""
+        steps: list[int] = []
+
+        def work(*, stopped: Stopped) -> LoudnessPlan:
+            while not stopped():
+                steps.append(1)
+                time.sleep(0.001)
+            raise PlanAbandonedError
+
+        job = PlanJob(work)
+        wait_until(lambda: bool(steps), "見積もりの始まり")
+        job.abandon()
+        assert job.wait(GUARD_SECONDS)
+        with pytest.raises(PlanAbandonedError):
+            job.take()
+
+    def test_the_estimate_asks_before_each_step(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """重なって鳴る音の見積もりは 1 回ごとに重い 尋ねずに回すと、やめても数秒止まらない"""
+        project, targets = _stacked(tmp_path, _peaky() * 0.98, _music(0.05))
+        report = _checked(project)
+        assert report.loudness is not None
+        loudness = report.loudness
+        steps: list[str] = []
+        real = Dynamics.limited_loudness
+
+        def counted(self: Dynamics, *args: Any, **kwargs: Any) -> float | None:
+            steps.append("見積もり")
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(Dynamics, "limited_loudness", counted)
+
+        class CountedHeadroom(Headroom):
+            def __init__(self, lanes: Sequence[LoudnessLane]) -> None:
+                steps.append("和の上限")
+                super().__init__(lanes)
+
+        monkeypatch.setattr(loudness_plan, "Headroom", CountedHeadroom)
+
+        def plan(stopped: Stopped) -> LoudnessPlan:
+            return plan_loudness(
+                report,
+                targets,
+                target=loudness + 6.0,
+                ceiling=-1.0,
+                squeeze=12.0,
+                raise_ceiling=None,
+                stopped=stopped,
+            )
+
+        def asked() -> bool:
+            steps.append("尋ねた")
+            return False
+
+        plan(asked)
+        assert "見積もり" in steps
+        assert "和の上限" in steps
+        # どの重い 1 歩（見積もり 1 回と和の上限の用意）の前にも尋ねている
+        for at, step in enumerate(steps):
+            if step != "尋ねた":
+                assert at > 0 and steps[at - 1] == "尋ねた", steps[max(0, at - 3) : at + 1]
+        with pytest.raises(PlanAbandonedError):
+            plan(lambda: True)
+
+    def test_nothing_is_taken_before_the_end(self) -> None:
+        """終わる前に取って空の計画を当てると、何も見積もらないまま掛ける"""
+        gate = threading.Event()
+        job = PlanJob(lambda **_kw: (gate.wait(GUARD_SECONDS), _plain())[1])
+        try:
+            assert job.take() is None
+            assert not job.wait(0)
+        finally:
+            gate.set()
+        assert job.wait(GUARD_SECONDS)
+        assert job.take() == _plain()
+
+
+def _plain() -> LoudnessPlan:
+    return LoudnessPlan(LoudnessGain(gain_db=1.0))

@@ -646,9 +646,12 @@ class TestTheExportPipelineSetting:
         window = MainWindow(Project.create(), confirm_unsaved=False)
         try:
             window._apply_preferences(Preferences(export_pipeline_depth=0))
-            dialog = ExportDialog(
-                window._document.project,
-                pipeline_depth=window._preferences.export_pipeline_depth,
+            # 起動の後の確かめと重なると欄が「確かめています」のままで、設定を読めない
+            dialog = settled(
+                ExportDialog(
+                    window._document.project,
+                    pipeline_depth=window._preferences.export_pipeline_depth,
+                )
             )
             try:
                 settings = dialog._settings()

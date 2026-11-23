@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -18,6 +19,7 @@ from PySide6.QtCore import QPoint
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox
 
+from sashimono.ai.loudness_plan import plan_loudness
 from sashimono.core.commands import (
     AddClip,
     AddEffect,
@@ -49,6 +51,7 @@ from sashimono.effects import registry
 from sashimono.effects.audio import LIMITER_KIND
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.checks.job import CheckRequest
+from sashimono.engine.checks.scan import LOUDNESS, CheckLimits
 from sashimono.engine.decode.probe import probe_media
 from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
@@ -58,6 +61,7 @@ from sashimono.ui.timeline.view import TimelineView
 from sashimono.ui.workspace import Preferences, PreferenceStore
 from tests.check_media import tone, write_tone
 from tests.ui.ai_tool_calls import call_after_check, call_tool, wait_for_check
+from tests.waiting import GUARD_SECONDS, wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -294,6 +298,139 @@ def _bgm_clip(window: MainWindow, bgm: Track) -> Clip:
     return clip
 
 
+class _HeldPlan:
+    """抑えた後の見積もり（#497）を、試験が離すまで裏のスレッドで止めておく"""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.gate = threading.Event()
+        self.threads: list[int] = []
+        #: 離した時点で、待つ側がやめていたか（始まった順の番号ごと 離す順はスレッドで前後する）
+        self.stopped: dict[int, bool] = {}
+        real = plan_loudness
+
+        def held(*args: Any, **kwargs: Any) -> Any:
+            order = len(self.threads)
+            self.threads.append(threading.get_ident())
+            self.gate.wait(GUARD_SECONDS)
+            self.stopped[order] = kwargs["stopped"]()
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(main_window_module, "plan_loudness", held)
+
+    def started(self, window: MainWindow, count: int = 1) -> None:
+        wait_until(
+            lambda: len(self.threads) >= count, "見積もりの始まり", step=QApplication.processEvents
+        )
+
+    def finished(self, window: MainWindow) -> None:
+        self.gate.set()
+        wait_until(
+            lambda: window._planning is None, "見積もりの終わり", step=QApplication.processEvents
+        )
+
+
+class TestPlannedInTheBackground:
+    """測り終えた後の見積もりを裏で回す（#497）"""
+
+    def test_the_window_keeps_running_while_planning(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """画面のスレッドで数えると、3 時間の作品で数秒、描き直しも操作も効かない"""
+        monkeypatch.setattr(main_window_module, "ask_loudness", lambda *_a: LoudnessChoice(-14.0))
+        held = _HeldPlan(monkeypatch)
+        project, _voice, bgm = _project(media)
+        window = _window(opened, project)
+        _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
+        wait_for_check(window)
+        held.started(window)
+        # 見積もりは止まったままでも、画面のスレッドはここへ戻ってくる
+        assert held.threads[0] != threading.get_ident()
+        assert "見積もっています" in window.statusBar().currentMessage()
+        assert window.document.project == project
+        held.finished(window)
+        assert clip_volume(_bgm_clip(window, bgm)).static == pytest.approx(200.0, rel=0.06)
+
+    def test_a_change_while_planning_is_not_overwritten(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """見積もる間に足した変更の上へ掛けると、測った音量と合わない量を掛ける"""
+        monkeypatch.setattr(main_window_module, "ask_loudness", lambda *_a: LoudnessChoice(-14.0))
+        held = _HeldPlan(monkeypatch)
+        project, voice, bgm = _project(media)
+        window = _window(opened, project)
+        _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
+        wait_for_check(window)
+        held.started(window)
+        window.document.execute(SetTrackState(voice.id, solo=True))
+        changed = window.document.project
+        held.finished(window)
+        assert window.document.project == changed
+        assert "作品か場面が変わった" in window.statusBar().currentMessage()
+
+    def test_a_switched_scene_is_not_changed(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """同じ中身の別の場面へ切り替えた後に当てると、測っていない場面を変える"""
+        monkeypatch.setattr(main_window_module, "ask_loudness", lambda *_a: LoudnessChoice(-14.0))
+        held = _HeldPlan(monkeypatch)
+        project, _voice, bgm = _project(media)
+        window = _window(opened, project)
+        _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
+        wait_for_check(window)
+        held.started(window)
+        monkeypatch.setattr(window, "_scene_name", lambda: "別の場面")
+        held.finished(window)
+        assert window.document.project == project
+        assert "作品か場面が変わった" in window.statusBar().currentMessage()
+
+    def test_another_check_stops_the_plan(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """見積もる間に始めた検査の後で当てると、その検査で測った物と合わない量を掛ける"""
+        monkeypatch.setattr(main_window_module, "ask_loudness", lambda *_a: LoudnessChoice(-14.0))
+        held = _HeldPlan(monkeypatch)
+        project, _voice, bgm = _project(media)
+        window = _window(opened, project)
+        _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
+        wait_for_check(window)
+        held.started(window)
+        other = CheckRequest(CheckLimits(kinds=frozenset({LOUDNESS})), project=project, end=30)
+        window.request_check(other)
+        held.finished(window)
+        assert window.document.project == project
+        assert "別の検査に替わった" in window.statusBar().currentMessage()
+
+    def test_an_older_plan_is_not_applied(
+        self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """選び直した後に古い見積もりを当てると、前に選んだ基準の音量になる"""
+        targets = iter([-14.0, -17.0])
+        monkeypatch.setattr(
+            main_window_module, "ask_loudness", lambda *_a: LoudnessChoice(next(targets))
+        )
+        held = _HeldPlan(monkeypatch)
+        project, _voice, bgm = _project(media)
+        window = _window(opened, project)
+        _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
+        wait_for_check(window)
+        held.started(window)
+        _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
+        # 選び直した基準はまだ測っている 古い見積もりがこの間に終わっても当てない
+        assert window._planning is None
+        wait_for_check(window)
+        held.started(window, 2)
+        held.finished(window)
+        # 古い見積もりは止める 止めないと、選び直す度に裏の仕事が重なる
+        wait_until(
+            lambda: len(held.stopped) >= 2, "見積もりの終わり", step=QApplication.processEvents
+        )
+        assert held.stopped == {0: True, 1: False}
+        # BGM は -20 LUFS 選び直した -17 へ +3 dB（-14 の答えなら +6 dB で 200%）
+        assert clip_volume(_bgm_clip(window, bgm)).static == pytest.approx(141.0, rel=0.06)
+        window.document.undo()
+        assert window.document.project == project
+
+
 class TestRightClick:
     """タイムラインの右クリックから人が使う（#329 2026-10-17 利用者の決定）
 
@@ -419,7 +556,9 @@ class TestRightClick:
         # 基準の既定は本人の設定（仕上がりを調べる音量の基準）
         assert asked == [-14.0]
         # 60 秒で区切ると、遅い機械では測り終える前に落ちる（#405） 検査の終わりの知らせを待つ
-        wait_for_check(window, then=lambda: window._pending_loudness is None)
+        wait_for_check(
+            window, then=lambda: window._pending_loudness is None and window._planning is None
+        )
         # BGM だけを測るので -20 LUFS から +6 dB 声のクリップは変えない
         assert clip_volume(_bgm_clip(window, bgm)).static == pytest.approx(200.0, rel=0.06)
         voice_clip = window.document.project.timeline.tracks[0].clips[0]
@@ -469,7 +608,9 @@ class TestRightClick:
         project = AddEffect(clip.id, limiter).apply(project)
         window = _window(opened, project)
         _menu_action(window, bgm, LOUDNESS_TEXT).trigger()
-        wait_for_check(window, then=lambda: window._pending_loudness is None)
+        wait_for_check(
+            window, then=lambda: window._pending_loudness is None and window._planning is None
+        )
         message = window.statusBar().currentMessage()
         assert "すでに基準" not in message
         assert "足りない" in message
