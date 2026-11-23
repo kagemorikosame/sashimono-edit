@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from sashimono.ai import loudness_plan
 from sashimono.ai.auto_fix import (
     FITTED_CEILING,
     clips_overlap,
@@ -64,7 +66,7 @@ from sashimono.effects.limiter import limit, limiter_history
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.audio.mixer import HISTORY_WINDOW
 from sashimono.engine.checks.job import CheckRequest, _check_timeline, _Progress
-from sashimono.engine.checks.loudness import Dynamics, LoudnessMeter
+from sashimono.engine.checks.loudness import Dynamics, Headroom, LoudnessLane, LoudnessMeter
 from sashimono.engine.checks.report import HIGH, MEDIUM, CheckReport
 from sashimono.engine.checks.scan import LOUDNESS, CheckLimits
 from sashimono.engine.checks.sound_lanes import LaneMeters
@@ -1062,8 +1064,9 @@ class TestPlanJob:
             raise ValueError("壊れた手がかり")
 
         job = PlanJob(lambda **_kw: broken(), done=told.set)
-        assert job.wait(GUARD_SECONDS)
-        assert told.is_set()
+        # 終わった印は知らせより先に立つ 印だけを待つと、知らせの前に読んで落ちることがある
+        assert told.wait(GUARD_SECONDS)
+        assert job.wait(0)
         with pytest.raises(ValueError, match="壊れた手がかり"):
             job.take()
 
@@ -1101,6 +1104,13 @@ class TestPlanJob:
 
         monkeypatch.setattr(Dynamics, "limited_loudness", counted)
 
+        class CountedHeadroom(Headroom):
+            def __init__(self, lanes: Sequence[LoudnessLane]) -> None:
+                steps.append("和の上限")
+                super().__init__(lanes)
+
+        monkeypatch.setattr(loudness_plan, "Headroom", CountedHeadroom)
+
         def plan(stopped: Stopped) -> LoudnessPlan:
             return plan_loudness(
                 report,
@@ -1118,11 +1128,11 @@ class TestPlanJob:
 
         plan(asked)
         assert "見積もり" in steps
-        # どの見積もりの前にも尋ねている（間に和の上限の確かめなどが挟まってもよい）
+        assert "和の上限" in steps
+        # どの重い 1 歩（見積もり 1 回と和の上限の用意）の前にも尋ねている
         for at, step in enumerate(steps):
-            if step == "見積もり":
-                assert "尋ねた" in steps[:at]
-                assert steps[at - 1] == "尋ねた", steps[max(0, at - 3) : at + 1]
+            if step != "尋ねた":
+                assert at > 0 and steps[at - 1] == "尋ねた", steps[max(0, at - 3) : at + 1]
         with pytest.raises(PlanAbandonedError):
             plan(lambda: True)
 

@@ -232,8 +232,9 @@ def _limited(
     if limited_peak(targets, ceiling) > ceiling + _REACHED_LU:
         # トラックの音量でリミッターの上限の範囲を越えると、組の山が止まる所を言えない
         return chosen
-    headroom = Headroom(dynamics.lanes)
+    # 和の上限は作品全体の配列を結合して並べる やめた後に作らないよう、作る前に尋ねる
     dynamics.check()
+    headroom = Headroom(dynamics.lanes)
     for top in dict.fromkeys((min(ceiling, _NO_CLIP_DB), _NO_CLIP_DB)):
         found = _within(
             dynamics,
