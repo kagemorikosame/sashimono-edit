@@ -21,7 +21,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -33,11 +33,14 @@ from PySide6.QtCore import QCoreApplication, QObject, QThread, Signal
 
 from sashimono.core.model import Project
 from sashimono.engine.audio import AudioMixer
+from sashimono.engine.checks.glyphs import glyph_runs
+from sashimono.engine.checks.loudness import Dynamics
 from sashimono.engine.checks.overflow import OverflowScan
 from sashimono.engine.checks.report import CheckReport, ClipIndex, assemble
 from sashimono.engine.checks.scan import (
     CLIPPING,
     LOUDNESS,
+    MISSING_GLYPH,
     PICTURE_KINDS,
     SOUND_KINDS,
     TEXT_OVERFLOW,
@@ -47,6 +50,7 @@ from sashimono.engine.checks.scan import (
     Run,
     VideoScan,
 )
+from sashimono.engine.checks.sound_lanes import LaneMeters
 from sashimono.engine.decode.probe import media_origin
 from sashimono.engine.decode.rational import Ratio, as_fraction
 from sashimono.engine.gpu import GLContextError, OffscreenGLContext
@@ -82,6 +86,9 @@ class CheckRequest:
     #: 調べ始めたときに開いていたシーン（ID） メインなら ``None`` 結果を返すときに添える
     #: 返す時点のシーンを添えると、待つ間に人が別のシーンを開いたとき取り違える
     scene: str | None = None
+    #: 組に分け、リミッターの見る山も測るか（#494 重なり・定位・トラックの音量）
+    #: 音量をそろえるときだけ 組の数だけ手間と場所が増える
+    separate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +116,9 @@ class _Progress:
         self._notified = 0.0
         self.video: VideoScan | None = None
         self.audio: AudioScan | None = None
+        self.lanes: LaneMeters | None = None
         self.overflow: OverflowScan | None = None
+        self.glyphs: list[Run] = []
         self.index: ClipIndex | None = None
         self.start = request.start
         self.end = request.end
@@ -155,6 +164,7 @@ class _Progress:
             runs += self.audio.runs(final=final)
         if self.overflow is not None:
             runs += self.overflow.runs()
+        runs += self.glyphs
         loudness = self.audio.loudness() if self.audio is not None else None
         skipped = set(self.skipped)
         notes = list(self.notes)
@@ -182,7 +192,17 @@ class _Progress:
             notes=tuple(notes),
             skipped=frozenset(skipped),
             sound=self.audio.profile() if self.audio is not None else None,
+            dynamics=self._dynamics() if final else None,
         )
+
+    def _dynamics(self) -> Dynamics | None:
+        found = self.audio.dynamics() if self.audio is not None else None
+        if found is None or self.lanes is None:
+            return found
+        lanes = self.lanes.lanes()
+        if not lanes:
+            return found
+        return replace(found, lanes=lanes, crosses=self.lanes.crosses())
 
     def fraction(self) -> float:
         span = self.end - self.start
@@ -437,8 +457,14 @@ def _check_timeline(
             )
         if limits.needs_sound:
             mixer = AudioMixer(project, smooth_history=smooth_history)
+        lanes = (
+            LaneMeters.of(project, request.start, request.end)
+            if request.separate and mixer is not None and LOUDNESS in limits.kinds
+            else None
+        )
         with progress.lock:
             progress.fps = fps
+            progress.lanes = lanes
             progress.index = ClipIndex(project)
             progress.length_seconds = (request.end - request.start) / fps
             progress.video = (
@@ -456,6 +482,10 @@ def _check_timeline(
                 else None
             )
             progress.overflow = overflow
+        if MISSING_GLYPH in limits.kinds:
+            absent = glyph_runs(project, request.start, request.end)
+            with progress.lock:
+                progress.glyphs = absent
         canvas = renderer.size if renderer is not None else (0, 0)
         frames: range | list[int] = range(request.start, request.end)
         if progress.video is None and progress.audio is None:
@@ -469,8 +499,16 @@ def _check_timeline(
                 if renderer is not None and progress.video is not None
                 else None
             )
-            sound = mixer.render_frames(frame, 1) if mixer is not None else None
+            sound = sounds = detected = None
+            if mixer is not None and lanes is not None:
+                sound, sounds, detected = mixer.render_frames_apart(
+                    frame, 1, lanes.lane_of, lanes.count
+                )
+            elif mixer is not None:
+                sound = mixer.render_frames(frame, 1)
             with progress.lock:
+                if lanes is not None and sounds is not None and detected is not None:
+                    lanes.add(sounds, detected)
                 if luma is not None and progress.video is not None:
                     progress.video.add(frame, luma)
                 if sound is not None and progress.audio is not None:
@@ -508,6 +546,11 @@ def _check_file(path: Path, progress: _Progress) -> None:
             progress.skip(
                 frozenset({TEXT_OVERFLOW}),
                 "書き出した動画からは字幕のはみ出しを調べられません（字の形が残らない）"
+                " タイムラインを調べると分かります",
+            )
+            progress.skip(
+                frozenset({MISSING_GLYPH}),
+                "書き出した動画からは書体に無い字を調べられません（字と書体が残らない）"
                 " タイムラインを調べると分かります",
             )
             progress.skip(

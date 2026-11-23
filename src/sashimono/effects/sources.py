@@ -315,6 +315,10 @@ TEXT = SourceDefinition(
         ColorSpec("color", "色", (1.0, 1.0, 1.0, 1.0)),
         CheckSpec("bold", "太字", False),
         CheckSpec("italic", "斜体", False),
+        # 書体に無い字は代わりの書体の標準の太さで出る（#494） 入れると足りない分だけ太らせる
+        # 既定は切 既にある作品と、代わりの細い字で測って合わせた互換の見た目を変えない
+        # 使う所では設定パネルと検査（missing_glyph）がこの欄を勧める
+        CheckSpec("match_fallback", "無い字の太さをそろえる", False),
         SelectSpec(
             "align",
             "行揃え",

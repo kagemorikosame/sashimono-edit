@@ -198,6 +198,9 @@ class TestBigProject:
         bridge = allow_sending(EditorBridge(big_window))
         # 初めの 1 枚は描き手（GL の文脈）を作るので重い 区切りの見張りから外す
         _run(big_window, "preview_frame", frame=0)
+        # 窓を作った直後に 1 度だけ走る片付け（_freeze_long_lived の全部のごみ集め）も先に済ませる
+        # 残すと最初の 1 回に混ざり、それまでの試験が積んだ物の数だけ延びて上限を越える
+        QApplication.processEvents()
         # 1 コマを重くして（4K の動画のシークのつもり）、1 回で描き切れば必ず長くなるようにする
         slow = 0.03
         real = big_window._render_for_ai

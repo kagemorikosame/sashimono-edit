@@ -663,6 +663,12 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("設定パネル/解除", "set_clip_property", note="止めた絵を解く（hold_at を null）"),
     same(
+        "設定パネル/画面に合わせる｜画素で置くのをやめ、拡大率を 100% に戻して画面に収めます"
+        "（取り消しで戻せます）",
+        "set_clip_property",
+        note="小さく入った動画に出る（#494） native_size を偽に（拡大率は set_param で 100 に）",
+    ),
+    same(
         "設定パネル/組み方を「標準」にする｜組み方を「標準」に変えて、この欄を使えるようにします"
         "（取り消しで戻せます）",
         "use_standard_layout",

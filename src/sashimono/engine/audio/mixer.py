@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 
 import numpy as np
 
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
+    ClipId,
     Effect,
     MediaId,
     ParamValue,
@@ -54,6 +55,11 @@ RAW_BUDGET_BYTES = 256 * 1024 * 1024
 #: 元の音の入れ物（:class:`_Tape`）に持たせる余裕 区切り 2 つ分あれば、続けて鳴らす間は
 #: 広げずに書き足せる
 _TAPE_SLACK = 2 * HISTORY_WINDOW
+
+
+#: 混ぜた音の内訳の受け皿 クリップの組・組ごとの音・組ごとの音量と定位の前の山
+#: （:meth:`AudioMixer.render_frames_apart`）
+type _Apart = tuple[Mapping[ClipId, int], np.ndarray, np.ndarray]
 
 
 class AudioMixer:
@@ -152,6 +158,26 @@ class AudioMixer:
         self._raw.clear()
         self._reaches.clear()
 
+    def render_frames_apart(
+        self, start_frame: int, frame_count: int, lane_of: Mapping[ClipId, int], lanes: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """:meth:`render_frames` と同じ音と、その内訳（組, サンプル, チャンネル）と、組ごとの
+        トラックの音量・定位の前の山（組, サンプル クリップの最後のリミッターが見る所）
+
+        音量の見積もり（#494）が使う 組ごとに混ぜ直すと、その回数だけ読むので待ち時間が延びる
+        """
+        if self._closed:
+            raise RuntimeError("閉じたミキサは使えない")
+        rate = self._project.rate
+        start = _frame_to_sample(start_frame, rate, self.sample_rate)
+        count = _frame_to_sample(start_frame + frame_count, rate, self.sample_rate) - start
+        sounds = np.zeros((lanes, count, self.channels), dtype=np.float32)
+        detected = np.zeros((lanes, count), dtype=np.float32)
+        mixed = self._render_timeline(
+            self._project.timeline, start, count, depth=0, apart=(lane_of, sounds, detected)
+        )
+        return mixed, sounds, detected
+
     def render(self, start_sample: int, count: int) -> np.ndarray:
         """``[start_sample, start_sample + count)`` のミックス結果を返す
 
@@ -167,7 +193,13 @@ class AudioMixer:
         return self._render_timeline(self._project.timeline, start_sample, count, depth=0)
 
     def _render_timeline(
-        self, timeline: Timeline, start_sample: int, count: int, *, depth: int
+        self,
+        timeline: Timeline,
+        start_sample: int,
+        count: int,
+        *,
+        depth: int,
+        apart: _Apart | None = None,
     ) -> np.ndarray:
         """1 本のタイムラインの音 入れ子のシーンも同じ道を通る
 
@@ -181,10 +213,10 @@ class AudioMixer:
         out = np.zeros((count, self.channels), dtype=np.float32)
         rate = self._project.rate
         for track in timeline.active_sound_tracks():
-            self._mix_track(out, track, start_sample, count, rate, depth)
+            self._mix_track(out, track, start_sample, count, rate, depth, apart)
         for track in timeline.active_picture_tracks():
             if track.kind is TrackKind.VIDEO:
-                self._mix_track(out, track, start_sample, count, rate, depth)
+                self._mix_track(out, track, start_sample, count, rate, depth, apart)
         return out
 
     def render_frames(self, start_frame: int, frame_count: int) -> np.ndarray:
@@ -202,6 +234,7 @@ class AudioMixer:
         count: int,
         rate: FrameRate,
         depth: int = 0,
+        apart: _Apart | None = None,
     ) -> None:
         # 映像トラックの音量と定位は使わない決まり（画面にも出ていない） 置いたシーンの
         # 音だけを混ぜるときに掛けると、見えない値で音が変わる
@@ -237,7 +270,13 @@ class AudioMixer:
                 continue
 
             offset = begin - start_sample
-            out[offset : offset + len(samples)] += _apply_pan(samples * gain, float(pan))
+            placed = _apply_pan(samples * gain, float(pan))
+            out[offset : offset + len(samples)] += placed
+            if apart is not None and (lane := apart[0].get(clip.id)) is not None:
+                apart[1][lane, offset : offset + len(samples)] += placed
+                # 音量と定位の前 リミッターは左右の大きい方を見て両方を同じだけ絞る
+                seen = apart[2][lane, offset : offset + len(samples)]
+                np.maximum(seen, np.abs(samples).max(axis=1), out=seen)
 
     def _windowed(
         self,

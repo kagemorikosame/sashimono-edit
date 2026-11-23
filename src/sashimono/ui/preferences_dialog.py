@@ -46,7 +46,12 @@ from sashimono.core.emphasis import (
     EMPHASIS_ZOOM_PERCENT_RANGE,
 )
 from sashimono.core.io.recovery import TrimItem
-from sashimono.core.mixing import DUCK_ATTACK_MS_RANGE, DUCK_DEPTH_DB_RANGE, DUCK_RELEASE_MS_RANGE
+from sashimono.core.mixing import (
+    DUCK_ATTACK_MS_RANGE,
+    DUCK_DEPTH_DB_RANGE,
+    DUCK_RELEASE_MS_RANGE,
+    LIMITER_DEPTHS,
+)
 from sashimono.core.reframe import (
     REFRAME_FOLLOW_NAMES,
     REFRAME_FOLLOWS,
@@ -1258,12 +1263,27 @@ class PreferencesDialog(QDialog):
         self._loudness_limiter.setToolTip(
             "AI アシスタントが全体の音量を基準へそろえるとき、一瞬の山が上限（-1 dBFS）に当たって"
             "基準に届かなければ、音のクリップの最後にリミッターを積んで山だけを抑え、基準まで上げる"
-            " 抑える量は 6 dB まで それでも届かなければ届かないことを伝える 前に積んだ"
-            "リミッターがあるクリップには重ねて積まず、その上限より上へは上げない 上限を越える音が"
-            "続く所はその間も抑えるので、全体の音量が少し下がることがある 切ると山の手前で止め、"
+            " 抑える量は下の上限まで それでも届かなければ届かないことを伝える 抑えて下がる分は"
+            "見込んで掛け、もう 1 度そろえても抑える前の音から数え直す 自分で値を変えた"
+            "リミッターがあれば重ねて抑えず、その上限より上へは上げない 切ると山の手前で止め、"
             "届かないことを伝える リミッターは設定パネルの「リミッター」で直せる"
         )
         form.addRow(self._loudness_limiter)
+        self._loudness_depth = QComboBox(self)
+        for depth, name in LIMITER_DEPTHS:
+            self._loudness_depth.addItem(name, depth)
+        self._loudness_depth.setCurrentIndex(
+            max(0, self._loudness_depth.findData(preferences.loudness_depth))
+        )
+        self._loudness_depth.setToolTip(
+            "上限いっぱいではなく、基準へ届くのに要る量だけを抑える 59 分の話し声の配信から"
+            "作った 2 本では、-14 LUFS に届くのに 8.1 dB と 9.8 dB 要った（6 dB では -15.4 と"
+            " -16.6 に止まった） 6 dB より深く抑えた所は全体の 0.3% ほどだった"
+            " 深いほど大声や破裂音の立ち上がりが丸くなる"
+        )
+        self._loudness_depth.setEnabled(preferences.loudness_limiter)
+        self._loudness_limiter.toggled.connect(self._loudness_depth.setEnabled)
+        form.addRow("音量をそろえるときに抑える山の上限", self._loudness_depth)
         # AI の起こしのモデル（#469） 速さと精度の釣り合いは機械と素材で答えが違う
         self._ai_transcribe_model = QComboBox(self)
         for info in ASR_MODELS:
@@ -1665,6 +1685,7 @@ class PreferencesDialog(QDialog):
             ai_image_edge=int(self._image_edge.currentData()),
             check_loudness_target=int(self._check_loudness.currentData()),
             loudness_limiter=self._loudness_limiter.isChecked(),
+            loudness_depth=int(self._loudness_depth.currentData()),
             ai_transcribe_model=str(self._ai_transcribe_model.currentData()),
             word_timestamps=self._word_timestamps.isChecked(),
             subtitle_fit_voice=self._subtitle_fit_voice.isChecked(),

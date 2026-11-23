@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sashimono.engine.checks.loudness import LoudnessMeter, k_weighting
+from sashimono.engine.checks.loudness import Dynamics, LoudnessLane, LoudnessMeter, k_weighting
 
 RATE = 48000
 
@@ -105,3 +105,38 @@ class TestChannels:
         signal[100, 1] = -0.9
         meter.add(signal)
         assert meter.peak == pytest.approx(0.9)
+
+
+class TestLaneSpans:
+    """クリップの頭が 5 ms の区切りの途中に来る組（PR #495 の 4 回目のレビュー）"""
+
+    @staticmethod
+    def _lane(peak_bin: int) -> LoudnessLane:
+        # 48 kHz・30 fps の 2 つ目のクリップは 1600 標本（33.3 ms）から 区切り 6 は 30〜35 ms
+        detected = np.full(12, 0.01, dtype=np.float32)
+        detected[peak_bin] = 1.0
+        return LoudnessLane(
+            energy=np.zeros(0),
+            peak=np.zeros(0),
+            starts=(0.0, 1600 / 48000),
+            detected=detected,
+            faders=(0.0, 6.0),
+        )
+
+    def test_the_later_clip_in_a_shared_part_keeps_its_fader(self) -> None:
+        """前のクリップの倍率で読むと、後のクリップの頭の山を 6 dB 浅く数え、深さを越えて潰す"""
+        lane = self._lane(6)
+        assert Dynamics(np.zeros(0), np.zeros(0), 4800, lanes=(lane,)).deepest_db(-1.0) == (
+            pytest.approx(7.0)
+        )
+        assert lane.ceilings(-1.0)[6] == pytest.approx(10 ** (-7.0 / 20))
+
+    def test_parts_of_one_clip_are_read_as_before(self) -> None:
+        """区切りを共にしない所は、そのクリップの倍率のまま"""
+        lane = self._lane(3)
+        assert Dynamics(np.zeros(0), np.zeros(0), 4800, lanes=(lane,)).deepest_db(-1.0) == (
+            pytest.approx(1.0)
+        )
+        ceilings = lane.ceilings(-1.0)
+        assert ceilings[5] == pytest.approx(10 ** (-1.0 / 20))
+        assert ceilings[7] == pytest.approx(10 ** (-7.0 / 20))

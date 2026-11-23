@@ -11,7 +11,7 @@ AI の ``auto_color`` ``reduce_noise`` と、人の〔色を自動で整える�
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import Any, Protocol
@@ -27,11 +27,13 @@ from sashimono.core.commands import (
     SetEffectEnabled,
     SetParam,
 )
+from sashimono.core.mixing import track_gain_db
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
     Effect,
+    EffectId,
     MediaId,
     MediaItem,
     Project,
@@ -41,7 +43,12 @@ from sashimono.core.model import (
 )
 from sashimono.effects import registry
 from sashimono.effects.audio import DENOISE_KIND, LIMITER_KIND
-from sashimono.effects.limiter import CEILING_DB_RANGE, DEFAULT_CEILING_DB
+from sashimono.effects.limiter import (
+    CEILING_DB_RANGE,
+    DEFAULT_CEILING_DB,
+    DEFAULT_RELEASE_MS,
+    ceiling_before_fader,
+)
 from sashimono.engine.audio.noise import QUIET_NOISE_DB, NoiseEstimate, estimate_noise
 from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.auto_color import (
@@ -53,6 +60,7 @@ from sashimono.engine.auto_color import (
     thinned,
 )
 from sashimono.engine.cache.thumbnails import Filmstrip
+from sashimono.engine.checks.report import CheckReport
 
 __all__ = [
     "AUTO_GRADE_PARAMS",
@@ -65,10 +73,13 @@ __all__ = [
     "can_auto_color",
     "clips_overlap",
     "has_limiter",
+    "left_limiters",
     "limited_ceiling",
     "limited_peak",
     "limiter_ceiling",
     "limiter_commands",
+    "limiters_match",
+    "measures_apart",
     "picture_clip",
     "plan_color_fix",
     "plan_noise_fix",
@@ -100,22 +111,6 @@ def clips_overlap(clips: Sequence[Clip]) -> bool:
 #: 補間の行き過ぎ（back・elastic）を拾うため、キーフレームの間を何点で見るか 上限の山と谷は
 #: 区間の 1/32 より細かくは動かない
 _CURVE_SAMPLES = 32
-
-
-def track_gain_db(track: Track) -> float:
-    """クリップのエフェクトの後に掛かる、トラックの音量と定位のいちばん大きい倍率（dB）
-
-    リミッターはクリップのエフェクトなので、その後のトラックの音量が山を動かす +6 dB のトラックで
-    上限 -1 dBFS に抑えても書き出しは +5 dBFS になる（PR #451 の CodeRabbit の指摘）
-    映像トラックは音量と定位を使わない（ミキサと同じ決まり）
-    """
-    if track.kind is TrackKind.VIDEO:
-        return 0.0
-    pan = float(np.clip(track.pan, -1.0, 1.0))
-    angle = (pan + 1.0) * np.pi / 4.0
-    # 定電力パンは片側を最大 √2 倍（+3 dB）にする 中央の 0 では倍率 1
-    panned = 1.0 if pan == 0.0 else float(np.sqrt(2.0) * max(np.cos(angle), np.sin(angle)))
-    return track.volume_db + 20.0 * float(np.log10(panned))
 
 
 def _lowest_ceiling(effect: Effect) -> float:
@@ -180,8 +175,81 @@ def limiter_ceiling(track: Track, ceiling: float) -> float:
     トラックの倍率の分だけ下げる 範囲（-20〜0 dBFS）を越える分は収め切れないので、
     :func:`limited_peak` で書き出しの山を言い直す
     """
-    low, high = CEILING_DB_RANGE
-    return float(np.clip(ceiling - track_gain_db(track), low, high))
+    return ceiling_before_fader(ceiling, track_gain_db(track))
+
+
+#: 重なる分だけ下げて置いた上限の控え（#494） 欄には無く、音にも効かない 上限がこの値のままなら
+#: そろえたときの物、違えば人が直した物と読む 控えないと、下げた物を人の物と読んで掛け直せない
+FITTED_CEILING = "fitted_ceiling"
+#: 前にそろえたときのリミッターと読む、上限と戻る速さの差
+_SAME_LIMITER = 0.05
+
+
+def redoable_limiters(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> frozenset[EffectId]:
+    """外して測り直してよいリミッター 効いている物が全部そろえた形のときだけ返す（#494）
+
+    そろえた形は、末尾に 1 つ・上限が :func:`limiter_ceiling` か重なる分だけ下げて置いた値
+    （:data:`FITTED_CEILING` の控えと同じ）・戻る速さが既定・どれも動かない物
+    人が整えたリミッターを外して測ると、その人の作った音と違う音から掛ける量を決める 1 つでも
+    違えば空（前の形のとおり、抑えた後の音を測って重ねて抑えない）
+    """
+    found: set[EffectId] = set()
+    for track, clip in targets:
+        active = [e for e in clip.effects if e.kind == LIMITER_KIND and e.enabled]
+        if not active:
+            continue
+        if len(active) > 1 or active[0] is not clip.effects[-1]:
+            return frozenset()
+        fitted = active[0].params.get(FITTED_CEILING)
+        ceilings = [limiter_ceiling(track, ceiling)]
+        if isinstance(fitted, AnimatedValue) and not fitted.is_animated:
+            ceilings.append(fitted.static)
+        wanted = {"ceiling": ceilings, "release": [DEFAULT_RELEASE_MS]}
+        for name, allowed in wanted.items():
+            value = active[0].params.get(name, allowed[0])
+            if isinstance(value, AnimatedValue):
+                if value.is_animated:
+                    return frozenset()
+                value = value.static
+            if not isinstance(value, int | float) or all(
+                abs(value - expected) > _SAME_LIMITER for expected in allowed
+            ):
+                return frozenset()
+        found.add(active[0].id)
+    return frozenset(found)
+
+
+def measures_apart(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> bool:
+    """混ぜた後の音からは、リミッターの抑える量が読めない形か（#494）
+
+    重なって鳴る・定位を振っている・トラックの音量で止まる所が頼んだ上限と違う のどれか
+    その形だけ、クリップの組とリミッターの前の山を分けて測る（手間が増える）
+    """
+    if clips_overlap([clip for _, clip in targets]):
+        return True
+    for track, _clip in targets:
+        if track.kind is not TrackKind.VIDEO and track.pan != 0.0:
+            return True
+        if abs(limiter_ceiling(track, ceiling) + track_gain_db(track) - ceiling) > 1e-6:
+            return True
+    return False
+
+
+def loudness_predictor(
+    report: CheckReport, ceiling: float, clips: Sequence[Clip]
+) -> Callable[[float], float | None] | None:
+    """掛ける量から抑えた後の音量を見積もる手（#494） 見積もれなければ ``None``
+
+    トラックの音量は測った音に入っているので、書き出しで止まる所（``ceiling``）で見積もる
+    重なって鳴るクリップでは見積もらない リミッターはクリップごとに掛かるのに、測ったのは混ぜた
+    後の音 混ぜた山を抑える見込みで上げると、抑えられなかった分だけ基準より大きくなる
+    """
+    dynamics = report.dynamics
+    if dynamics is None or clips_overlap(clips):
+        return None
+    # ミキサのリミッターはクリップの頭で絞る量を持ち越さない（前のクリップの音を読まない）
+    starts = [(clip.timeline_start - report.start) / report.fps for clip in clips]
+    return lambda gain: dynamics.limited_loudness(gain, ceiling, starts)
 
 
 def limited_peak(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float:
@@ -195,20 +263,52 @@ def limited_peak(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float
     )
 
 
-def limiter_commands(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> list[Command]:
+def limiters_match(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> bool:
+    """どのクリップにも、上限が ``ceiling`` に当たる効いたリミッターがもうあるか"""
+    for track, clip in targets:
+        wanted = limiter_ceiling(track, ceiling)
+        found = next((e for e in clip.effects if e.kind == LIMITER_KIND and e.enabled), None)
+        if found is None or abs(_lowest_ceiling(found) - wanted) > _SAME_LIMITER:
+            return False
+    return True
+
+
+def left_limiters(
+    targets: Sequence[tuple[Track, Clip]], ceiling: float, bypassed: frozenset[EffectId]
+) -> list[tuple[Track, Clip]]:
+    """外して測った（``bypassed``）のに、上限が ``ceiling`` と違う値のまま残るリミッターのクリップ
+
+    抑える量が 0 の計画でも、残った低い上限は書き出しで効く 外して測った音量と食い違う
+    """
+    return [
+        (track, clip)
+        for track, clip in targets
+        if any(effect.id in bypassed for effect in clip.effects)
+        and not limiters_match([(track, clip)], ceiling)
+    ]
+
+
+def limiter_commands(
+    targets: Sequence[tuple[Track, Clip]], ceiling: float, lowered: float = 0.0
+) -> list[Command]:
     """どのクリップにもリミッターを積む もうあれば上限だけを置き換える（重ねて掛けない #414）
 
     AI の ``normalize_loudness`` と人の〔音量を基準にそろえる…〕が同じここを通る 積む位置は
     音量とフェードの後（``AddEffect`` が決める） 上限はトラックの倍率を引いた値
-    （:func:`limiter_ceiling`）
+    （:func:`limiter_ceiling`） ``lowered`` は重なる分の余裕として下げる量（#494）
     """
     commands: list[Command] = []
     for track, clip in targets:
-        local = limiter_ceiling(track, ceiling)
-        found = next((effect for effect in clip.effects if effect.kind == LIMITER_KIND), None)
+        local = limiter_ceiling(track, ceiling - lowered)
+        placed = registry.require(LIMITER_KIND).create(ceiling=local)
+        if lowered > 0:
+            placed = placed.with_param(FITTED_CEILING, AnimatedValue(static=local))
+        limiters = [effect for effect in clip.effects if effect.kind == LIMITER_KIND]
+        # 外して測った物（:func:`redoable_limiters`）と同じ、効いている物を先に取る 前にある無効な
+        # 物を取ると、積み直した物と効いていた物が 2 つ重なって潰れる
+        found = next((e for e in limiters if e.enabled), limiters[0] if limiters else None)
         if found is None:
-            effect = registry.require(LIMITER_KIND).create(ceiling=local)
-            commands.append(AddEffect(clip.id, effect))
+            commands.append(AddEffect(clip.id, placed))
             continue
         value = found.params.get("ceiling")
         if isinstance(value, AnimatedValue) and value.is_animated:
@@ -221,11 +321,14 @@ def limiter_commands(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> l
             # 読み込んだファイルでは、無効のリミッターが音量の欄やほかの音のエフェクトより前に
             # あることがある そのまま有効にすると、後で上げた音量の山を抑えない 末尾へ積み直す
             # （固定の欄はまたいで動かせないので、動かすのでなく外して足す）
-            effect = registry.require(LIMITER_KIND).create(ceiling=local)
-            commands += [RemoveEffect(clip.id, found.id), AddEffect(clip.id, effect)]
+            commands += [RemoveEffect(clip.id, found.id), AddEffect(clip.id, placed)]
             continue
         path = ParamPath.of_effect(clip.id, found.id, "ceiling")
         commands.append(SetParam(path, AnimatedValue(static=local)))
+        if lowered > 0 or FITTED_CEILING in found.params:
+            # 通常の値へ戻すときも控えを書き換える 残すと、人が前の値へ直した上限をそろえた物と読む
+            note = ParamPath.of_effect(clip.id, found.id, FITTED_CEILING)
+            commands.append(SetParam(note, AnimatedValue(static=local)))
         if not found.enabled:
             commands.append(SetEffectEnabled(clip.id, found.id, True))
     return commands

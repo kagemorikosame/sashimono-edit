@@ -22,6 +22,7 @@ from sashimono.ui.export_dialog import ExportDialog
 from sashimono.ui.main_window import MainWindow
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.ui.export_codecs import settled
 
 
 def test_on_by_default_and_kept_after_restart(tmp_path: Path) -> None:
@@ -49,7 +50,8 @@ def test_the_preferences_dialog_shows_and_keeps_it(qt_application: QApplication)
 def test_the_export_dialog_passes_the_choice(qt_application: QApplication) -> None:
     # 壊れると、窓で切っても書き出した動画に章が入る
     del qt_application
-    dialog = ExportDialog(Project.create(), chapters=False)
+    # 待たないと、裏の確かめと重なったときに設定が読めず、下の飛ばしで何も確かめずに終わる
+    dialog = settled(ExportDialog(Project.create(), chapters=False))
     try:
         assert dialog.embeds_chapters is False
         settings = dialog._settings()

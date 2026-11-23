@@ -48,6 +48,7 @@ from sashimono.core.timebase import FrameRate
 from sashimono.effects import registry
 from sashimono.effects.audio import LIMITER_KIND
 from sashimono.engine.audio import AudioMixer
+from sashimono.engine.checks.job import CheckRequest
 from sashimono.engine.decode.probe import probe_media
 from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
@@ -404,10 +405,11 @@ class TestRightClick:
         # 壊れると、右クリックでそろえても基準の音量にならないか、測る間に画面が固まる
         asked: list[float] = []
 
-        def answer(_parent: object, target: float, limiter: bool) -> LoudnessChoice:
+        def answer(_parent: object, target: float, limiter: bool, depth: float) -> LoudnessChoice:
             asked.append(target)
             # リミッターの初めの値は本人の設定（#414 既定は入り）
             assert limiter is True
+            assert depth == 12.0  # 抑えてよい量も本人の設定（#494）
             return LoudnessChoice(-14.0)
 
         monkeypatch.setattr(main_window_module, "ask_loudness", answer)
@@ -424,6 +426,32 @@ class TestRightClick:
         assert clip_volume(voice_clip).static == 100.0
         window.document.undo()
         assert window.document.project == project
+
+    @pytest.mark.parametrize("tuned", [False, True])
+    def test_lanes_are_measured_only_when_they_are_used(
+        self,
+        opened: list[MainWindow],
+        media: _Media,
+        monkeypatch: pytest.MonkeyPatch,
+        tuned: bool,
+    ) -> None:
+        """人のリミッターがあれば組の手がかりは使わない 測ると長い作品で待ちだけが延びる"""
+        monkeypatch.setattr(
+            main_window_module, "ask_loudness", lambda *_args: LoudnessChoice(-14.0)
+        )
+        project, voice, bgm = _project(media)
+        clips = [
+            next(t for t in project.timeline.tracks if t.id == track.id).clips[0]
+            for track in (voice, bgm)
+        ]
+        if tuned:
+            limiter = registry.require(LIMITER_KIND).create(release=300.0)
+            project = AddEffect(clips[0].id, limiter).apply(project)
+        window = _window(opened, project)
+        asked: list[CheckRequest] = []
+        monkeypatch.setattr(window, "request_check", asked.append)
+        window.normalize_clips([clip.id for clip in clips])
+        assert [request.separate for request in asked] == [not tuned]
 
     def test_a_capped_gain_is_not_called_on_target(
         self, opened: list[MainWindow], media: _Media, monkeypatch: pytest.MonkeyPatch

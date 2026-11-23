@@ -123,7 +123,12 @@ class LoudnessDialog(QDialog):
     """そろえる基準と音の山の上限を選ぶ 基準の既定は本人の設定"""
 
     def __init__(
-        self, target: float, parent: QWidget | None = None, *, limiter: bool = True
+        self,
+        target: float,
+        parent: QWidget | None = None,
+        *,
+        limiter: bool = True,
+        depth: float = MAX_LIMITER_DB,
     ) -> None:
         """``limiter`` は〔リミッターで山を抑える〕の初めの値 本人の設定を渡す
 
@@ -158,10 +163,10 @@ class LoudnessDialog(QDialog):
         self.limiter_box.setChecked(limiter)
         self.limiter_box.setToolTip(
             "山が上限に当たって基準に届かないとき、選んだクリップの最後にリミッターを積んで山を"
-            f" {MAX_LIMITER_DB:g} dB まで抑え、基準まで上げます"
-            " 一瞬の山だけなら話し声の大きさはほぼ変わりませんが、上限を越える音が続く所は"
-            "その間も抑えるので、全体の音量が少し下がることがあります"
-            " 前に積んだリミッターがあるクリップには重ねて積みません"
+            f" {depth:g} dB まで（表示 → 設定… で変えられます）抑え、基準まで上げます"
+            " 抑えて下がる分は見込んで掛けます"
+            " もう 1 度そろえても抑える前の音から数え直すので、重ねて潰れません"
+            " 自分で値を変えたリミッターがあるときは、それ以上は抑えません"
             " そろえた後に AI の check_output か書き出しで音量を確かめてください"
         )
         form.addRow(self.limiter_box)
@@ -191,9 +196,11 @@ def ask_duck(parent: QWidget, voices: Sequence[Track], shape: DuckShape) -> Duck
         dialog.deleteLater()
 
 
-def ask_loudness(parent: QWidget, target: float, limiter: bool = True) -> LoudnessChoice | None:
+def ask_loudness(
+    parent: QWidget, target: float, limiter: bool = True, depth: float = MAX_LIMITER_DB
+) -> LoudnessChoice | None:
     """窓を出して選ばせる やめたら ``None``"""
-    dialog = LoudnessDialog(target, parent, limiter=limiter)
+    dialog = LoudnessDialog(target, parent, limiter=limiter, depth=depth)
     try:
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None

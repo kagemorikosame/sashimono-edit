@@ -32,6 +32,7 @@ __all__ = [
     "RELEASE_MS_RANGE",
     "limit",
     "limiter_history",
+    "reduction",
 ]
 
 #: 上限（dBFS）の範囲と既定 既定は配信の多くが求める -1 dBTP（音量をそろえる道具の天井と同じ）
@@ -55,6 +56,30 @@ def limiter_history(values: dict[str, float]) -> float:
     return _release_seconds(values) * _HISTORY_TIMES
 
 
+def ceiling_before_fader(ceiling_db: float, fader_db: float) -> float:
+    """後に掛かる倍率 ``fader_db`` の分を引いた、リミッターの欄に置ける上限
+
+    置く所と、抑えた後の見積もり（#494）が同じ式を通る 範囲で止まると、書き出しで止まる所は
+    頼んだ上限から離れる
+    """
+    low, high = CEILING_DB_RANGE
+    return float(np.clip(ceiling_db - fader_db, low, high))
+
+
+def reduction(wanted: np.ndarray, interval: float, release: float) -> np.ndarray:
+    """絞りたい量の並び（``interval`` 秒おき）を、戻る速さ ``release`` 秒で均した絞る量
+
+    リミッターと、抑えた後の音量の見積もり（#494）が同じ式を通る 別々に書くと見積もりがずれる
+    """
+    step = -interval / release
+    index = np.arange(len(wanted), dtype=np.float64)
+    # 絞る量 h[n] = max(wanted[n], h[n-1] * a) a = e^step
+    # = a^n * max_{k<=n}(wanted[k] * a^-k) を対数で求める 0 は -inf で最大に効かない
+    with np.errstate(divide="ignore"):
+        logs = np.log(wanted) - index * step
+    return np.asarray(np.exp(np.maximum.accumulate(logs) + index * step))
+
+
 def limit(samples: np.ndarray, values: dict[str, float], context: AudioContext) -> np.ndarray:
     """``ceiling`` dBFS を越える山を絞る 左右は同じだけ絞る（定位を動かさない）"""
     if len(samples) == 0:
@@ -67,14 +92,8 @@ def limit(samples: np.ndarray, values: dict[str, float], context: AudioContext) 
     if not np.any(wanted > 0.0):
         return samples
     keep = min(max(context.keep_from, 0), len(samples))
-    step = -1.0 / (_release_seconds(values) * max(context.sample_rate, 1))
-    index = np.arange(len(samples), dtype=np.float64)
-    # 絞る量 h[n] = max(wanted[n], h[n-1] * a) a = e^step
-    # = a^n * max_{k<=n}(wanted[k] * a^-k) を対数で求める 0 は -inf で最大に効かない
-    with np.errstate(divide="ignore"):
-        logs = np.log(wanted) - index * step
-    reduction = np.exp(np.maximum.accumulate(logs) + index * step)
-    gain = (1.0 - reduction).astype(np.float32)
+    held = reduction(wanted, 1.0 / max(context.sample_rate, 1), _release_seconds(values))
+    gain = (1.0 - held).astype(np.float32)
     out = samples * gain[:, None]
     if keep:
         # 前の音として読んだだけの所は使われない 長さだけそろえる

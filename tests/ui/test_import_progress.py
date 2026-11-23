@@ -147,6 +147,68 @@ class TestImportDoesNotFreeze:
         assert window._import_indicator.isHidden()
         assert window.statusBar().currentMessage() == "2 件を読み込んだ"
 
+    @pytest.mark.parametrize("broken", [(), ("b.mp4",)])
+    def test_a_small_video_is_told_with_the_result(
+        self,
+        window: MainWindow,
+        video_media: MediaItem,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        broken: tuple[str, ...],
+    ) -> None:
+        # 続けて出すと、件数か失敗の訳が合わせ方を上書きして 1 度も読めない
+        stream = replace(video_media.video_streams[0], width=80, height=60)
+        gate = _Gate(replace(video_media, video_streams=(stream,)), broken)
+        gate.release.set()
+        monkeypatch.setattr(main_window_module, "probe_media", gate)
+        # 空の作品は素材の大きさへ合わせに行く 作品より小さく入った形を見る
+        monkeypatch.setattr(window, "_match_project_to", lambda _media: None)
+        window.import_media([tmp_path / "a.mp4", tmp_path / "b.mp4"])
+        assert window.wait_for_imports()
+        message = window.statusBar().currentMessage()
+        assert "画面に合わせる" in message
+        assert ("b.mp4" if broken else "2 件を読み込んだ") in message
+        if broken:
+            # 長いパスと理由を前に置くと、合わせ方が画面の外へ押し出される
+            assert message.index("画面に合わせる") < message.index("b.mp4")
+
+    @pytest.mark.parametrize("failed", [0, 1])
+    def test_the_end_of_the_analysis_keeps_the_small_hint(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch, failed: int
+    ) -> None:
+        # 新しい素材では解析が数秒で終わる 上書きすると合わせ方を読む前に消える
+        window._show_small("小さく入った 画面に合わせる")
+        window._background_shown = True
+        idle = window._proxies.poll()
+        monkeypatch.setattr(window._proxies, "poll", lambda: replace(idle, failed=failed))
+        monkeypatch.setattr(window._proxies, "settle", lambda _snapshot: None)
+        window._show_background_progress()
+        message = window.statusBar().currentMessage()
+        assert message.startswith("小さく入った 画面に合わせる")
+        assert ("失敗 1 件" in message) is bool(failed)
+
+    def test_the_hint_survives_a_failure_and_then_a_success(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 失敗を添えた後の知らせを覚えないと、次に終わった処理が合わせ方を消す
+        window._show_small("小さく入った 画面に合わせる")
+        idle = window._proxies.poll()
+        monkeypatch.setattr(window._proxies, "settle", lambda _snapshot: None)
+        for failed in (1, 0):
+            snapshot = replace(idle, failed=failed)
+            monkeypatch.setattr(window._proxies, "poll", lambda now=snapshot: now)
+            window._background_shown = True
+            window._show_background_progress()
+        assert "画面に合わせる" in window.statusBar().currentMessage()
+
+    def test_the_end_of_the_analysis_is_told_without_a_hint(self, window: MainWindow) -> None:
+        # 知らせが消えた後まで黙ると、解析が終わったことが分からない
+        window._show_small("小さく入った 画面に合わせる")
+        window.statusBar().clearMessage()
+        window._background_shown = True
+        window._show_background_progress()
+        assert window.statusBar().currentMessage() == "控えと解析が終わった"
+
     def test_cancel_places_nothing(
         self,
         window: MainWindow,

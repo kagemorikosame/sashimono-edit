@@ -13,7 +13,7 @@ BGM を話している間だけ下げる（ダッキング）線と、音量の�
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from itertools import pairwise
@@ -25,6 +25,7 @@ from sashimono.core.model import (
     AnimatedValue,
     Clip,
     ClipId,
+    EffectId,
     Keyframe,
     Project,
     Track,
@@ -40,6 +41,7 @@ __all__ = [
     "DUCK_ATTACK_MS_RANGE",
     "DUCK_DEPTH_DB_RANGE",
     "DUCK_RELEASE_MS_RANGE",
+    "LIMITER_DEPTHS",
     "MAX_LIMITER_DB",
     "VOLUME_LIMIT",
     "DuckPlan",
@@ -263,17 +265,31 @@ def plan_ducking(
     return DuckPlan(tuple(commands), tuple(curves), tuple(untouched))
 
 
-def measure_project(project: Project, clip_ids: Iterable[ClipId]) -> Project:
+def measure_project(
+    project: Project, clip_ids: Iterable[ClipId], bypass: Collection[EffectId] = ()
+) -> Project:
     """測るクリップだけを残したプロジェクト ミュートとソロは外す
 
     ほかのクリップを残すと、BGM だけをそろえたいのに声まで含めた音量を測る ソロは聞き比べの
     ための物で、残すとソロのトラックの外にある測りたい音が鳴らない
+    ``bypass`` のエフェクトは切って測る 前にそろえたときのリミッターを外して測ると、掛け直しても
+    抑える量が重ならない（#494）
     """
     wanted = set(clip_ids)
+
+    def bare(clip: Clip) -> Clip:
+        if not any(effect.id in bypass for effect in clip.effects):
+            return clip
+        effects = tuple(
+            replace(effect, enabled=False) if effect.id in bypass else effect
+            for effect in clip.effects
+        )
+        return replace(clip, effects=effects)
+
     tracks = tuple(
         replace(
             track,
-            clips=tuple(clip for clip in track.clips if clip.id in wanted),
+            clips=tuple(bare(clip) for clip in track.clips if clip.id in wanted),
             muted=False,
             solo=False,
         )
@@ -285,9 +301,16 @@ def measure_project(project: Project, clip_ids: Iterable[ClipId]) -> Project:
 #: 音の山の上限の既定（dBFS） 配信の多くが求める -1 dBTP に合わせる 窓と AI の道具と
 #: 検査の直し方が同じ値を見る
 DEFAULT_PEAK_CEILING_DB = -1.0
-#: リミッターで抑えてよい山の量の上限（dB #414） 通しの確かめで届かなかった 3.8〜6 LU を覆う
-#: これより絞ると、話し声の子音の立ち上がりまで潰れて平たく聞こえる
-MAX_LIMITER_DB = 6.0
+#: リミッターで抑えてよい山の量の既定（dB #414 #494） 59 分の話し声の配信から作った 2 本では、
+#: -14 LUFS へ届くのに 8.1 と 9.8 dB 要った 6 dB を越えて抑えた区切りは全体の 0.3% ほどで、
+#: 基準へ届かせる量だけを抑える（上限いっぱいまで潰すわけではない）
+MAX_LIMITER_DB = 12.0
+#: 設定画面の選び 立ち上がりを残したい人は浅くする
+LIMITER_DEPTHS: tuple[tuple[int, str], ...] = (
+    (6, "浅め 6 dB（立ち上がりを残す 基準に届かないことがある）"),
+    (9, "中くらい 9 dB"),
+    (12, "深め 12 dB（話し声の配信でも基準に届く）"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +322,106 @@ class LoudnessGain:
     limited_by: tuple[str, ...] = ()
     #: 掛けた後に山が天井を越える量（dB） リミッターで抑える分 0 なら抑えなくてよい
     squeeze_db: float = 0.0
+    #: 抑えた後の音量の見積もり（LUFS #494） 抑えないか、見積もる手がかりが無ければ ``None``
+    limited_lufs: float | None = None
+
+
+def _compensated(
+    predict: Callable[[float], float | None], target: float, low: float, high: float
+) -> float:
+    """抑えた後の音量が ``target`` になる量 どこでも届かなければ一番大きく鳴る量
+
+    たいていは掛けた量とともに増えるので二分で詰める ただし増える一方とは限らない 静かな所が
+    相対ゲートを越えて平均に入ると下がるので、上端で届かないときだけ下から順に見て、初めて届いた
+    所（一番浅く抑える側）の手前から詰める
+
+    見落としの限り 見るのは :data:`_SCAN_DB` おきと、その中で一番よかった点の前後（:func:`_crest`
+    0.02 dB まで） それより低く見えた別の山にある、幅 1 dB 未満の届く範囲は拾わない そのときも
+    返すのは見た中で一番大きく鳴る量で、基準に届いたとは答えない
+    """
+    if high <= low:
+        return high
+    top = predict(high)
+    if top is None:
+        return low
+    if top < target:
+        best, loudest_value = high, top
+        below = low
+        for step in range(math.ceil((high - low) / _SCAN_DB)):
+            at = low + step * _SCAN_DB
+            value = predict(at)
+            if value is None:
+                continue
+            if value >= target:
+                low, high = below, at
+                break
+            if value > loudest_value:
+                best, loudest_value = at, value
+            below = at
+        else:
+            at, value = _crest(predict, target, best, loudest_value, low, high)
+            if value < target:
+                return at
+            low, high = max(low, best - _SCAN_DB) if at <= best else best, at
+    for _ in range(_COMPENSATION_STEPS):
+        middle = (low + high) / 2.0
+        value = predict(middle)
+        if value is not None and value < target:
+            low = middle
+        else:
+            high = middle
+    return high
+
+
+def _crest(
+    predict: Callable[[float], float | None],
+    target: float,
+    best: float,
+    best_value: float,
+    low: float,
+    high: float,
+) -> tuple[float, float]:
+    """1 dB おきに見て一番よかった ``best`` のまわりの、一番大きく鳴る量とその音量
+
+    届く範囲が格子より狭いと、格子のどの点も届かない 黄金分割で詰め、届いた所で止める
+    上端へ向けて増え続けている形（山が無い）は 1 回見て止める 見積もりは 1 回が重い
+    """
+
+    def heard(gain: float) -> float:
+        value = predict(gain)
+        return -math.inf if value is None else value
+
+    if best >= high and heard(high - _CREST_DB) <= best_value:
+        return best, best_value
+    left, right = max(low, best - _SCAN_DB), min(high, best + _SCAN_DB)
+    first, second = right - _GOLDEN * (right - left), left + _GOLDEN * (right - left)
+    first_value, second_value = heard(first), heard(second)
+    while True:
+        at, value = (first, first_value) if first_value >= second_value else (second, second_value)
+        if value > best_value:
+            best, best_value = at, value
+        if best_value >= target or right - left <= _CREST_DB:
+            return best, best_value
+        if first_value >= second_value:
+            right, second, second_value = second, first, first_value
+            first = right - _GOLDEN * (right - left)
+            first_value = heard(first)
+        else:
+            left, first, first_value = first, second, second_value
+            second = left + _GOLDEN * (right - left)
+            second_value = heard(second)
+
+
+#: 格子の間の山を詰める細かさ（dB）
+_CREST_DB = 0.02
+#: 黄金分割の比
+_GOLDEN = (math.sqrt(5.0) - 1.0) / 2.0
+#: これより足りなければ基準に届いていないと読む（LU） 見積もりの細かさと同じくらい
+_SHORT_LU = 0.05
+#: 二分の回数 12 dB の幅が 0.003 dB まで詰まる
+_COMPENSATION_STEPS = 12
+#: 上端で届かないときに下から見る幅（dB） 見積もりは 1 回が長い作品で 0.1 秒ほど掛かる
+_SCAN_DB = 1.0
 
 
 def loudness_gain(
@@ -310,6 +433,7 @@ def loudness_gain(
     ceiling: float,
     squeeze: float = 0.0,
     raise_ceiling: float | None = None,
+    predict: Callable[[float], float | None] | None = None,
 ) -> LoudnessGain:
     """測った積分ラウドネス ``measured`` を ``target`` へ寄せる量（dB）
 
@@ -320,13 +444,25 @@ def loudness_gain(
     ``raise_ceiling`` は前に積んだリミッターが山を止める所 そこより上へは上げないが、下げる
     理由にはしない 測った山は混ぜた音の物で、どのクリップの山かは分からない 静かなクリップの
     低い上限で全体を下げると、そろえるはずの音量が大きく下がる（PR #451 の CodeRabbit の指摘）
+    ``predict`` は掛ける量から、抑えた後の音量を見積もる手（#494） 渡すと抑えて下がる分を
+    見込んで掛ける 渡さなければ、抑えた分だけ基準より小さくなる
     """
     gain = target - measured
     limited: list[str] = []
     room = max(0.0, squeeze)
+    # 抑える所だけ見込む 天井に当たらなければ掛けた量どおりに動く
+    estimate = predict if room > 0 and peak_db is not None else None
+    if estimate is not None and peak_db is not None and peak_db + gain > ceiling:
+        most = ceiling + room - peak_db
+        if gain <= most:
+            gain = _compensated(estimate, target, gain, most)
+            after = estimate(gain)
+            if after is not None and after < target - _SHORT_LU:
+                limited.append("peak")
     if peak_db is not None and peak_db + gain > ceiling + room:
         gain = ceiling + room - peak_db
-        limited.append("peak")
+        if "peak" not in limited:
+            limited.append("peak")
     if (
         raise_ceiling is not None
         and peak_db is not None
@@ -341,7 +477,8 @@ def loudness_gain(
         gain = ratio_to_db(VOLUME_LIMIT / top)
         limited.append("volume_limit")
     over = 0.0 if peak_db is None else max(0.0, peak_db + gain - ceiling)
-    return LoudnessGain(gain, tuple(limited), over)
+    after = estimate(gain) if estimate is not None and over > 0 else None
+    return LoudnessGain(gain, tuple(limited), over, after)
 
 
 def gain_commands(clips: Sequence[Clip], gain_db: float) -> list[Command]:
@@ -369,6 +506,24 @@ def sounds_now(project: Project, track: Track, clip: Clip) -> bool:
     測って音量をそろえ、書き出す音が基準からずれる（#375 の Codex の指摘）
     """
     return clip.enabled and id(track) in _heard_tracks(project) and project.plays_sound(track, clip)
+
+
+def track_gain_db(track: Track) -> float:
+    """クリップのエフェクトの後に掛かる、トラックの音量と定位のいちばん大きい倍率（dB）
+
+    リミッターはクリップのエフェクトなので、その後のトラックの音量が山を動かす +6 dB のトラックで
+    上限 -1 dBFS に抑えても書き出しは +5 dBFS になる（PR #451 の CodeRabbit の指摘）
+    映像トラックは音量と定位を使わない（ミキサと同じ決まり）
+    """
+    if track.kind is TrackKind.VIDEO:
+        return 0.0
+    pan = min(1.0, max(-1.0, float(track.pan)))
+    if pan == 0.0:
+        return track.volume_db
+    angle = (pan + 1.0) * math.pi / 4.0
+    # 定電力パンは片側を最大 √2 倍（+3 dB）にする 中央の 0 では倍率 1
+    panned = math.sqrt(2.0) * max(math.cos(angle), math.sin(angle))
+    return track.volume_db + 20.0 * math.log10(panned)
 
 
 def audible_clips(project: Project) -> list[tuple[Track, Clip]]:

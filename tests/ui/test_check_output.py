@@ -541,6 +541,8 @@ class TestSubtitlesInScenes:
             clip for track in project.timeline.tracks for clip in track.clips if clip.scene_id
         )
         assert overflow["in_scene_clip"] == str(placed.id)
+        # set_param は開いていないシーンの字を見つけられない auto で返すと AI が失敗を繰り返す
+        assert overflow["fix"]["action"] == "handoff"
 
     def test_moving_the_placed_scene_off_screen_is_found(
         self, opened: list[MainWindow], media: _Media

@@ -127,6 +127,27 @@ class TestWordAt:
         found = WordMap(Transcript(lines, language="ja")).word_at(Fraction(2))
         assert found is not None and found.text == "あ" * 10
 
+    @pytest.mark.parametrize(
+        ("hundredths", "side", "inside"),
+        [
+            (208, CUT_OUT, True),
+            (208, CUT_IN, True),
+            (206, CUT_OUT, True),
+            (206, CUT_IN, False),
+            (200, CUT_OUT, False),
+            (202, CUT_OUT, False),
+            (216, CUT_IN, False),
+            (214, CUT_IN, False),
+        ],
+    )
+    def test_the_middle_of_a_short_word_alone(
+        self, hundredths: int, side: str, inside: bool
+    ) -> None:
+        """向かいの端の遊びが覆うと短い語だけの行の真ん中の切れ目を見逃し、端まで数えると誤報になる"""
+        word = Word(Fraction(2), Fraction(216, 100), "はい")
+        words = WordMap(Transcript((segment((word,)),), language="ja"))
+        assert (words.word_at(Fraction(hundredths, 100), side) is not None) is inside
+
 
 class TestAttachWords:
     """語の時刻のために起こし直すと、人が直した字幕が消える"""
