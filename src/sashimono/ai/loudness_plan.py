@@ -190,7 +190,7 @@ def plan_loudness(
     after = plan.decided.limited_lufs
     if after is None:
         after = measured + plan.decided.gain_db
-    # 低いトラックの上限は 0 dBFS で頭打ちになり、深さの中では上げられないことがある
+    # 低いトラックの上限は欄の範囲（+20 dB #499）で頭打ちになり、深さの中では上げられないことがある
     # 抑えて下げるより、抑えずに山の手前まで上げる
     return LoudnessPlan(free) if after < measured + free.gain_db else plan
 
