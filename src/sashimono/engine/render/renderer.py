@@ -49,6 +49,8 @@ from sashimono.engine.audio_shapes import spectrum_window
 from sashimono.engine.cache.proxy import ProxyStore
 from sashimono.engine.decode import AudioDecoder, ProbeError, VideoDecoder
 from sashimono.engine.gpu import (
+    IDENTITY,
+    OFF_SCREEN,
     BlendMode,
     Compositor,
     Corners,
@@ -1366,6 +1368,9 @@ class FrameRenderer:
             source_rect=inner.to_clip(width, height),
             duration=clip.duration,
             bounds=_placed_bounds(self._object_box_of(clip, image), image, inner),
+            # 画面はバッファの真ん中 バッファの端を画面の端と見ると、縮めて画面に収めた絵の
+            # 外周が暗いまま残る（#493）
+            screen=(float(screen_width), float(screen_height)),
         )
         self._compositor.draw_handle(
             result.color,
@@ -1614,6 +1619,7 @@ class FrameRenderer:
                 # 画面に収まる絵と同じ入れ物（AviUtl2 の組み方のテキストなら文字の枠も入れる）
                 # 色の付いた範囲だけにすると、はみ出す長さの字だけ効果の基準が変わる
                 bounds=self._object_box_of(clip, image),
+                screen=(float(screen_width), float(screen_height)),
             )
             self._compositor.draw_handle(
                 result.color, placed, opacity=opacity, flip=False, blend=clip.blend_mode
@@ -2180,6 +2186,8 @@ class FrameRenderer:
                 source_rect=placement.to_clip(self._compositor.width, self._compositor.height),
                 duration=clip.duration,
                 bounds=_placed_bounds(_content_box(call.image), call.image, placement),
+                # 結果を回して重ねる物は、バッファの端が画面の中に見える
+                screen=None if matrix == IDENTITY else OFF_SCREEN,
             )
             self._compositor.draw_handle(
                 result.color,
@@ -2320,6 +2328,8 @@ class FrameRenderer:
             source_rect=centred.to_clip(width, height),
             duration=duration,
             bounds=_placed_bounds(box, None, centred, texture.width, texture.height),
+            # この後で四角へ貼るので、バッファの端は画面の端ではない
+            screen=OFF_SCREEN,
         )
         if uv is not None:
             # 絵の一部だけを貼るときは、切り出す四隅を結果のバッファの中の位置へ

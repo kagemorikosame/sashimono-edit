@@ -12,6 +12,7 @@ from __future__ import annotations
 from sashimono.effects.blending import BLEND_FUNCTIONS, BLEND_MODES
 from sashimono.effects.builtin import PRELUDE
 from sashimono.effects.definition import EffectDefinition, registry
+from sashimono.effects.edges import flipped_edges
 from sashimono.effects.motion import _IN_OUT, _JUMP_SHAPE, _WAVE, _easing, _in_out_specs
 from sashimono.effects.spec import CheckSpec, ColorSpec, SelectSpec, TrackSpec, ValueSpec
 
@@ -1222,6 +1223,9 @@ def register_optics_effects() -> None:
                 CheckSpec("vertical", "上下", False),
             ),
             fragment_shader=_FLIP,
+            moves_edges=flipped_edges,
+            # 裏返しはもう 1 度裏返すと戻るので、掛ける前の画面も同じ式
+            screen_before=flipped_edges,
             # どちらも裏返さなければ絵は変わらない クリップが最初から持つ左右反転は
             # この値で付く（:mod:`sashimono.core.commands.fixed`）
             idle_when=(("horizontal", False), ("vertical", False)),
