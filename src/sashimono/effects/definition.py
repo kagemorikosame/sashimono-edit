@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sashimono.core.model import AnimatedValue, Effect, ParamValue
+from sashimono.effects.edges import MoveEdges
 from sashimono.effects.spec import ParameterGroup, ParameterSpec, ParamInput, TrackSpec
 
 __all__ = [
@@ -70,6 +71,8 @@ class EffectDefinition:
     ``u_pass``      複数パスのときの通し番号（0 から）
     ``u_time``      クリップ先頭からの経過秒
     ``u_frame``     クリップ先頭からの経過フレーム
+    ``u_screen``    画面がバッファのどこか（左・下・右・上） 幅 0 なら画面に出ない絵
+    ``u_edges``     絵のまっすぐな縁（:attr:`moves_edges` で追った物 幅は ``u_edge_soft``）
 
     パラメータは名前をそのまま uniform 名にする 数値は ``float``、チェックは
     ``bool``、色は ``vec4``（リニアへ変換済み）、選択肢は番号の ``int``
@@ -125,6 +128,17 @@ class EffectDefinition:
     keeps_content: bool = False
     #: 画面いっぱいの四角 1 枚ではなく、升目ごとの四角で描くか（:class:`Pieces`）
     pieces: Pieces | None = None
+    #: 絵のまっすぐな縁を動かすエフェクトの、動かした後の縁の求め方
+    #: （:mod:`sashimono.effects.edges`）
+    #:
+    #: 後ろの変形は縁が画面の端に掛かったかをこれで知る 縁を動かす物に付けないと、その後で
+    #: 画面いっぱいへ拡大した絵の外周が暗くなる（#493）
+    moves_edges: MoveEdges | None = field(default=None, compare=False, kw_only=True)
+    #: このエフェクトの後で画面の端に来る所が、掛ける前はどこだったか（画面を縁として渡す）
+    #:
+    #: 無いエフェクト（:attr:`keeps_content` の物を除く）が変形の後ろにあれば、その変形は縁に
+    #: 手を入れない 入れると、硬くした縁を後ろの動きが画面の中へ運んで見せる（#493）
+    screen_before: MoveEdges | None = field(default=None, compare=False, kw_only=True)
     #: この値の組なら絵を変えない、という項目と値（動かない値だけが当たる）
     #:
     #: クリップが最初から持つ配置と反転（固定の項目）は、置いたクリップすべてに付く

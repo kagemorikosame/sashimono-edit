@@ -42,6 +42,9 @@ vec4 bilinear_premul(sampler2D tex, vec2 pixel, bool premultiplied) {
     return mix(low, high, f.y);
 }
 
+// area_premul が 1 辺に読む点の数 読む位置を寄せる側（変形の画面の端）も同じ数で広がりを測る
+int area_steps(float reach) { return int(clamp(ceil(reach - 0.001), 1.0, 8.0)); }
+
 // uv の 1 画素が入力で覆う範囲の平均（事前乗算） du と dv は出力の 1 画素ぶん動いたときの
 // uv の動き（dFdx と dFdy） 分かれ道の中では測れないので、呼ぶ側が先に測って渡す
 // 読む数は覆う画素の数に合わせ、極端に縮めたときも 8x8 で止めて重くしすぎない
@@ -54,7 +57,7 @@ vec4 area_premul(sampler2D tex, vec2 uv, vec2 du, vec2 dv, bool premultiplied) {
     // 傾けた板の裏へ回った所の隣は、とても遠い点になる そこまでを範囲にすると、
     // 縁の画素が遠くを平均して薄れる
     if (reach > 256.0) return bilinear_premul(tex, pixel, premultiplied);
-    int n = int(clamp(ceil(reach - 0.001), 1.0, 8.0));
+    int n = area_steps(reach);
     vec4 sum = vec4(0.0);
     for (int j = 0; j < n; ++j) {
         for (int i = 0; i < n; ++i) {

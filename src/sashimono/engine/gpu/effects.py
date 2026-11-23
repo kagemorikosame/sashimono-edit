@@ -12,13 +12,14 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from OpenGL import GL
 
 from sashimono.core.model import Effect, ParamValue
 from sashimono.effects import EffectDefinition, registry
 from sashimono.effects.definition import object_pivot, turned_object
+from sashimono.effects.edges import EdgeStep, PictureEdges, placed_edges
 from sashimono.effects.sampling import AREA_SAMPLING
 from sashimono.effects.spec import (
     CheckSpec,
@@ -41,7 +42,11 @@ from sashimono.engine.gpu.glutil import (
 )
 from sashimono.engine.gpu.images import EffectImages
 
-__all__ = ["EffectProcessor", "piece_grid", "srgb_to_linear"]
+__all__ = ["OFF_SCREEN", "EffectProcessor", "piece_grid", "srgb_to_linear"]
+
+#: :meth:`EffectProcessor.apply` の ``screen`` へ渡す 結果のバッファの端が画面の端にならない絵
+#: （焼き込みの作業場・後で回すか四角へ貼る絵） 画面の端として扱うと、画面の中に見える縁が硬くなる
+OFF_SCREEN = (0.0, 0.0)
 
 
 _log = logging.getLogger(__name__)
@@ -107,6 +112,9 @@ class EffectProcessor:
         self._origin: tuple[float, float] = (float(width) * 0.5, float(height) * 0.5)
         #: 絵の中身が載りうる範囲（u_content） 素材を置いた直後は u_object と同じ
         self._content: tuple[float, float, float, float] = self._object
+        #: 画面がバッファのどこか（u_screen）と、絵の縁（u_edges 追えなくなったら None）
+        self._screen: tuple[float, float, float, float] = self._object
+        self._edges: PictureEdges | None = None
         self._duration = 0
         #: 事前乗算で渡される絵（合成先のキャンバス）が sRGB で符号化した値か
         #: 重ね合わせを sRGB で行うプロジェクトで真にする（:class:`Compositor` の ``encoded``）
@@ -159,6 +167,7 @@ class EffectProcessor:
         bounds: tuple[float, float, float, float] | None = None,
         origin: tuple[float, float] | None = None,
         premultiplied: bool = False,
+        screen: tuple[float, float] | None = None,
     ) -> Framebuffer:
         """``source`` にエフェクトを掛けた結果のバッファを返す
 
@@ -174,22 +183,26 @@ class EffectProcessor:
 
         ``origin`` は絵の原点（画素、左上が原点） 省くと ``bounds`` の中央
         範囲の中央と原点が離れる絵（場面切り替えの場面）だけが渡す
+
+        ``screen`` は画面の大きさ（合成の画素） 画面はバッファの中心に重なる 省くとバッファが
+        そのまま画面 画面の端に掛かった縁を変形が見分けるのに使う（:data:`OFF_SCREEN`）
         """
         self._front = 0
         self._draw_source(source, source_rect, flip_source, premultiplied)
         width, height = float(self.width), float(self.height)
         #: 絵が置かれた範囲（画素、GL の向き） 角丸や中心基準の動きが使う
+        left, bottom, right, top = (float(v) for v in source_rect[:4])
+        placed = (
+            (left + 1.0) * 0.5 * width,
+            (bottom + 1.0) * 0.5 * height,
+            (right + 1.0) * 0.5 * width,
+            (top + 1.0) * 0.5 * height,
+        )
         if bounds is not None:
             left_px, top_px, right_px, bottom_px = bounds
             self._object = (left_px, height - bottom_px, right_px, height - top_px)
         else:
-            left, bottom, right, top = (float(v) for v in source_rect[:4])
-            self._object = (
-                (left + 1.0) * 0.5 * width,
-                (bottom + 1.0) * 0.5 * height,
-                (right + 1.0) * 0.5 * width,
-                (top + 1.0) * 0.5 * height,
-            )
+            self._object = placed
         if origin is not None:
             self._origin = (origin[0], height - origin[1])
         else:
@@ -199,10 +212,18 @@ class EffectProcessor:
             )
         self._duration = max(duration, 0)
         self._content = self._object
+        seen_width, seen_height = screen or (width, height)
+        self._screen = (
+            (width - seen_width) * 0.5,
+            (height - seen_height) * 0.5,
+            (width + seen_width) * 0.5,
+            (height + seen_height) * 0.5,
+        )
+        self._edges = placed_edges(self._object, placed, (source.width, source.height))
 
         #: 開いている部分フィルタ 後ろのエフェクトはこの範囲の中だけに効く
         scope: tuple[_Compiled, Effect] | None = None
-        for effect in effects:
+        for index, effect in enumerate(effects):
             # 何もしない値の物はパスを通さない 通すと 1 回ごとに画素を読み直すだけ遅くなる
             if not effect.enabled or _idle(effect):
                 continue
@@ -222,7 +243,7 @@ class EffectProcessor:
                 self._copy(self._buffers[self._front], self._held_buffer())
                 scope = (compiled, effect)
                 continue
-            self._apply_one(compiled, effect, frame=frame, fps=fps)
+            self._apply_one(compiled, effect, frame=frame, fps=fps, later=effects[index + 1 :])
         if scope is not None:
             self._close_scope(*scope, frame=frame, fps=fps)
 
@@ -288,13 +309,18 @@ class EffectProcessor:
         frame: int,
         fps: float,
         keep_source: bool = False,
+        later: tuple[Effect, ...] = (),
     ) -> None:
         """エフェクト 1 つを、必要なパス数だけ掛ける
 
         ``keep_source`` が真なら ``u_source`` を書き換えない（部分フィルタを閉じるとき）
+        ``later`` はこの後ろに掛かる並び 縁に手を入れてよいかを決める（:meth:`_screen_before`）
         """
         definition = compiled.definition
         program = compiled.program
+        # 縁を見るエフェクトにだけ渡す ほかのシェーダへまで毎回送ると、その分だけ遅い
+        edge_aware = definition.moves_edges is not None
+        screen = self._screen_before(later, frame) if edge_aware else self._screen
 
         # 元の絵を控えておく u_source を使うエフェクト（グロー・影）が要る
         if not keep_source:
@@ -318,6 +344,8 @@ class EffectProcessor:
             program.set_vec4("u_object", self._object)
             program.set_vec2("u_origin", self._origin)
             program.set_vec4("u_content", self._content)
+            if edge_aware:
+                self._set_edges(program, screen)
             program.set_float("u_pixel_scale", self.pixel_scale)
             program.bind_texture("u_texture", source_buffer.color, unit=0)
             program.bind_texture("u_source", self._source.color, unit=1)
@@ -329,8 +357,12 @@ class EffectProcessor:
             self._quad.draw()
             self._front = 1 - self._front
 
+        self._move_edges(definition, effect, frame)
         self._grow_object(definition, effect, frame)
         if not definition.keeps_content:
+            if self._edges is not None and definition.moves_edges is None:
+                # 縁をどう動かしたか分からない物（粒・ぼかし）の後の縁は、当てにしない
+                self._edges = replace(self._edges, known=False)
             # 中身をどこへ動かしたかは分からない（変形・揺れ・散らす物）ので、後ろの
             # エフェクトにはバッファ全体を中身の範囲として渡す u_object で決めると、
             # 前の変形で広げた絵の粒や欠片が元の大きさで切れる（#199）
@@ -370,6 +402,84 @@ class EffectProcessor:
         self._blit.bind_texture("u_texture", target.color)
         self._quad.draw()
 
+    def _set_edges(self, program: Program, screen: tuple[float, float, float, float]) -> None:
+        """画面の範囲と絵の縁を渡す"""
+        program.set_vec4("u_screen", screen)
+        # 追えなくなった縁はバッファ全体 画素の境目から探す方だけが効く
+        edges = self._edges
+        whole = (0.0, 0.0, float(self.width), float(self.height))
+        program.set_vec4("u_edges", whole if edges is None else edges.box)
+        program.set_vec4("u_edge_soft", (0.5,) * 4 if edges is None else edges.soft)
+        program.set_bool("u_edge_known", edges is not None and edges.known)
+
+    def _screen_before(
+        self, later: tuple[Effect, ...], frame: int
+    ) -> tuple[float, float, float, float]:
+        """``later`` を掛け終えて画面になる所が今のどこか 幅 0 なら縁に手を入れない
+
+        後ろに動かす物（もう 1 つの変形・揺れ）があれば手を入れない 今の画面の端で硬くした縁や、
+        はみ出しのバッファの画面の外へ伸びた帯が、動いた先で画面の中に見える 最後の変形は
+        前の変形でなまった幅（:class:`PictureEdges` の ``soft``）ごと端を満たすので暗くはならない
+        """
+        following: list[tuple[EffectDefinition, Effect]] = []
+        for effect in later:
+            if not effect.enabled or _idle(effect):
+                continue
+            compiled = self._compile(effect)
+            if compiled is None:
+                continue
+            definition = compiled.definition
+            if definition.keeps_content or definition.scopes_following:
+                continue
+            if definition.screen_before is None:
+                return (0.0, 0.0, 0.0, 0.0)
+            following.append((definition, effect))
+        screen: PictureEdges | None = PictureEdges(self._screen, (0.5, 0.5, 0.5, 0.5))
+        for definition, effect in reversed(following):
+            if screen is None or definition.screen_before is None:
+                break
+            screen = definition.screen_before(screen, self._edge_step(definition, effect, frame))
+        return (0.0, 0.0, 0.0, 0.0) if screen is None else screen.box
+
+    def _move_edges(self, definition: EffectDefinition, effect: Effect, frame: int) -> None:
+        """縁を動かすエフェクトの後で、絵の縁を動かす
+
+        ``u_object`` が広がる前に呼ぶ シェーダは広がる前の範囲で支点を決めている
+        """
+        if definition.moves_edges is None or self._edges is None:
+            return
+        moved = definition.moves_edges(self._edges, self._edge_step(definition, effect, frame))
+        # 桁の外の値（壊れたファイル）は掛け算で無限になる 次の変形が画素へ丸めるときに
+        # 例外になり、そのコマの描画が止まるので、追うのをやめる
+        if moved is not None and not all(map(math.isfinite, (*moved.box, *moved.soft))):
+            moved = None
+        self._edges = moved
+
+    def _edge_step(self, definition: EffectDefinition, effect: Effect, frame: int) -> EdgeStep:
+        """縁を動かす関数へ渡す、このエフェクトの手掛かり"""
+        return EdgeStep(
+            number=lambda name: _number(definition, effect, name, frame, self.pixel_scale),
+            checked=lambda name: _checked(definition, effect, name),
+            pivot=lambda: self._pivot(definition, effect, frame),
+            placed=self._object,
+        )
+
+    def _pivot(
+        self, definition: EffectDefinition, effect: Effect, frame: int
+    ) -> tuple[float, float]:
+        """支点（合成の画素） シェーダと同じ決まり（:func:`object_pivot`）"""
+        return object_pivot(
+            _choice(definition, effect, "pivot_h"),
+            _choice(definition, effect, "pivot_v"),
+            (
+                _number(definition, effect, "anchor_x", frame, self.pixel_scale),
+                _number(definition, effect, "anchor_y", frame, self.pixel_scale),
+            ),
+            self._object,
+            (float(self.width), float(self.height)),
+            self._origin,
+        )
+
     def _grow_object(self, definition: EffectDefinition, effect: Effect, frame: int) -> None:
         """入れ物を広げるエフェクトの後で、絵の置かれた範囲を広げる
 
@@ -377,18 +487,7 @@ class EffectProcessor:
         AviUtl の 領域拡張 → ミラー は、広げたぶんだけ鏡像が離れる並べ方
         """
         if definition.turns_object:
-            pivot = object_pivot(
-                _choice(definition, effect, "pivot_h"),
-                _choice(definition, effect, "pivot_v"),
-                (
-                    _number(definition, effect, "anchor_x", frame, self.pixel_scale),
-                    _number(definition, effect, "anchor_y", frame, self.pixel_scale),
-                ),
-                self._object,
-                (float(self.width), float(self.height)),
-                self._origin,
-            )
-            self._object = turned_object(self._object, pivot)
+            self._object = turned_object(self._object, self._pivot(definition, effect, frame))
         if definition.expands_object is None:
             return
         top, bottom, left, right = (
@@ -558,6 +657,15 @@ def _number(
     value = effect.params.get(name)
     raw = spec.default_value() if value is None else value
     return float(spec.scaled_at(spec.coerce(raw), frame, scale))
+
+
+def _checked(definition: EffectDefinition, effect: Effect, name: str) -> bool:
+    """真偽の項目を 1 つ、シェーダへ渡すのと同じ形で読む 項目が無ければ偽"""
+    spec = definition.spec(name)
+    if not isinstance(spec, CheckSpec):
+        return False
+    value = effect.params.get(name)
+    return spec.coerce(spec.default_value() if value is None else value)
 
 
 def _choice(definition: EffectDefinition, effect: Effect, name: str) -> str:

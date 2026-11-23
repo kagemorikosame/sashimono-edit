@@ -18,7 +18,7 @@ import numpy as np
 from sashimono.compat.aviutl.report import CompatibilityReport, global_report
 from sashimono.core.model import Effect
 from sashimono.effects.strokes import effect_reach, pixel_reach
-from sashimono.engine.gpu import Compositor, EffectProcessor, Placement, Texture
+from sashimono.engine.gpu import OFF_SCREEN, Compositor, EffectProcessor, Placement, Texture
 
 __all__ = ["BAKE_CANVAS_LIMIT", "BAKE_MARGIN", "ScriptEffectBaker", "bake_margin", "fitted_margin"]
 
@@ -107,6 +107,8 @@ class ScriptEffectBaker:
                 float(margin + width),
                 float(margin + height),
             ),
+            # 作業場は画面ではない 戻した絵はこの後で置かれる
+            screen=OFF_SCREEN,
         )
         compositor.begin((0.0, 0.0, 0.0, 0.0))
         compositor.draw_handle(
@@ -193,6 +195,7 @@ class ScriptEffectBaker:
                     float(margin - left + int(columns[-1]) + 1),
                     float(margin - top + int(rows[-1]) + 1),
                 ),
+                screen=OFF_SCREEN,
             )
         finally:
             # スクリプトの焼き込み（:meth:`apply`）は画面の画素で掛ける 戻さないと、画質を
