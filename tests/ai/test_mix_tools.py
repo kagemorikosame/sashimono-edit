@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -14,7 +15,9 @@ from typing import Any
 
 import pytest
 
+from sashimono.ai import operations
 from sashimono.ai.host import ToolError
+from sashimono.ai.loudness_plan import plan_loudness
 from sashimono.ai.operations import Pending, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddClip, AddScene, SetClipProperty, SetTrackState, new_scene
@@ -38,12 +41,14 @@ from sashimono.engine.checks import CheckState
 from sashimono.engine.checks.report import assemble
 from sashimono.engine.checks.scan import LOUDNESS
 from tests.ai.conftest import RATE_30, FakeHost
+from tests.ai.pending import run_now, settle
+from tests.waiting import GUARD_SECONDS, wait_until
 
 
 def _run(host: FakeHost, name: str, **arguments: Any) -> Any:
     operation = find_operation(name)
     assert operation is not None
-    return operation(host, arguments)
+    return run_now(name, operation(host, arguments), arguments)
 
 
 def _sound(name: str, seconds: int) -> MediaItem:
@@ -571,6 +576,57 @@ class TestNormalize:
         assert result["gain_db"] == pytest.approx(-6.0)
         assert "limited_by" not in result
 
+    @staticmethod
+    def _held_plan(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, list[int]]:
+        """抑えた後の見積もり（#497）を、試験が離すまで裏のスレッドで止めておく"""
+        gate = threading.Event()
+        threads: list[int] = []
+        real = plan_loudness
+
+        def held(*args: Any, **kwargs: Any) -> Any:
+            threads.append(threading.get_ident())
+            gate.wait(GUARD_SECONDS)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(operations, "plan_loudness", held)
+        return gate, threads
+
+    def test_the_estimate_runs_off_the_editor_thread(
+        self, work: _Work, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """道具は画面のスレッドで動く そこで数えると、長い作品で数秒、描き直しも中断も効かない"""
+        gate, threads = self._held_plan(monkeypatch)
+        _run(work.host, "normalize_loudness", wait_seconds=10)
+        _measured(work.host, -17.0, -10.0)
+        operation = find_operation("normalize_loudness")
+        assert operation is not None
+        pending = operation(work.host, {"wait_seconds": 0})
+        assert isinstance(pending, Pending)
+        wait_until(lambda: bool(threads), "見積もりの始まり")
+        assert threads[0] != threading.get_ident()
+        assert not pending.wait(0)
+        gate.set()
+        done = settle(pending)
+        assert done["gain_db"] == pytest.approx(3.0)
+
+    def test_a_change_while_estimating_is_refused(
+        self, work: _Work, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """見積もる間に変えた作品へ掛けると、測った音量と合わない量を掛ける"""
+        gate, threads = self._held_plan(monkeypatch)
+        _run(work.host, "normalize_loudness", wait_seconds=10)
+        _measured(work.host, -17.0, -10.0)
+        operation = find_operation("normalize_loudness")
+        assert operation is not None
+        pending = operation(work.host, {"wait_seconds": 0})
+        wait_until(lambda: bool(threads), "見積もりの始まり")
+        work.host.apply_commands([SetTrackState(work.voice_track.id, solo=True)], "ソロ")
+        changed = work.host.document.project
+        gate.set()
+        with pytest.raises(ToolError, match="見積もっている間に作品が変わりました"):
+            settle(pending)
+        assert work.host.document.project == changed
+
     def test_a_change_while_measuring_is_refused(self, work: _Work) -> None:
         # 壊れると、測った後に足した音まで同じだけ上げ、測った音量と合わなくなる
         pending = _run(work.host, "normalize_loudness", wait_seconds=10)
@@ -594,7 +650,7 @@ class TestNormalize:
         result = _run(work.host, "normalize_loudness", wait_seconds=10)
         assert isinstance(result, Pending)
         _measured(work.host, -17.0, -10.0)
-        done = result.then()
+        done = settle(result.then())
         assert isinstance(done, dict)
         assert done["gain_db"] == pytest.approx(3.0)
 

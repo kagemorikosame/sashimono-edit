@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import gc
+import logging
 import math
 import os
 import platform
@@ -18,7 +19,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -83,7 +84,7 @@ from sashimono.ai.host import (
     ToolError,
     ViewState,
 )
-from sashimono.ai.loudness_plan import plan_loudness
+from sashimono.ai.loudness_plan import LoudnessPlan, PlanJob, plan_loudness
 from sashimono.ai.operations import (
     NarrationJob,
     narration_consent,
@@ -223,6 +224,7 @@ from sashimono.engine.cache.proxy import ProxyBuilder, ProxyStore, proxy_order, 
 from sashimono.engine.cache.scene_notes import SceneNoteStore
 from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckJob, CheckLimits, CheckRequest, CheckState
+from sashimono.engine.checks.report import CheckReport
 from sashimono.engine.checks.scan import LOUDNESS
 from sashimono.engine.decode import ProbeError, forget_probe, probe_media
 from sashimono.engine.decode.batch import ProbeBatch
@@ -357,6 +359,8 @@ POOL_THUMBNAIL_SECONDS = Fraction(1)
 
 #: AviUtl のオブジェクトファイル
 EXO_FILTER = "AviUtl オブジェクト (*.exo *.exa *.exo2 *.exa2);;すべてのファイル (*)"
+
+_log = logging.getLogger(__name__)
 
 #: 初めて開いたときの窓の大きさ 画面がこれより狭ければ画面に合わせる（:func:`initial_size`）
 DEFAULT_SIZE = QSize(1440, 900)
@@ -498,6 +502,8 @@ class MainWindow(QMainWindow):
     """編集画面"""
 
     project_changed = Signal(object)
+    #: 抑えた後の音量を見積もり終えた（#497） 裏のスレッドから送り、画面のスレッドで受ける
+    _loudness_planned = Signal(object)
 
     def __init__(
         self,
@@ -949,6 +955,9 @@ class MainWindow(QMainWindow):
         # 右クリックの〔音量を基準にそろえる…〕（#329）が測り終えるのを待つ頼み
         self._pending_loudness: _PendingLoudness | None = None
         self._checks.changed.connect(self._finish_loudness)
+        # 測り終えた後の見積もり（#497） 長い作品で数秒かかるので裏で回し、終わりを知らせで受ける
+        self._planning: _PlanningLoudness | None = None
+        self._loudness_planned.connect(self._on_loudness_planned)
         self.statusBar().addPermanentWidget(self._check_indicator)
         # 新しい版を入れる準備ができたときだけ出るボタンも右端に置く ダイアログで割り込むと、
         # 編集の手を止めさせる（起動時の確認は裏で黙って行う）
@@ -4995,6 +5004,8 @@ class MainWindow(QMainWindow):
         self._pending_loudness = _PendingLoudness(
             request, project, tuple(enabled), choice.ceiling, squeeze, redo
         )
+        # 前の頼みの見積もりが裏で残っていても、その答えは当てない 新しく選んだ基準と食い違う
+        self._planning = None
         self.request_check(request)
         # 同じ頼みを前に測り終えていれば、知らせを待たずにそのまま当てる
         self._finish_loudness()
@@ -5029,16 +5040,62 @@ class MainWindow(QMainWindow):
                 "測るあいだに作品が変わったので、音量を変えなかった もう 1 度選んでください", 8000
             )
             return
+        # 抑えた後の見積もりは長い作品で数秒かかる（3 時間分で 1.6 秒、重なると 3.6 秒）
+        # ここで数えると、その間は画面が描き直されず操作も効かない 裏で数え、終わりを知らせで
+        # 受ける（#497）
         # 前に積んだリミッターの上限より上へは上げない（AI の normalize_loudness と同じ）
-        clips = [clip for _, clip in pending.targets]
-        plan = plan_loudness(
-            report,
-            pending.targets,
-            target=pending.request.limits.loudness_target,
-            ceiling=pending.ceiling,
-            squeeze=pending.squeeze,
-            raise_ceiling=None if pending.redo else raise_cap(pending.targets, pending.ceiling),
+        planning = _PlanningLoudness(pending, report)
+        planning.job = PlanJob(
+            functools.partial(
+                plan_loudness,
+                report,
+                pending.targets,
+                target=pending.request.limits.loudness_target,
+                ceiling=pending.ceiling,
+                squeeze=pending.squeeze,
+                raise_ceiling=None if pending.redo else raise_cap(pending.targets, pending.ceiling),
+            ),
+            done=functools.partial(self._tell_planned, planning),
         )
+        self._planning = planning
+        self.statusBar().showMessage("抑えた後の音量を見積もっています…")
+
+    def _tell_planned(self, planning: _PlanningLoudness) -> None:
+        """見積もりの裏のスレッドから、終わりを画面のスレッドへ渡す"""
+        try:
+            self._loudness_planned.emit(planning)
+        except RuntimeError:
+            # 見積もる間に窓を閉じた 受け取る所が無い
+            return
+
+    def _on_loudness_planned(self, planning: _PlanningLoudness) -> None:
+        """見積もり終えたら、まだその頼みのままで作品も変わっていなければ当てる"""
+        if self._planning is not planning or planning.job is None:
+            # 見積もる間に別の頼みに替わった 古い答えを当てると、選び直した基準と食い違う
+            return
+        self._planning = None
+        try:
+            plan = planning.job.take()
+        except Exception as error:
+            _log.exception("抑えた後の音量を見積もれなかった")
+            self.statusBar().showMessage(f"音量をそろえられなかった: {error}", 8000)
+            return
+        assert plan is not None
+        if self.view_project != planning.pending.project:
+            # 見積もる間に足した音まで同じだけ上げると、測った音量と合わなくなる
+            self.statusBar().showMessage(
+                "見積もるあいだに作品が変わったので、音量を変えなかった もう 1 度選んでください",
+                8000,
+            )
+            return
+        self._apply_loudness_plan(planning.pending, planning.report, plan)
+
+    def _apply_loudness_plan(
+        self, pending: _PendingLoudness, report: CheckReport, plan: LoudnessPlan
+    ) -> None:
+        """見積もった計画どおりに音量の線とリミッターを変え、何をしたかを知らせる"""
+        assert report.loudness is not None
+        clips = [clip for _, clip in pending.targets]
         decided = plan.decided
         moved = abs(decided.gain_db) >= 0.05
         # 音量を変えなくても、山が天井を越えていればリミッターは積む
@@ -5634,3 +5691,16 @@ class _PendingLoudness:
     squeeze: float = 0.0
     #: 外して測ったリミッター（#494） 測った値は抑える前の音
     redo: frozenset[EffectId] = frozenset()
+
+
+@dataclass(eq=False)
+class _PlanningLoudness:
+    """測り終えて、抑えた後の音量を裏で見積もっている頼み（#497）
+
+    同じ物かは ``is`` で比べる 中身で比べると、同じ基準で選び直した頼みへ古い答えを当てる
+    """
+
+    pending: _PendingLoudness
+    report: CheckReport
+    #: 裏の見積もり 作ってから入れる（終わりの知らせがこの頼みを指すため）
+    job: PlanJob | None = field(default=None)

@@ -56,6 +56,7 @@ from sashimono.ai.operations import OPERATIONS, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.model import MediaItem, Transcript
 from tests.ai.conftest import FakeHost, make_loaded
+from tests.ai.pending import run_now
 
 #: 変える道具の一覧（数えた物） 足すときは、何を変えるかを確かめてからここへ足す
 #: 「元に戻す」で戻らない物は Safety.IRREVERSIBLE にして、ここではなく確かめの側へ入れる
@@ -428,7 +429,7 @@ def no_file_writes(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
 def _run(host: FakeHost, name: str, arguments: dict[str, Any]) -> object:
     operation = find_operation(name)
     assert operation is not None
-    return operation(host, arguments)
+    return run_now(name, operation(host, arguments), arguments)
 
 
 class TestDeletingKeepsTheOriginals:

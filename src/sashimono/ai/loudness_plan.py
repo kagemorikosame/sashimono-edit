@@ -7,6 +7,9 @@ AI の ``normalize_loudness`` と人の〔音量を基準にそろえる…〕�
 （:class:`~sashimono.engine.checks.loudness.LoudnessLane`）から、和の越えない所までリミッターの
 上限を一緒に下げる 下げた分も、本人の設定の抑える深さに数える
 
+計算は作品の長さに比例して重い（3 時間分で 1.6 秒、重なると 3.6 秒） 画面のスレッドで回すと
+その間は描き直しも中断も効かないので、:class:`PlanJob` で裏のスレッドへ出す（#497）
+
 リミッターはトラックの音量と定位の前に掛かる 深さと抑えた後の音量は、その所の山と、クリップごとに
 実際に置ける上限で数える 混ぜた後の音で数えると、音量 -20 dB のトラックが -20 dBFS で潰れているのに
 届いたと答える
@@ -15,7 +18,8 @@ AI の ``normalize_loudness`` と人の〔音量を基準にそろえる…〕�
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from sashimono.ai.auto_fix import (
@@ -30,7 +34,7 @@ from sashimono.core.model import Clip, Track
 from sashimono.engine.checks.loudness import Dynamics, Headroom
 from sashimono.engine.checks.report import CheckReport
 
-__all__ = ["LoudnessPlan", "plan_loudness"]
+__all__ = ["LoudnessPlan", "PlanJob", "plan_loudness"]
 
 #: 上限に収めると基準へ届かないときに、代わりに和を収める所（dBFS） 割れだけは作らない
 _NO_CLIP_DB = -0.1
@@ -51,6 +55,51 @@ class LoudnessPlan:
     held_db: float | None = None
     #: 分けて測る形（重なり・定位・トラックの音量）なのに測れなかったか 抑えた後の音量を言い切れない
     unchecked: bool = False
+
+
+class PlanJob:
+    """:func:`plan_loudness` を裏のスレッドで回す（#497）
+
+    重い所は numpy が GIL を離すので、回している間も画面のスレッドは 10 ms おきの合図を
+    3 ms の遅れで受ける ``done`` は終わったとき（失敗も）に裏のスレッドから呼ぶ 画面へは
+    Qt の知らせで渡す（ここは画面の部品を知らない）
+    """
+
+    def __init__(
+        self, work: Callable[[], LoudnessPlan], done: Callable[[], None] | None = None
+    ) -> None:
+        self._finished = threading.Event()
+        self._plan: LoudnessPlan | None = None
+        self._error: Exception | None = None
+        self._done = done
+        thread = threading.Thread(
+            target=self._run, args=(work,), name="sashimono-loudness-plan", daemon=True
+        )
+        thread.start()
+
+    def _run(self, work: Callable[[], LoudnessPlan]) -> None:
+        try:
+            self._plan = work()
+        except Exception as error:
+            # ここで落とすと、待つ側は終わった印を受けられず「見積もっています」のまま残る
+            self._error = error
+        finally:
+            self._finished.set()
+            if self._done is not None:
+                self._done()
+
+    def wait(self, seconds: float) -> bool:
+        """終わるまで最長 ``seconds`` 秒待ち、終わっていれば真 どのスレッドから呼んでもよい"""
+        return self._finished.wait(seconds)
+
+    def take(self) -> LoudnessPlan | None:
+        """終わっていれば計画を返す（失敗はここで投げ直す） まだなら ``None``"""
+        if not self._finished.is_set():
+            return None
+        if self._error is not None:
+            raise self._error
+        assert self._plan is not None
+        return self._plan
 
 
 def plan_loudness(

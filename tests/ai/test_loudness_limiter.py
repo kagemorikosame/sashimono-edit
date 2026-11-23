@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ from sashimono.ai.auto_fix import (
 )
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
-from sashimono.ai.loudness_plan import LoudnessPlan, plan_loudness
+from sashimono.ai.loudness_plan import LoudnessPlan, PlanJob, plan_loudness
 from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddEffect, SetEffectEnabled, SetParam
 from sashimono.core.commands.effects import ParamPath
@@ -36,7 +37,7 @@ from sashimono.core.commands.fixed import (
     with_fixed_items,
 )
 from sashimono.core.io.serialize import effect_from_json, effect_to_json
-from sashimono.core.mixing import MAX_LIMITER_DB, gain_commands, loudness_gain
+from sashimono.core.mixing import MAX_LIMITER_DB, LoudnessGain, gain_commands, loudness_gain
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -62,8 +63,10 @@ from sashimono.engine.checks.scan import LOUDNESS, CheckLimits
 from sashimono.engine.checks.sound_lanes import LaneMeters
 from sashimono.engine.decode.probe import probe_media
 from tests.ai.conftest import FakeHost
+from tests.ai.pending import settle
 from tests.ai.test_mix_tools import _measured, _Work
 from tests.check_media import tone, write_tone
+from tests.waiting import GUARD_SECONDS
 
 RATE = 48_000
 
@@ -71,7 +74,8 @@ RATE = 48_000
 def _run(work: _Work, **arguments: Any) -> Any:
     operation = find_operation("normalize_loudness")
     assert operation is not None
-    return operation(work.host, {"wait_seconds": 0, **arguments})
+    # 抑えた後の見積もりは裏で回る（#497） ブリッジと同じく待ってから辿る
+    return settle(operation(work.host, {"wait_seconds": 0, **arguments}))
 
 
 @pytest.fixture
@@ -1038,3 +1042,36 @@ class TestTheLimiterComesBeforeTheFader:
         ]
         assert max(cuts) <= plan.decided.squeeze_db + 0.1
         assert plan.decided.squeeze_db <= depth + 0.1
+
+
+class TestPlanJob:
+    """抑えた後の見積もりを裏で回す口（#497）"""
+
+    def test_a_failure_is_told_and_raised_again(self) -> None:
+        """裏で落ちたのを知らせないと、待つ側は「見積もっています」のまま止まる"""
+        told = threading.Event()
+
+        def broken() -> LoudnessPlan:
+            raise ValueError("壊れた手がかり")
+
+        job = PlanJob(broken, done=told.set)
+        assert job.wait(GUARD_SECONDS)
+        assert told.is_set()
+        with pytest.raises(ValueError, match="壊れた手がかり"):
+            job.take()
+
+    def test_nothing_is_taken_before_the_end(self) -> None:
+        """終わる前に取って空の計画を当てると、何も見積もらないまま掛ける"""
+        gate = threading.Event()
+        job = PlanJob(lambda: (gate.wait(GUARD_SECONDS), _plain())[1])
+        try:
+            assert job.take() is None
+            assert not job.wait(0)
+        finally:
+            gate.set()
+        assert job.wait(GUARD_SECONDS)
+        assert job.take() == _plain()
+
+
+def _plain() -> LoudnessPlan:
+    return LoudnessPlan(LoudnessGain(gain_db=1.0))

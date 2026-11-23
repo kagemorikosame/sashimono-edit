@@ -45,6 +45,7 @@ from sashimono.engine.checks import CheckLimits, CheckRequest, CheckState
 from sashimono.engine.checks.report import HIGH, MEDIUM, assemble
 from sashimono.engine.checks.scan import LOUDNESS, SOUND_KINDS
 from tests.ai.conftest import RATE_30, FakeHost, make_loaded
+from tests.ai.pending import run_now
 from tests.ai.test_audio_tools import _done, _heard, _spoken, _voiced
 from tests.ai.test_mix_tools import _measured, _Work
 from tests.check_media import chord, talk
@@ -55,7 +56,7 @@ from tests.ui.test_subtitle_panel import make_waveform
 def _run(host: FakeHost, tool: str, /, **arguments: Any) -> Any:
     operation = find_operation(tool)
     assert operation is not None
-    return operation(host, arguments)
+    return run_now(tool, operation(host, arguments), arguments)
 
 
 @pytest.fixture
