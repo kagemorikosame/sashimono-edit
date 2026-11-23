@@ -996,6 +996,35 @@ class TestLeftLimiters:
 class TestTheLimiterComesBeforeTheFader:
     """リミッターはトラックの音量と定位の前に掛かる（PR #495 の 3 回目のレビュー）"""
 
+    @pytest.mark.parametrize("overlap", [False, True])
+    @pytest.mark.parametrize("volume", [-20.0, -6.0, 0.0])
+    def test_a_lowered_track_still_reaches_the_target(
+        self, tmp_path: Path, volume: float, overlap: bool
+    ) -> None:
+        """欄が 0 dB で止まると、下げたトラックの声だけが基準に届かないまま書き出す（#499）"""
+        voice = _peaky() * 0.98
+        sounds = [voice, _music(0.02)] if overlap else [voice]
+        project, targets = _stacked(tmp_path, *sounds)
+        tracks = tuple(
+            replace(track, volume_db=volume) if index == 0 else track
+            for index, track in enumerate(project.timeline.tracks)
+        )
+        project = project.with_timeline(replace(project.timeline, tracks=tracks))
+        targets = [(track, track.clips[0]) for track in project.timeline.tracks]
+        report = _checked(project)
+        assert report.loudness is not None
+        target = report.loudness + 5.0
+        plan = plan_loudness(
+            report, targets, target=target, ceiling=-1.0, squeeze=12.0, raise_ceiling=None
+        )
+        assert "peak" not in plan.decided.limited_by
+        changed = _applied(project, targets, plan)
+        mixed = _mixed(changed)
+        assert _meter(mixed).integrated() == pytest.approx(target, abs=0.25)
+        # 書き出しの山は頼んだ上限（重なる分を引いた所）を越えない
+        held = -1.0 if plan.held_db is None else plan.held_db
+        assert float(np.abs(mixed).max()) <= 10 ** (held / 20) + 1e-3
+
     @pytest.mark.parametrize("installed", [False, True])
     @pytest.mark.parametrize("overlap", [False, True])
     @pytest.mark.parametrize("pan", [0.0, 0.9])
