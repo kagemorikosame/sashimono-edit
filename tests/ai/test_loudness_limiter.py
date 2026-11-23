@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,13 @@ from sashimono.ai.auto_fix import (
 )
 from sashimono.ai.fixes import ASK, AUTO, fix_for
 from sashimono.ai.host import ToolError
-from sashimono.ai.loudness_plan import LoudnessPlan, PlanJob, plan_loudness
+from sashimono.ai.loudness_plan import (
+    LoudnessPlan,
+    PlanAbandonedError,
+    PlanJob,
+    Stopped,
+    plan_loudness,
+)
 from sashimono.ai.operations import find_operation
 from sashimono.core.commands import AddEffect, SetEffectEnabled, SetParam
 from sashimono.core.commands.effects import ParamPath
@@ -57,7 +64,7 @@ from sashimono.effects.limiter import limit, limiter_history
 from sashimono.engine.audio import AudioMixer
 from sashimono.engine.audio.mixer import HISTORY_WINDOW
 from sashimono.engine.checks.job import CheckRequest, _check_timeline, _Progress
-from sashimono.engine.checks.loudness import LoudnessMeter
+from sashimono.engine.checks.loudness import Dynamics, LoudnessMeter
 from sashimono.engine.checks.report import HIGH, MEDIUM, CheckReport
 from sashimono.engine.checks.scan import LOUDNESS, CheckLimits
 from sashimono.engine.checks.sound_lanes import LaneMeters
@@ -66,7 +73,7 @@ from tests.ai.conftest import FakeHost
 from tests.ai.pending import settle
 from tests.ai.test_mix_tools import _measured, _Work
 from tests.check_media import tone, write_tone
-from tests.waiting import GUARD_SECONDS
+from tests.waiting import GUARD_SECONDS, wait_until
 
 RATE = 48_000
 
@@ -1054,16 +1061,75 @@ class TestPlanJob:
         def broken() -> LoudnessPlan:
             raise ValueError("壊れた手がかり")
 
-        job = PlanJob(broken, done=told.set)
+        job = PlanJob(lambda **_kw: broken(), done=told.set)
         assert job.wait(GUARD_SECONDS)
         assert told.is_set()
         with pytest.raises(ValueError, match="壊れた手がかり"):
             job.take()
 
+    def test_an_abandoned_job_stops(self) -> None:
+        """やめても最後まで回すと、選び直す度に 3 時間分で数秒ずつ裏の仕事が重なる"""
+        steps: list[int] = []
+
+        def work(*, stopped: Stopped) -> LoudnessPlan:
+            while not stopped():
+                steps.append(1)
+                time.sleep(0.001)
+            raise PlanAbandonedError
+
+        job = PlanJob(work)
+        wait_until(lambda: bool(steps), "見積もりの始まり")
+        job.abandon()
+        assert job.wait(GUARD_SECONDS)
+        with pytest.raises(PlanAbandonedError):
+            job.take()
+
+    def test_the_estimate_asks_before_each_step(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """重なって鳴る音の見積もりは 1 回ごとに重い 尋ねずに回すと、やめても数秒止まらない"""
+        project, targets = _stacked(tmp_path, _peaky() * 0.98, _music(0.05))
+        report = _checked(project)
+        assert report.loudness is not None
+        loudness = report.loudness
+        steps: list[str] = []
+        real = Dynamics.limited_loudness
+
+        def counted(self: Dynamics, *args: Any, **kwargs: Any) -> float | None:
+            steps.append("見積もり")
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(Dynamics, "limited_loudness", counted)
+
+        def plan(stopped: Stopped) -> LoudnessPlan:
+            return plan_loudness(
+                report,
+                targets,
+                target=loudness + 6.0,
+                ceiling=-1.0,
+                squeeze=12.0,
+                raise_ceiling=None,
+                stopped=stopped,
+            )
+
+        def asked() -> bool:
+            steps.append("尋ねた")
+            return False
+
+        plan(asked)
+        assert "見積もり" in steps
+        # どの見積もりの前にも尋ねている（間に和の上限の確かめなどが挟まってもよい）
+        for at, step in enumerate(steps):
+            if step == "見積もり":
+                assert "尋ねた" in steps[:at]
+                assert steps[at - 1] == "尋ねた", steps[max(0, at - 3) : at + 1]
+        with pytest.raises(PlanAbandonedError):
+            plan(lambda: True)
+
     def test_nothing_is_taken_before_the_end(self) -> None:
         """終わる前に取って空の計画を当てると、何も見積もらないまま掛ける"""
         gate = threading.Event()
-        job = PlanJob(lambda: (gate.wait(GUARD_SECONDS), _plain())[1])
+        job = PlanJob(lambda **_kw: (gate.wait(GUARD_SECONDS), _plain())[1])
         try:
             assert job.take() is None
             assert not job.wait(0)

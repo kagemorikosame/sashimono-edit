@@ -17,7 +17,7 @@ import pytest
 
 from sashimono.ai import operations
 from sashimono.ai.host import ToolError
-from sashimono.ai.loudness_plan import plan_loudness
+from sashimono.ai.loudness_plan import PlanAbandonedError, plan_loudness
 from sashimono.ai.operations import Pending, find_operation
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddClip, AddScene, SetClipProperty, SetTrackState, new_scene
@@ -38,8 +38,9 @@ from sashimono.core.model import (
     Transcript,
 )
 from sashimono.engine.checks import CheckState
+from sashimono.engine.checks.job import CheckRequest
 from sashimono.engine.checks.report import assemble
-from sashimono.engine.checks.scan import LOUDNESS
+from sashimono.engine.checks.scan import LOUDNESS, CheckLimits
 from tests.ai.conftest import RATE_30, FakeHost
 from tests.ai.pending import run_now, settle
 from tests.waiting import GUARD_SECONDS, wait_until
@@ -586,6 +587,9 @@ class TestNormalize:
         def held(*args: Any, **kwargs: Any) -> Any:
             threads.append(threading.get_ident())
             gate.wait(GUARD_SECONDS)
+            # 待つ側がやめていたら、本物と同じく止まる
+            if kwargs["stopped"]():
+                raise PlanAbandonedError
             return real(*args, **kwargs)
 
         monkeypatch.setattr(operations, "plan_loudness", held)
@@ -626,6 +630,52 @@ class TestNormalize:
         with pytest.raises(ToolError, match="見積もっている間に作品が変わりました"):
             settle(pending)
         assert work.host.document.project == changed
+
+    @pytest.mark.parametrize("change", ["check", "scene"])
+    def test_a_switch_while_estimating_is_refused(
+        self, work: _Work, monkeypatch: pytest.MonkeyPatch, change: str
+    ) -> None:
+        """見積もる間に別の検査か場面に替わった後で掛けると、測った物と違う所を変える"""
+        gate, threads = self._held_plan(monkeypatch)
+        _run(work.host, "normalize_loudness", wait_seconds=10)
+        _measured(work.host, -17.0, -10.0)
+        operation = find_operation("normalize_loudness")
+        assert operation is not None
+        pending = operation(work.host, {"wait_seconds": 0})
+        wait_until(lambda: bool(threads), "見積もりの始まり")
+        before = work.host.document.project
+        if change == "check":
+            other = CheckRequest(CheckLimits(kinds=frozenset({LOUDNESS})), project=before, end=30)
+            work.host.request_check(other)
+            match = "別の検査に替わりました"
+        else:
+            monkeypatch.setattr(operations, "_scene", lambda _host: "別の場面")
+            match = "場面が切り替わりました"
+        gate.set()
+        with pytest.raises(ToolError, match=match):
+            settle(pending)
+        assert work.host.document.project == before
+
+    def test_stopping_the_wait_stops_the_estimate(
+        self, work: _Work, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """中断した後も見積もりを回すと、待つ人のいない仕事が裏で数秒ずつ重なる"""
+        gate, threads = self._held_plan(monkeypatch)
+        _run(work.host, "normalize_loudness", wait_seconds=10)
+        _measured(work.host, -17.0, -10.0)
+        operation = find_operation("normalize_loudness")
+        assert operation is not None
+        pending = operation(work.host, {"wait_seconds": 0})
+        assert isinstance(pending, Pending)
+        assert pending.stop is not None
+        wait_until(lambda: bool(threads), "見積もりの始まり")
+        pending.stop()
+        gate.set()
+        assert pending.wait(GUARD_SECONDS)
+        before = work.host.document.project
+        with pytest.raises(PlanAbandonedError):
+            pending.then()
+        assert work.host.document.project == before
 
     def test_a_change_while_measuring_is_refused(self, work: _Work) -> None:
         # 壊れると、測った後に足した音まで同じだけ上げ、測った音量と合わなくなる

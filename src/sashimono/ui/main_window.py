@@ -957,7 +957,11 @@ class MainWindow(QMainWindow):
         self._checks.changed.connect(self._finish_loudness)
         # 測り終えた後の見積もり（#497） 長い作品で数秒かかるので裏で回し、終わりを知らせで受ける
         self._planning: _PlanningLoudness | None = None
-        self._loudness_planned.connect(self._on_loudness_planned)
+        # 送るのは裏のスレッド 受けるのはこの窓のスレッドに積み直す（窓と編集を触るため）
+        # PySide は窓の物へつなぐと自分で積み直すが、頼りにせず書いておく
+        self._loudness_planned.connect(
+            self._on_loudness_planned, Qt.ConnectionType.QueuedConnection
+        )
         self.statusBar().addPermanentWidget(self._check_indicator)
         # 新しい版を入れる準備ができたときだけ出るボタンも右端に置く ダイアログで割り込むと、
         # 編集の手を止めさせる（起動時の確認は裏で黙って行う）
@@ -4997,7 +5001,7 @@ class MainWindow(QMainWindow):
             project=measure_project(project, (clip.id for clip in clips), redo),
             start=min(clip.timeline_start for clip in clips),
             end=max(clip.timeline_end for clip in clips),
-            scene=str(self._active_scene) if self._active_scene is not None else None,
+            scene=self._scene_name(),
             # 抑えないなら組の手がかりは使わない 測ると待ちだけが延びる（AI の道具と同じ）
             separate=squeeze > 0 and measures_apart(enabled, choice.ceiling),
         )
@@ -5005,6 +5009,9 @@ class MainWindow(QMainWindow):
             request, project, tuple(enabled), choice.ceiling, squeeze, redo
         )
         # 前の頼みの見積もりが裏で残っていても、その答えは当てない 新しく選んだ基準と食い違う
+        # 止めもする 止めないと、選び直す度に 3 時間分で数秒ずつ裏の仕事が重なる
+        if self._planning is not None and self._planning.job is not None:
+            self._planning.job.abandon()
         self._planning = None
         self.request_check(request)
         # 同じ頼みを前に測り終えていれば、知らせを待たずにそのまま当てる
@@ -5060,6 +5067,10 @@ class MainWindow(QMainWindow):
         self._planning = planning
         self.statusBar().showMessage("抑えた後の音量を見積もっています…")
 
+    def _scene_name(self) -> str | None:
+        """検査の頼み（:attr:`CheckRequest.scene`）と同じ形の、今の場面"""
+        return str(self._active_scene) if self._active_scene is not None else None
+
     def _tell_planned(self, planning: _PlanningLoudness) -> None:
         """見積もりの裏のスレッドから、終わりを画面のスレッドへ渡す"""
         try:
@@ -5081,10 +5092,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"音量をそろえられなかった: {error}", 8000)
             return
         assert plan is not None
-        if self.view_project != planning.pending.project:
-            # 見積もる間に足した音まで同じだけ上げると、測った音量と合わなくなる
+        if self._checks.state().request != planning.pending.request:
+            # 見積もる間に別の検査が始まった 測り終えたときだけ見ると、見積もりの数秒が抜ける
+            # （PR #498 の Sourcery の指摘）
+            self.statusBar().showMessage("別の検査に替わったので、音量をそろえるのをやめた", 8000)
+            return
+        if (
+            self.view_project != planning.pending.project
+            or self._scene_name() != planning.pending.request.scene
+        ):
+            # 見積もる間に足した音まで同じだけ上げると、測った音量と合わなくなる 同じ中身の
+            # 別の場面へ切り替えたときは作品の比べでは分からず、測っていない場面を変える
             self.statusBar().showMessage(
-                "見積もるあいだに作品が変わったので、音量を変えなかった もう 1 度選んでください",
+                "見積もるあいだに作品か場面が変わったので、音量を変えなかった"
+                " もう 1 度選んでください",
                 8000,
             )
             return

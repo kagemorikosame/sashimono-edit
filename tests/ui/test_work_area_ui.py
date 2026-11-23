@@ -25,6 +25,7 @@ from sashimono.ui.main_window import MainWindow
 from sashimono.ui.theme import Colors, Metrics
 from sashimono.ui.timeline import TimelineView
 from sashimono.ui.timeline.work_area import CLEAR_TEXT, HINT_TEXT
+from tests.ui.export_codecs import settled
 
 _LEFT = Qt.MouseButton.LeftButton
 _SHIFT = Qt.KeyboardModifier.ShiftModifier
@@ -254,7 +255,7 @@ class TestExportDialog:
 
     def test_with_a_range_the_range_is_the_default(self) -> None:
         """範囲があれば既定は範囲 帯を引いた人は、その所を出したくて引いている"""
-        dialog = ExportDialog(SetWorkArea((30, 90)).apply(_project()))
+        dialog = settled(ExportDialog(SetWorkArea((30, 90)).apply(_project())))
         try:
             assert dialog._range.currentData() == RANGE_WORK_AREA
             settings = dialog._settings()
@@ -265,7 +266,7 @@ class TestExportDialog:
 
     def test_choosing_the_whole_exports_everything(self) -> None:
         # 範囲を決めたまま忘れていた人が、全体へ戻せる
-        dialog = ExportDialog(SetWorkArea((30, 90)).apply(_project()))
+        dialog = settled(ExportDialog(SetWorkArea((30, 90)).apply(_project())))
         try:
             dialog._range.setCurrentIndex(dialog._range.findData(RANGE_ALL))
             settings = dialog._settings()
@@ -276,7 +277,7 @@ class TestExportDialog:
 
     def test_without_a_range_the_whole_is_exported(self) -> None:
         # 範囲が無いのに範囲の選びが出ると、選んでも何も書き出せない項目が並ぶ
-        dialog = ExportDialog(_project())
+        dialog = settled(ExportDialog(_project()))
         try:
             assert dialog._range.count() == 1
             settings = dialog._settings()
@@ -287,7 +288,7 @@ class TestExportDialog:
 
     def test_a_range_past_the_end_is_cut_to_the_end(self) -> None:
         """終わりより後ろへはみ出した分は書き出さない 出すと黒と無音が後ろに付く"""
-        dialog = ExportDialog(SetWorkArea((200, 900)).apply(_project(300)))
+        dialog = settled(ExportDialog(SetWorkArea((200, 900)).apply(_project(300))))
         try:
             settings = dialog._settings()
             assert settings is not None
@@ -299,7 +300,7 @@ class TestExportDialog:
         # 選べると、何も映らない所だけを書き出す
         project = _project(300)
         project = project.with_timeline(replace(project.timeline, work_area=(400, 500)))
-        dialog = ExportDialog(project)
+        dialog = settled(ExportDialog(project))
         try:
             assert dialog._range.currentData() == RANGE_ALL
             settings = dialog._settings()

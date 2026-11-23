@@ -16,6 +16,7 @@ from sashimono.engine.encode import ExportSettings
 from sashimono.ui.playback import PlaybackController
 from sashimono.ui.preferences_dialog import PreferencesDialog
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.ui.export_codecs import settled
 
 
 def test_a_turned_off_setting_stays_off_after_restart(tmp_path: Path) -> None:
@@ -59,7 +60,7 @@ def test_the_export_gets_the_same_setting_as_playback(qt_application: QApplicati
     del qt_application
     from sashimono.ui.export_dialog import ExportDialog
 
-    dialog = ExportDialog(Project.create(), smooth_history=False)
+    dialog = settled(ExportDialog(Project.create(), smooth_history=False))
     try:
         settings = dialog._settings()
         if settings is None:

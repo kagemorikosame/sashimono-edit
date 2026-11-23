@@ -7516,7 +7516,7 @@ def _normalize_loudness(host: EditorHost, arguments: dict[str, Any]) -> object:
         project=measure_project(project, (clip.id for _, clip in targets), redo),
         start=start,
         end=end,
-        scene=str(host.active_scene) if host.active_scene is not None else None,
+        scene=_scene(host),
         # リミッターの見る所も測る（#494） クリップごとに、トラックの音量と定位の前で掛かる
         separate=squeeze > 0 and measures_apart(targets, ceiling),
     )
@@ -7600,9 +7600,23 @@ def _apply_loudness(
     def settle() -> object:
         plan = job.take()
         if plan is None:
+            job.abandon()
             raise ToolError(
                 "抑えた後の音量の見積もりが時間内に終わりませんでした 何も変えていません"
                 " もう 1 度呼んでください"
+            )
+        if host.check_state().request != request:
+            # 見積もる間に別の検査が始まった 測り終えたときだけ見ると、見積もりの数秒が抜ける
+            # （PR #498 の Sourcery の指摘）
+            raise ToolError(
+                "見積もっている間に別の検査に替わりました 何も変えていません"
+                " もう 1 度呼んでください"
+            )
+        if _scene(host) != request.scene:
+            # 同じ中身の別の場面へ切り替わると作品の比べでは分からず、測っていない場面を変える
+            raise ToolError(
+                "見積もっている間に場面が切り替わりました 何も変えていません"
+                " 測った場面に戻してから呼び直してください"
             )
         if _project(host) != project:
             # 見積もる間に足した音まで同じだけ上げると、測った音量と合わなくなる
@@ -7612,7 +7626,13 @@ def _apply_loudness(
             )
         return _settle_loudness(host, request, targets, ceiling, squeeze, redo, report, plan)
 
-    return Pending(wait=job.wait, seconds=_PLAN_WAIT, then=settle)
+    # 中断したら見積もりも止める 止めないと、待つのをやめた見積もりが裏で数秒回り続ける
+    return Pending(wait=job.wait, seconds=_PLAN_WAIT, then=settle, stop=job.abandon)
+
+
+def _scene(host: EditorHost) -> str | None:
+    """検査の頼み（:attr:`CheckRequest.scene`）と同じ形の、今の場面"""
+    return str(host.active_scene) if host.active_scene is not None else None
 
 
 def _settle_loudness(
