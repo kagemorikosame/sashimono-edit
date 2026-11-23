@@ -172,7 +172,8 @@ def raise_cap(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> float | 
 def limiter_ceiling(track: Track, ceiling: float) -> float:
     """書き出しの山を ``ceiling`` dBFS に収めるため、``track`` のクリップのリミッターに置く上限
 
-    トラックの倍率の分だけ下げる 範囲（-20〜0 dBFS）を越える分は収め切れないので、
+    トラックの倍率の分だけ下げる 欄の範囲（:data:`CEILING_DB_RANGE` -20〜+20 dB #499）を越える分は
+    収め切れないので、
     :func:`limited_peak` で書き出しの山を言い直す
     """
     return ceiling_before_fader(ceiling, track_gain_db(track))
@@ -183,6 +184,8 @@ def limiter_ceiling(track: Track, ceiling: float) -> float:
 FITTED_CEILING = "fitted_ceiling"
 #: 前にそろえたときのリミッターと読む、上限と戻る速さの差
 _SAME_LIMITER = 0.05
+#: 欄の上端が 0 dB だった頃（#499 の前）の上端 そろえる道具はここで頭打ちにして置いた
+_OLD_TOP_DB = 0.0
 
 
 def redoable_limiters(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> frozenset[EffectId]:
@@ -202,6 +205,10 @@ def redoable_limiters(targets: Sequence[tuple[Track, Clip]], ceiling: float) -> 
             return frozenset()
         fitted = active[0].params.get(FITTED_CEILING)
         ceilings = [limiter_ceiling(track, ceiling)]
+        if ceilings[0] > _OLD_TOP_DB:
+            # 欄が 0 dB までだったときに頭打ちで置いた物（#499） 人の物と読むと外して測れず、
+            # 音量を下げたトラックが前の止まる所のまま基準に届かない（PR #501 の Sourcery の指摘）
+            ceilings.append(_OLD_TOP_DB)
         if isinstance(fitted, AnimatedValue) and not fitted.is_animated:
             ceilings.append(fitted.static)
         wanted = {"ceiling": ceilings, "release": [DEFAULT_RELEASE_MS]}

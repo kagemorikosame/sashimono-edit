@@ -958,6 +958,32 @@ class TestTheSumOfTheLanes:
         assert meters.count == 2
 
 
+class TestLimitersFromTheNarrowRange:
+    """欄が -20〜0 dB だったときに、0 dB で頭打ちにして置いた自動のリミッター（#499）"""
+
+    @pytest.mark.parametrize("volume", [-6.0, -20.0])
+    def test_an_old_capped_limiter_is_redone(self, volume: float) -> None:
+        """人の物と読むと外して測れず、下げたトラックが前の止まる所のまま基準に届かない"""
+        track = Track(kind=TrackKind.AUDIO, name="声", volume_db=volume)
+        old = registry.require(LIMITER_KIND).create(ceiling=0.0)
+        clip = Clip(timeline_start=0, duration=30, effects=(old,))
+        assert redoable_limiters([(track, clip)], -1.0) == frozenset({old.id})
+
+    def test_a_limiter_set_by_hand_below_the_old_cap_is_kept(self) -> None:
+        """前の範囲で止まらない値は、前の道具も置かない 人の物を外して測ると、その人の音と違う"""
+        track = Track(kind=TrackKind.AUDIO, name="声", volume_db=-6.0)
+        tuned = registry.require(LIMITER_KIND).create(ceiling=-0.5)
+        clip = Clip(timeline_start=0, duration=30, effects=(tuned,))
+        assert redoable_limiters([(track, clip)], -1.0) == frozenset()
+
+    def test_a_track_that_never_reached_the_cap_is_unchanged(self) -> None:
+        """前の範囲に収まっていたトラックの 0 dB は、人が置いた値"""
+        track = Track(kind=TrackKind.AUDIO, name="声", volume_db=0.0)
+        tuned = registry.require(LIMITER_KIND).create(ceiling=0.0)
+        clip = Clip(timeline_start=0, duration=30, effects=(tuned,))
+        assert redoable_limiters([(track, clip)], -1.0) == frozenset()
+
+
 class TestLeftLimiters:
     """外して測ったリミッターを、音に効いたまま残さない"""
 
