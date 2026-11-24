@@ -958,6 +958,32 @@ class TestTheSumOfTheLanes:
         assert meters.count == 2
 
 
+class TestLimitersFromTheNarrowRange:
+    """欄が -20〜0 dB だったときに、0 dB で頭打ちにして置いた自動のリミッター（#499）"""
+
+    @pytest.mark.parametrize("volume", [-6.0, -20.0])
+    def test_an_old_capped_limiter_is_redone(self, volume: float) -> None:
+        """人の物と読むと外して測れず、下げたトラックが前の止まる所のまま基準に届かない"""
+        track = Track(kind=TrackKind.AUDIO, name="声", volume_db=volume)
+        old = registry.require(LIMITER_KIND).create(ceiling=0.0)
+        clip = Clip(timeline_start=0, duration=30, effects=(old,))
+        assert redoable_limiters([(track, clip)], -1.0) == frozenset({old.id})
+
+    def test_a_limiter_set_by_hand_below_the_old_cap_is_kept(self) -> None:
+        """前の範囲で止まらない値は、前の道具も置かない 人の物を外して測ると、その人の音と違う"""
+        track = Track(kind=TrackKind.AUDIO, name="声", volume_db=-6.0)
+        tuned = registry.require(LIMITER_KIND).create(ceiling=-0.5)
+        clip = Clip(timeline_start=0, duration=30, effects=(tuned,))
+        assert redoable_limiters([(track, clip)], -1.0) == frozenset()
+
+    def test_a_track_that_never_reached_the_cap_is_unchanged(self) -> None:
+        """前の範囲に収まっていたトラックの 0 dB は、人が置いた値"""
+        track = Track(kind=TrackKind.AUDIO, name="声", volume_db=0.0)
+        tuned = registry.require(LIMITER_KIND).create(ceiling=0.0)
+        clip = Clip(timeline_start=0, duration=30, effects=(tuned,))
+        assert redoable_limiters([(track, clip)], -1.0) == frozenset()
+
+
 class TestLeftLimiters:
     """外して測ったリミッターを、音に効いたまま残さない"""
 
@@ -995,6 +1021,35 @@ class TestLeftLimiters:
 
 class TestTheLimiterComesBeforeTheFader:
     """リミッターはトラックの音量と定位の前に掛かる（PR #495 の 3 回目のレビュー）"""
+
+    @pytest.mark.parametrize("overlap", [False, True])
+    @pytest.mark.parametrize("volume", [-20.0, -6.0, 0.0])
+    def test_a_lowered_track_still_reaches_the_target(
+        self, tmp_path: Path, volume: float, overlap: bool
+    ) -> None:
+        """欄が 0 dB で止まると、下げたトラックの声だけが基準に届かないまま書き出す（#499）"""
+        voice = _peaky() * 0.98
+        sounds = [voice, _music(0.02)] if overlap else [voice]
+        project, targets = _stacked(tmp_path, *sounds)
+        tracks = tuple(
+            replace(track, volume_db=volume) if index == 0 else track
+            for index, track in enumerate(project.timeline.tracks)
+        )
+        project = project.with_timeline(replace(project.timeline, tracks=tracks))
+        targets = [(track, track.clips[0]) for track in project.timeline.tracks]
+        report = _checked(project)
+        assert report.loudness is not None
+        target = report.loudness + 5.0
+        plan = plan_loudness(
+            report, targets, target=target, ceiling=-1.0, squeeze=12.0, raise_ceiling=None
+        )
+        assert "peak" not in plan.decided.limited_by
+        changed = _applied(project, targets, plan)
+        mixed = _mixed(changed)
+        assert _meter(mixed).integrated() == pytest.approx(target, abs=0.25)
+        # 書き出しの山は頼んだ上限（重なる分を引いた所）を越えない
+        held = -1.0 if plan.held_db is None else plan.held_db
+        assert float(np.abs(mixed).max()) <= 10 ** (held / 20) + 1e-3
 
     @pytest.mark.parametrize("installed", [False, True])
     @pytest.mark.parametrize("overlap", [False, True])
