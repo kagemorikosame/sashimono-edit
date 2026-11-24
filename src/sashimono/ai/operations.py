@@ -171,6 +171,7 @@ from sashimono.core.commands import (
     AddCredits,
     AddEffect,
     AddMarkers,
+    AddMedia,
     AddScene,
     AddStroke,
     AddTrack,
@@ -5392,25 +5393,43 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not isinstance(raw, list):
         raise ToolError("paths はファイルパスの配列で渡してください")
     paths = [Path(entry) for entry in _string_items(raw, "paths")]
-    if not paths:
-        raise ToolError("paths が空です")
+    raw_ids = arguments.get("library_file_ids") or []
+    if not isinstance(raw_ids, list):
+        raise ToolError("library_file_ids は search_library の file_id の配列で渡してください")
+    ids = _string_items(raw_ids, "library_file_ids")
+    if not paths and not ids:
+        raise ToolError("paths か library_file_ids のどちらかに 1 つ以上渡してください")
+    # 素材一覧へ入れるだけ（エクスプローラーの〔素材一覧へ読み込む〕と同じ #521）
+    pool_only = _flag_argument(arguments, "pool_only", False)
+
+    sources: list[tuple[MediaItem, bool]] = []
+    for path in paths:
+        if not path.exists():
+            raise ToolError(f"ファイルがありません: {path}")
+        sources.append((host.probe(path), True))
+    sources.extend(_library_media(host, entry) for entry in ids)
 
     project = _project(host)
     commands: list[Command] = []
     added: list[str] = []
-    for path in paths:
-        if not path.exists():
-            raise ToolError(f"ファイルがありません: {path}")
-        media = host.probe(path)
-        batch = insert_media(project, media, at_frame=None, split_audio=host.splits_media)
+    for media, fresh in sources:
+        if pool_only:
+            # 前に取り込んだ同じファイルは足さない 同じ名前の素材が一覧に並ぶだけになる
+            batch: list[Command] = [AddMedia(media)] if fresh else []
+        else:
+            batch = insert_media(project, media, at_frame=None, split_audio=host.splits_media)
         for command in batch:
             project = command.apply(project)
         commands.extend(batch)
-        host.analyze(media)
         added.append(f"{media.name} ({media.id})")
 
-    host.apply_commands(commands, f"素材を読み込み: {len(paths)} 件")
-    return {"imported": added} | _small_placed(project, commands)
+    if commands:
+        label = "素材一覧へ読み込み" if pool_only else "素材を読み込み"
+        host.apply_commands(commands, f"{label}: {len(sources)} 件")
+    for media, fresh in sources:
+        if fresh:
+            host.analyze(media)
+    return {"imported": added} | ({} if pool_only else _small_placed(project, commands))
 
 
 def _small_placed(project: Project, commands: Sequence[Command]) -> dict[str, Any]:
@@ -12545,16 +12564,25 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="import_media",
-        description="ファイルを読み込んでタイムラインの末尾へ置く",
+        description=(
+            "ファイルを読み込んでタイムラインの末尾へ置く library_file_ids（search_library の"
+            " file_id）で登録したフォルダの素材も読み込める pool_only を true にすると素材一覧へ"
+            "入れるだけで置かない 取り消し 1 回で戻る"
+        ),
         schema=_schema(
             {
                 "paths": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "ファイルパス",
-                }
+                },
+                "library_file_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "登録したフォルダの素材（search_library の file_id）",
+                },
+                "pool_only": _boolean("素材一覧へ入れるだけで置かない（既定 false）"),
             },
-            ["paths"],
         ),
         handler=_import_media,
         sends=_WITH_FILES,

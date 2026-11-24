@@ -586,7 +586,7 @@ LEDGER: tuple[Entry, ...] = (
         "preferences.explorer_folders",
     ),
     read_only(
-        "エクスプローラー/外す｜選んだフォルダの登録を外す ファイルは消さない",
+        "エクスプローラー/外す｜選んだ登録したフォルダの登録を外す ファイルは消さない",
         _SETTINGS,
         "preferences.explorer_folders",
     ),
@@ -596,9 +596,21 @@ LEDGER: tuple[Entry, ...] = (
         note="search_library は呼ぶたびにフォルダを見直す 見るのは AI に使わせる分類のフォルダだけ",
         safety=Safety.READ_ONLY,
     ),
+    # 表示の切り替え（一覧とアイコン）は本人の好みで覚える 中身は search_library で読める
+    read_only(
+        "エクスプローラー/一覧｜名前・長さ・大きさなどを列に並べる 見出しで並べ替える",
+        _SETTINGS,
+        "preferences.explorer_view",
+    ),
+    read_only(
+        "エクスプローラー/アイコン｜見本の絵と波形を大きく並べる",
+        _SETTINGS,
+        "preferences.explorer_view",
+    ),
+    # 下見の再生 AI は音を聞けず動きも見られない（作品の再生の行と同じ）
     hidden(
-        "エクスプローラー/試聴｜選んだ音を鳴らす もう一度押すと止める",
-        "AI は音を聞けない 長さと頭の 1 分の大きさは search_library で読む"
+        "エクスプローラー/再生｜選んだファイルを下見で再生する・止める（Space）",
+        "AI は音を聞けず動きも見られない 長さと頭の 1 分の大きさは search_library で読む"
         " 決定の 5 つに当たらず未決",
     ),
     same(
@@ -611,6 +623,18 @@ LEDGER: tuple[Entry, ...] = (
             "フォルダの物だけ（既定は効果音と BGM）"
         ),
     ),
+    same(
+        "エクスプローラーの右クリック/タイムラインへ置く",
+        "place_media",
+        "place_sound",
+        note="library_file_id で取り込んで置く 使えるのは AI に使わせる分類のフォルダの物だけ",
+    ),
+    same(
+        "エクスプローラーの右クリック/素材一覧へ読み込む",
+        "import_media",
+        note="library_file_ids と pool_only で素材一覧へ入れるだけにする 取り消し 1 回で戻る",
+    ),
+    hidden("エクスプローラーの右クリック/エクスプローラーで開く", _OUTSIDE),
     # --- 字幕パネル ---
     same("字幕パネル/起こす…", "transcribe"),
     same("字幕パネル/整形…", "clean_subtitles"),

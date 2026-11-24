@@ -148,7 +148,10 @@ __all__ = [
     "DOCK_TABS_BOTTOM",
     "DOCK_TABS_TOP",
     "DOCK_TAB_POSITIONS",
+    "EXPLORER_DOUBLE_CLICKS",
+    "EXPLORER_ICON_SIZES",
     "EXPLORER_PREVIEW_VOLUME_RANGE",
+    "EXPLORER_VIEWS",
     "LAYOUT_VERSION",
     "LIMIT_ACTIONS",
     "MAX_PREFETCH_MB",
@@ -325,6 +328,11 @@ AI_MINUTE_LIMITS = (0, 1440)
 PACKAGE_MARGINS = (0, 60)
 #: エクスプローラーの試聴の音量（%）の範囲 上げるのは割れるので 100 まで
 EXPLORER_PREVIEW_VOLUME_RANGE = (0, 100)
+#: エクスプローラーの表示・アイコンの幅・ダブルクリックの動きの値（:mod:`sashimono.ui.explorer`
+#: の ``VIEW_MODES`` ``ICON_SIZE_RANGE`` ``DOUBLE_CLICK_ACTIONS`` とそろえる 試験が照らす）
+EXPLORER_VIEWS = ("list", "icons")
+EXPLORER_ICON_SIZES = (64, 256)
+EXPLORER_DOUBLE_CLICKS = ("preview", "timeline")
 #: 素材を読み込んだときに場面の一覧を裏で作るか（#321） :attr:`Preferences.scene_analysis` の値
 #: AI アシスタントが入っているときだけ・いつも・作らない（AI が頼んだときだけ読む）
 SCENES_WITH_AI = "with_ai"
@@ -884,6 +892,15 @@ class Preferences:
     #: エクスプローラーで試聴する音量（%） 100 は作品の再生と同じ大きさ（素材をそのまま鳴らす）
     #: 大きな効果音を続けて聞くと耳が疲れるので、下げたい人が下げられるようにする
     explorer_preview_volume: int = 100
+    #: エクスプローラーの表示 一覧（列のある表 既定）かアイコン（見本の絵） 一覧の方が名前と
+    #: 長さを並べて比べられ、見本の絵を作る裏の仕事も起きない パネルのボタンで選んだ物を覚える
+    explorer_view: str = EXPLORER_VIEWS[0]
+    #: アイコン表示の絵の幅（画素） パネルの大きさのスライダーで選んだ物を覚える
+    explorer_icon_size: int = 128
+    #: 中身の行をダブルクリックしたとき 下見で再生する（既定 メディアブラウザーと同じ）か、
+    #: タイムラインへ置くか 置く方に慣れた人は変えられる
+    #: 置くのはドラッグと〔タイムラインへ〕でもできる
+    explorer_double_click: str = EXPLORER_DOUBLE_CLICKS[0]
     #: AI アシスタントがジャンプカットのつなぎ目を目立たなくする（#332）ときの既定
     #: 溶かすか寄るか・どれだけの長さかは人と作品で違う AI に値を言わなければこれを使う
     #: 既定は短いクロスフェードと 20 ms の音のフェード（絵の中身が欠けない側
@@ -1458,6 +1475,15 @@ class PreferenceStore:
                 data.get("explorer_preview_volume"),
                 EXPLORER_PREVIEW_VOLUME_RANGE,
                 plain.explorer_preview_volume,
+            ),
+            explorer_view=_choice(data.get("explorer_view"), EXPLORER_VIEWS, plain.explorer_view),
+            explorer_icon_size=_within(
+                data.get("explorer_icon_size"), EXPLORER_ICON_SIZES, plain.explorer_icon_size
+            ),
+            explorer_double_click=_choice(
+                data.get("explorer_double_click"),
+                EXPLORER_DOUBLE_CLICKS,
+                plain.explorer_double_click,
             ),
             seam_video=_choice(data.get("seam_video"), SEAM_VIDEOS, plain.seam_video),
             seam_crossfade_ms=_within(

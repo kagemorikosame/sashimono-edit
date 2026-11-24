@@ -526,6 +526,9 @@ def _scan_stage(window: MainWindow, stage: _Stage, folder: Path, scan: Scan) -> 
     walk_buttons(window._transport, "再生の操作", scan)
     walk_buttons(window._media_pool, "素材一覧", scan)
     walk_buttons(window._explorer, "エクスプローラー", scan)
+    walk_menu(
+        window._explorer.build_menu([folder / "音.wav"]), "エクスプローラーの右クリック", scan
+    )
     walk_buttons(window._subtitles, "字幕パネル", scan)
 
     if stage.media is not None:
@@ -686,6 +689,7 @@ class TestEveryScreenOperationIsListed:
             "素材一覧",
             "素材一覧の右クリック",
             "エクスプローラー",
+            "エクスプローラーの右クリック",
             "字幕パネル",
             "字幕パネルの右クリック",
             "設定パネル",

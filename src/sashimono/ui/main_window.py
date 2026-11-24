@@ -205,7 +205,7 @@ from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
-from sashimono.engine.audio.library_sound import SoundPreview, measure_library_file
+from sashimono.engine.audio.library_sound import measure_library_file
 from sashimono.engine.audio.mixer import history_seconds
 from sashimono.engine.audio.speech import (
     SpeechError,
@@ -362,6 +362,8 @@ POOL_THUMBNAIL_SECONDS = Fraction(1)
 
 #: エクスプローラーの素材を測った長さと大きさの控え（#522 キャッシュの置き場の中）
 EXPLORER_MEASURES = "explorer_measures.json"
+#: エクスプローラーの見本の絵と波形の控え（キャッシュの置き場の中） 開くたびに作り直さない
+EXPLORER_THUMBS = "explorer_thumbs"
 
 #: AviUtl のオブジェクトファイル
 EXO_FILTER = "AviUtl オブジェクト (*.exo *.exa *.exo2 *.exa2);;すべてのファイル (*)"
@@ -510,8 +512,6 @@ class MainWindow(QMainWindow):
     project_changed = Signal(object)
     #: 抑えた後の音量を見積もり終えた（#497） 裏のスレッドから送り、画面のスレッドで受ける
     _loudness_planned = Signal(object)
-    #: エクスプローラーの試聴が鳴らせなかった（#521） 試聴の裏のスレッドから送る
-    _explorer_sound_failed = Signal(str)
 
     def __init__(
         self,
@@ -672,7 +672,9 @@ class MainWindow(QMainWindow):
         #: 頼んだ順と食い違う
         self._import: ProbeBatch | None = None
         #: 待っている読み込み パスと、タイムラインへ落とされた位置（落とされていなければ ``None``）
-        self._import_queue: list[tuple[list[Path], _DropTarget | None]] = []
+        self._import_queue: list[tuple[list[Path], _DropTarget | None, bool]] = []
+        #: 素材一覧へだけ入れる読み込み（エクスプローラーの〔素材一覧へ読み込む〕 #521）
+        self._pool_only: weakref.WeakSet[ProbeBatch] = weakref.WeakSet()
         #: タイムラインへ落とされた読み込みの、置く位置 走っている分の結果と一緒に引く
         #: 読み込みに引っ掛けて持つのは、取り消しやプロジェクトの切り替えで読み込みを
         #: 捨てたときに、位置だけが残って次の読み込みに当たらないようにするため
@@ -783,15 +785,14 @@ class MainWindow(QMainWindow):
         # 登録したフォルダの素材（#520 #521） 測った長さと大きさの控えは AI の道具（#522）と
         # 一覧の行で同じ物を使う 測り直すと数百の効果音で数十秒待たせる
         self._explorer_measures = MeasureBook(userdirs.cache_root() / EXPLORER_MEASURES)
-        self._sound_preview = SoundPreview()
         self._explorer = ExplorerPanel(
             self._preferences.explorer_folders,
             self,
             book=self._explorer_measures,
-            play=self._play_explorer_sound,
-            stop=self._sound_preview.stop,
+            before_play=self._stop_for_explorer,
+            thumbs=userdirs.cache_root() / EXPLORER_THUMBS,
         )
-        self._explorer.set_preview_volume(self._preferences.explorer_preview_volume)
+        self._apply_explorer_preferences(self._preferences)
         self._inspector = InspectorPanel(self)
         # 設定パネルは選んだクリップを引くためにプロジェクトを持つ 起動直後にも渡す
         # （渡さないと、最初の編集まで何本も選んだときのまとめ当てが効かない）
@@ -1330,8 +1331,7 @@ class MainWindow(QMainWindow):
         scenes_before = self._scenes_on_import()
         screen_before = self._screen_on_import()
         self._preferences = preferences
-        self._explorer.set_folders(preferences.explorer_folders)
-        self._explorer.set_preview_volume(preferences.explorer_preview_volume)
+        self._apply_explorer_preferences(preferences)
         self._apply_scene_preferences(scenes_before)
         self._apply_screen_preferences(screen_before)
         try:
@@ -1627,7 +1627,17 @@ class MainWindow(QMainWindow):
         self._explorer.folders_changed.connect(self._on_explorer_folders)
         self._explorer.place_requested.connect(self._place_explorer_files)
         self._explorer.message.connect(lambda text: self.statusBar().showMessage(text, 5000))
-        self._explorer_sound_failed.connect(self._explorer_sound_stopped)
+        self._explorer.import_requested.connect(
+            lambda paths: self.import_media(list(paths), pool_only=True)
+        )
+        self._explorer.view_mode_changed.connect(
+            lambda mode: self._remember_preferences(replace(self._preferences, explorer_view=mode))
+        )
+        self._explorer.icon_size_changed.connect(
+            lambda size: self._remember_preferences(
+                replace(self._preferences, explorer_icon_size=size)
+            )
+        )
         self._timeline.status_message.connect(
             lambda message: self.statusBar().showMessage(message, 4000)
         )
@@ -1983,7 +1993,9 @@ class MainWindow(QMainWindow):
         if names:
             self.import_media([Path(name) for name in names])
 
-    def import_media(self, paths: list[Path], *, at: DropSpot | None = None) -> None:
+    def import_media(
+        self, paths: list[Path], *, at: DropSpot | None = None, pool_only: bool = False
+    ) -> None:
         """素材を読み込んでタイムラインへ置く 調べるのは裏のスレッドで、待たずに返る
 
         複数選ばれた場合もまとめて 1 回の Undo で戻せるようにする
@@ -1993,6 +2005,7 @@ class MainWindow(QMainWindow):
         ダイアログ・一覧のボタン・一覧やタイムラインへの落とし込みは、どれもここへ来る
         ``at`` はタイムラインへ落とされた位置 無ければ末尾へ並べる 落とされた位置は、
         そのとき開いているシーンの位置として覚える（:meth:`_apply_import`）
+        ``pool_only`` は素材一覧へ入れるだけで置かない（エクスプローラーの〔素材一覧へ読み込む〕）
         """
         if not paths:
             return
@@ -2002,10 +2015,10 @@ class MainWindow(QMainWindow):
             else None
         )
         if self._import is not None:
-            self._import_queue.append((list(paths), target))
+            self._import_queue.append((list(paths), target, pool_only))
             self._show_import_progress()
             return
-        self._start_import(list(paths), target)
+        self._start_import(list(paths), target, pool_only)
 
     @property
     def importing(self) -> bool:
@@ -2092,7 +2105,9 @@ class MainWindow(QMainWindow):
             time.sleep(0.005)
         return True
 
-    def _start_import(self, paths: list[Path], at: _DropTarget | None = None) -> None:
+    def _start_import(
+        self, paths: list[Path], at: _DropTarget | None = None, pool_only: bool = False
+    ) -> None:
         # probe_media はこのモジュールの名前から引く 試験がここを差し替えて、
         # 開けない素材や断られる読み込みを作る
         # 読み込み直しでは必ず開き直す 覚えた結果は再生中のデコーダの作り直しのための物
@@ -2101,6 +2116,8 @@ class MainWindow(QMainWindow):
         self._import = ProbeBatch(paths, probe_media)
         if at is not None:
             self._import_spots[self._import] = at
+        if pool_only:
+            self._pool_only.add(self._import)
         self._show_import_progress()
         self._import_timer.start()
 
@@ -2161,7 +2178,9 @@ class MainWindow(QMainWindow):
             spot = replace(spot, frame=retime_frame(spot.frame, target.rate, now))
         found = self._scene_project(scene)
         lost = found is None
-        if found is None:
+        pool_only = batch in self._pool_only
+        if found is None or pool_only:
+            # 素材一覧はメインの物 シーンを開いていても、入れるだけならメインへ入れる
             project, spot, scene = self._document.project, None, None
         else:
             project = found
@@ -2170,7 +2189,11 @@ class MainWindow(QMainWindow):
             if isinstance(outcome, ProbeError):
                 failures.append(str(outcome))
                 continue
-            placed = [AddMedia(outcome)] if lost else self._place_dropped(project, outcome, spot)
+            placed = (
+                [AddMedia(outcome)]
+                if lost or pool_only
+                else self._place_dropped(project, outcome, spot)
+            )
             if spot is not None:
                 spot = spot.after(placed)
             for command in placed:
@@ -2188,7 +2211,7 @@ class MainWindow(QMainWindow):
         for media in loaded:
             self._request_analysis(media)
             self._request_proxy(media)
-        small = None if lost else self._small_hint(commands)
+        small = None if lost or pool_only else self._small_hint(commands)
         if small is not None:
             # 1 つの知らせにまとめる 続けて出すと、件数か失敗の訳が合わせ方を上書きする
             # 失敗の訳は後ろへ置く パスと理由が長く、前に置くと合わせ方が画面の外へ押し出される
@@ -2197,6 +2220,8 @@ class MainWindow(QMainWindow):
             )
         elif failures:
             self.statusBar().showMessage(failures[0], 5000)
+        elif pool_only and commands:
+            self.statusBar().showMessage(f"{batch.total} 件を素材一覧へ読み込んだ", 3000)
         elif lost and commands:
             self.statusBar().showMessage(
                 "落とした先のシーンが無くなったので、素材を一覧へ入れるだけにした", 5000
@@ -2468,18 +2493,20 @@ class MainWindow(QMainWindow):
         """
         self.import_media(list(paths), at=DropSpot(self._timeline.playhead, None))
 
-    def _play_explorer_sound(self, path: Path, volume: float) -> None:
-        """エクスプローラーの試聴 作品を再生していれば止める（2 つの音が重なると聞き分けられない）
-
-        作品の再生は止めるだけで、試聴の音は作品の時計を動かさない
+    def _stop_for_explorer(self) -> None:
+        """エクスプローラーの下見を鳴らす前 作品を再生していれば止める（2 つの音が重なると
+        聞き分けられない） 下見の音は作品の時計を動かさない
         """
         if self._playback.is_playing:
             self._playback.toggle()
-        self._sound_preview.play(path, volume, self._explorer_sound_failed.emit)
 
-    def _explorer_sound_stopped(self, message: str) -> None:
-        self._explorer.stop_listening()
-        self.statusBar().showMessage(message, 5000)
+    def _apply_explorer_preferences(self, preferences: Preferences) -> None:
+        explorer = self._explorer
+        explorer.set_folders(preferences.explorer_folders)
+        explorer.set_preview_volume(preferences.explorer_preview_volume)
+        explorer.set_view_mode(preferences.explorer_view)
+        explorer.set_icon_size(preferences.explorer_icon_size)
+        explorer.set_double_click(preferences.explorer_double_click)
 
     def show_explorer(self) -> None:
         """エクスプローラーのパネルを前へ出す"""
@@ -5760,7 +5787,7 @@ class MainWindow(QMainWindow):
         # 人の窓で作っている途中の声も、AI の書き出しと同じく止めて捨てる（#335） 残すと、
         # 閉じた後もイベントループが回る場面で、閉じた窓へ WAV を書いて声を置きに来る
         self._stop_narration()
-        self._sound_preview.stop()
+        self._explorer.shutdown()
         self._explorer_measures.save()
         self._playback.close()
         if self._ai_renderer is not None:

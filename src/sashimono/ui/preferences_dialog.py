@@ -1721,6 +1721,7 @@ class PreferencesDialog(QDialog):
             ),
             explorer_ai_bgm=self._explorer_ai_bgm.isChecked(),
             explorer_preview_volume=self._explorer_volume.value(),
+            explorer_double_click=str(self._explorer_double_click.currentData()),
             seam_video=str(self._seam_video.currentData()),
             seam_crossfade_ms=self._seam_crossfade.value(),
             seam_zoom_percent=self._seam_zoom.value(),
@@ -1996,10 +1997,22 @@ class PreferencesDialog(QDialog):
         self._explorer_volume.setSuffix(" %")
         self._explorer_volume.setValue(preferences.explorer_preview_volume)
         self._explorer_volume.setToolTip(
-            "エクスプローラーで試聴する大きさ 100 % は作品の再生と同じ大きさ"
+            "エクスプローラーの下見で鳴らす大きさ 100 % は作品の再生と同じ大きさ"
             "（素材をそのまま鳴らす）"
         )
-        form.addRow("エクスプローラー: 試聴の音量", self._explorer_volume)
+        form.addRow("エクスプローラー: 下見の音量", self._explorer_volume)
+
+        self._explorer_double_click = QComboBox(self)
+        for key, name in (("preview", "下見で再生する"), ("timeline", "タイムラインへ置く")):
+            self._explorer_double_click.addItem(name, key)
+        self._explorer_double_click.setCurrentIndex(
+            max(0, self._explorer_double_click.findData(preferences.explorer_double_click))
+        )
+        self._explorer_double_click.setToolTip(
+            "エクスプローラーの中身の行をダブルクリックしたときの動き タイムラインへ置くのは"
+            "ドラッグと〔タイムラインへ〕でもできる"
+        )
+        form.addRow("エクスプローラー: ダブルクリック", self._explorer_double_click)
 
     def _add_seam_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """ジャンプカットのつなぎ目（#332）の既定 溶かすか寄るか・どれだけの長さかは人と作品で違う

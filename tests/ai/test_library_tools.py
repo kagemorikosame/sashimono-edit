@@ -299,3 +299,23 @@ class TestDirectionPlan:
         result = run(work, "propose_direction", cues=_cues())
         assert "sound_file_id" in result["note"]
         assert "search_library" in result["note"]
+
+
+class TestImport:
+    def test_reads_into_the_pool_only_as_one_undo(self, work: _LibraryHost) -> None:
+        # 壊れると、エクスプローラーの〔素材一覧へ読み込む〕と同じ頼みで AI がタイムラインへ置き、
+        # 取り消した後も素材一覧に音が残る
+        before = work.document.project
+        row = _file(work, "ドン.wav")
+        result = run(work, "import_media", library_file_ids=[row["file_id"]], pool_only=True)
+        project = work.document.project
+        assert [m.path.name for m in project.media if m.path.name == "ドン.wav"] == ["ドン.wav"]
+        assert project.timeline == before.timeline
+        assert len(result["imported"]) == 1
+        work.document.undo()
+        assert work.document.project == before
+
+    def test_needs_something_to_read(self, work: _LibraryHost) -> None:
+        # 壊れると、空の頼みで空の取り消しの段が積まれる
+        with pytest.raises(ToolError, match="どちらか"):
+            run(work, "import_media")

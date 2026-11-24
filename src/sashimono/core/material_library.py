@@ -39,8 +39,12 @@ __all__ = [
     "CATEGORY_VIDEO",
     "DEFAULT_AI_CATEGORIES",
     "IMAGE_SUFFIXES",
+    "KIND_IMAGE",
+    "KIND_SOUND",
+    "KIND_VIDEO",
     "SCAN_LIMIT",
     "VIDEO_SUFFIXES",
+    "FolderListing",
     "FolderScan",
     "LibraryFile",
     "LibraryFolder",
@@ -49,6 +53,8 @@ __all__ = [
     "MeasureBook",
     "add_folder",
     "file_id",
+    "kind_of",
+    "list_folder",
     "match_files",
     "parse_categories",
     "parse_folders",
@@ -225,6 +231,62 @@ def scan_folder(folder: LibraryFolder, limit: int = SCAN_LIMIT) -> FolderScan:
     return FolderScan(folder, tuple(found), error=error)
 
 
+@dataclass(frozen=True, slots=True)
+class FolderListing:
+    """フォルダ 1 段の中身（エクスプローラーの木で開いたフォルダ） 下のフォルダには入らない"""
+
+    files: tuple[LibraryFile, ...] = ()
+    folders: tuple[Path, ...] = ()
+    missing: bool = False
+
+
+def list_folder(folder: LibraryFolder, directory: Path, limit: int = SCAN_LIMIT) -> FolderListing:
+    """登録した ``folder`` の中の ``directory`` 1 段の、分類に合うファイルと下のフォルダ
+
+    木で開いたフォルダの中身を出すのに使う 下まで全部を見て回ると、根を開くたびに
+    数万のファイルを待つ 名前で絞るときだけ :func:`scan_folder` で下まで見る
+    """
+    if not directory.is_dir():
+        return FolderListing(missing=True)
+    suffixes = _SUFFIXES.get(folder.category, _SUFFIXES[CATEGORY_OTHER])
+    files: list[LibraryFile] = []
+    folders: list[Path] = []
+    try:
+        with os.scandir(directory) as entries:
+            listed = sorted(entries, key=lambda entry: entry.name.casefold())
+    except OSError:
+        return FolderListing(missing=True)
+    for entry in listed:
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                folders.append(Path(entry.path))
+                continue
+            if Path(entry.name).suffix.lower() not in suffixes or not entry.is_file():
+                continue
+            stat = entry.stat()
+        except OSError:
+            continue
+        if len(files) < limit:
+            files.append(LibraryFile(Path(entry.path), folder, stat.st_size, stat.st_mtime_ns))
+    return FolderListing(tuple(files), tuple(folders))
+
+
+#: ファイルの種類（エクスプローラーの種類の絞り込みと列）
+KIND_SOUND = "sound"
+KIND_VIDEO = "video"
+KIND_IMAGE = "image"
+
+
+def kind_of(path: Path) -> str:
+    """後ろから見た種類 開かずに決める（数千の行を並べるたびに開くと待たせる）"""
+    suffix = path.suffix.lower()
+    if suffix in VIDEO_SUFFIXES:
+        return KIND_VIDEO
+    if suffix in IMAGE_SUFFIXES:
+        return KIND_IMAGE
+    return KIND_SOUND
+
+
 def match_files(files: Iterable[LibraryFile], query: str) -> list[LibraryFile]:
     """名前で絞る 空白で区切った語をどれも含む物（大文字と小文字・全角と半角の英字は区別しない）
 
@@ -329,13 +391,17 @@ class Measure:
     has_video: bool
     loudness: float | None = None
     peak: float | None = None
+    #: 絵の大きさ（表示の向き）と 1 秒のコマ数 エクスプローラーの列に出す 絵が無ければ 0
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
 
 
 #: 測る関数 測れない（開けない・壊れた）ときは ``None``
 Measurer = Callable[[Path], Measure | None]
 
 #: 覚えた手がかりの形の版 形を変えたら上げる（前の版の物は読まずに測り直す）
-_BOOK_VERSION = 1
+_BOOK_VERSION = 2
 
 
 @dataclass
@@ -368,6 +434,9 @@ class MeasureBook:
             "video": measure.has_video,
             "loudness": measure.loudness,
             "peak": measure.peak,
+            "width": measure.width,
+            "height": measure.height,
+            "fps": measure.fps,
         }
         with self._lock:
             self._load()[file.id] = row
@@ -412,14 +481,22 @@ def _measure_from(row: dict[str, object]) -> Measure | None:
     seconds = row.get("seconds")
     if isinstance(seconds, bool) or not isinstance(seconds, int | float):
         return None
-    loudness, peak = row.get("loudness"), row.get("peak")
     return Measure(
         seconds=float(seconds),
         has_audio=bool(row.get("audio")),
         has_video=bool(row.get("video")),
-        loudness=float(loudness) if isinstance(loudness, int | float) else None,
-        peak=float(peak) if isinstance(peak, int | float) else None,
+        loudness=_number(row.get("loudness")),
+        peak=_number(row.get("peak")),
+        width=int(_number(row.get("width")) or 0),
+        height=int(_number(row.get("height")) or 0),
+        fps=_number(row.get("fps")) or 0.0,
     )
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 # --- AI が使う口 ---
