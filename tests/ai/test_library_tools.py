@@ -319,3 +319,20 @@ class TestImport:
         # 壊れると、空の頼みで空の取り消しの段が積まれる
         with pytest.raises(ToolError, match="どちらか"):
             run(work, "import_media")
+
+
+class TestFavorites:
+    def test_favorites_only_stays_inside_the_allowed_categories(
+        self, work: _LibraryHost, folders: dict[str, Path]
+    ) -> None:
+        # 壊れると、「いつもの効果音」の頼みで本人が AI に使わせないと決めた分類の物まで選ぶ
+        effects = folders[CATEGORY_SOUND_EFFECT]
+        work.material = replace(
+            work.material,
+            favorites=(str(effects / "拍手"), str(folders[CATEGORY_VIDEO] / "隠し.wav")),
+        )
+        rows = run(work, "search_library", favorites_only=True)["files"]
+        assert [row["name"] for row in rows] == ["拍手大.wav"]
+        assert rows[0]["favorite"] is True
+        every = run(work, "search_library")["files"]
+        assert {row["name"] for row in every if not row["favorite"]} >= {"ドン.wav"}

@@ -793,6 +793,13 @@ class MainWindow(QMainWindow):
             thumbs=userdirs.cache_root() / EXPLORER_THUMBS,
         )
         self._apply_explorer_preferences(self._preferences)
+        # 前回の場所から開く（#521） 消えていれば先頭から 選び直しのたびに設定を書かないよう、
+        # 動いた場所は覚えておき、窓を閉じるときに書く
+        self._explorer_location = (
+            self._preferences.explorer_last_folder,
+            self._preferences.explorer_last_file,
+        )
+        self._explorer.restore_location(*self._explorer_location)
         self._inspector = InspectorPanel(self)
         # 設定パネルは選んだクリップを引くためにプロジェクトを持つ 起動直後にも渡す
         # （渡さないと、最初の編集まで何本も選んだときのまとめ当てが効かない）
@@ -1630,6 +1637,12 @@ class MainWindow(QMainWindow):
         self._explorer.import_requested.connect(
             lambda paths: self.import_media(list(paths), pool_only=True)
         )
+        self._explorer.favorites_changed.connect(
+            lambda favorites: self._remember_preferences(
+                replace(self._preferences, explorer_favorite_paths=tuple(favorites))
+            )
+        )
+        self._explorer.location_changed.connect(self._on_explorer_location)
         self._explorer.view_mode_changed.connect(
             lambda mode: self._remember_preferences(replace(self._preferences, explorer_view=mode))
         )
@@ -2493,6 +2506,18 @@ class MainWindow(QMainWindow):
         """
         self.import_media(list(paths), at=DropSpot(self._timeline.playhead, None))
 
+    def _on_explorer_location(self, folder: str, file: str) -> None:
+        self._explorer_location = (folder, file)
+
+    def _remember_explorer_location(self) -> None:
+        """エクスプローラーの最後の場所を覚える 変わっていなければ書かない"""
+        folder, file = self._explorer_location
+        preferences = self._preferences
+        if (folder, file) != (preferences.explorer_last_folder, preferences.explorer_last_file):
+            self._remember_preferences(
+                replace(preferences, explorer_last_folder=folder, explorer_last_file=file)
+            )
+
     def _stop_for_explorer(self) -> None:
         """エクスプローラーの下見を鳴らす前 作品を再生していれば止める（2 つの音が重なると
         聞き分けられない） 下見の音は作品の時計を動かさない
@@ -2503,6 +2528,7 @@ class MainWindow(QMainWindow):
     def _apply_explorer_preferences(self, preferences: Preferences) -> None:
         explorer = self._explorer
         explorer.set_folders(preferences.explorer_folders)
+        explorer.set_favorites(preferences.explorer_favorite_paths)
         explorer.set_preview_volume(preferences.explorer_preview_volume)
         explorer.set_view_mode(preferences.explorer_view)
         explorer.set_icon_size(preferences.explorer_icon_size)
@@ -4743,6 +4769,7 @@ class MainWindow(QMainWindow):
             auto_bgm=preferences.explorer_ai_bgm,
             book=self._explorer_measures,
             measure=measure_library_file,
+            favorites=preferences.explorer_favorite_paths,
         )
 
     @property
@@ -5334,6 +5361,17 @@ class MainWindow(QMainWindow):
             names.add(str(self._path))
         # エクスプローラーに登録したフォルダ（#520） 設定の写しと search_library に出る
         names.update(folder.path for folder in self._preferences.explorer_folders)
+        # お気に入りと前回の場所も、設定の写しに場所として載る
+        names.update(self._preferences.explorer_favorite_paths)
+        names.update(
+            place
+            for place in (
+                self._preferences.explorer_last_folder,
+                self._preferences.explorer_last_file,
+                *self._explorer_location,
+            )
+            if place
+        )
         names.update(
             folder
             for folder in (
@@ -5789,6 +5827,7 @@ class MainWindow(QMainWindow):
         self._stop_narration()
         self._explorer.shutdown()
         self._explorer_measures.save()
+        self._remember_explorer_location()
         self._playback.close()
         if self._ai_renderer is not None:
             self._ai_renderer.close()

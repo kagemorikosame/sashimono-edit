@@ -3519,6 +3519,9 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
         raise ToolError("query は文字で渡してください")
     shortest = _optional_number(arguments, "min_seconds", 0.0)
     longest = _optional_number(arguments, "max_seconds", 0.0)
+    # 本人がお気に入りに入れた物だけ（いつもの効果音） 使ってよい分類の外の物は、
+    # お気に入りでも出さない（見て回るのが使ってよい分類のフォルダだけなので）
+    favorites_only = _flag_argument(arguments, "favorites_only", False)
     head: dict[str, Any] = {
         "categories": [
             {"category": key, "name": LIBRARY_CATEGORIES[key]} for key in library.ai_categories
@@ -3539,6 +3542,9 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
     rows: list[dict[str, Any]] = []
     unmeasured = 0
     for file in matched:
+        favorite = library.is_favorite(file)
+        if favorites_only and not favorite:
+            continue
         known = library.measured(file, allow_measure=False)
         if known is None and budget > 0:
             budget -= 1
@@ -3557,6 +3563,7 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
             "name": file.name,
             "folder": file.subfolder,
             "category": file.category,
+            "favorite": favorite,
             "measured": known is not None,
         }
         if known is not None:
@@ -11916,6 +11923,10 @@ OPERATIONS: tuple[Operation, ...] = (
                 ),
                 "min_seconds": _number("この秒より短い物を外す（BGM を探すとき）"),
                 "max_seconds": _number("この秒より長い物を外す（効果音は 10 以下）"),
+                "favorites_only": _boolean(
+                    "本人がお気に入りに入れた物（とお気に入りのフォルダの中の物）だけ"
+                    " 「いつもの」と頼まれたときに使う（既定 false）"
+                ),
                 **_paging(),
             }
         ),

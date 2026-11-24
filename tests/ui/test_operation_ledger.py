@@ -529,6 +529,7 @@ def _scan_stage(window: MainWindow, stage: _Stage, folder: Path, scan: Scan) -> 
     walk_menu(
         window._explorer.build_menu([folder / "音.wav"]), "エクスプローラーの右クリック", scan
     )
+    walk_menu(window._explorer.build_tree_menu(folder), "エクスプローラーの木の右クリック", scan)
     walk_buttons(window._subtitles, "字幕パネル", scan)
 
     if stage.media is not None:
@@ -690,6 +691,7 @@ class TestEveryScreenOperationIsListed:
             "素材一覧の右クリック",
             "エクスプローラー",
             "エクスプローラーの右クリック",
+            "エクスプローラーの木の右クリック",
             "字幕パネル",
             "字幕パネルの右クリック",
             "設定パネル",

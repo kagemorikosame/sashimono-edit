@@ -24,12 +24,16 @@ from sashimono.core.material_library import (
     MeasureBook,
     add_folder,
     file_id,
+    is_favorite,
     match_files,
     parse_categories,
     parse_folders,
+    parse_paths,
     remove_folder,
+    same_place,
     scan_folder,
     set_category,
+    toggle_favorite,
 )
 
 
@@ -220,3 +224,26 @@ class TestMaterialLibrary:
         assert library.measured(file, allow_measure=True) is not None
         assert library.measured(file, allow_measure=True) is not None
         assert calls == [sound]
+
+
+class TestFavorites:
+    def test_toggle_keeps_order_and_ignores_spelling(self, tmp_path: Path) -> None:
+        # 壊れると、同じ物が書き方の違いで 2 つ並ぶか、外したつもりで残る
+        a, b = str(tmp_path / "a.wav"), str(tmp_path / "b")
+        favorites = toggle_favorite((), a, True)
+        favorites = toggle_favorite(favorites, b, True)
+        favorites = toggle_favorite(favorites, a.upper() if os.name == "nt" else a, True)
+        assert favorites == (b, a.upper() if os.name == "nt" else a)
+        assert toggle_favorite(favorites, a, False) == (b,)
+
+    def test_files_inside_a_favorite_folder_count(self, tmp_path: Path) -> None:
+        # 壊れると、お気に入りのフォルダに入れた効果音を AI が「いつもの」として選べない
+        favorites = (str(tmp_path / "いつもの"),)
+        assert is_favorite(favorites, tmp_path / "いつもの" / "ドン.wav")
+        assert not is_favorite(favorites, tmp_path / "いつもの2" / "ドン.wav")
+        assert same_place(tmp_path / "x", str(tmp_path / "." / "x"))
+
+    def test_broken_settings_are_dropped(self) -> None:
+        # 壊れた値で起動を止めない
+        assert parse_paths("D:/x") == ()
+        assert parse_paths(["D:/x", "", 3, "D:/x"]) == ("D:/x",)

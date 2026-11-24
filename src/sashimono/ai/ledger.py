@@ -635,6 +635,28 @@ LEDGER: tuple[Entry, ...] = (
         note="library_file_ids と pool_only で素材一覧へ入れるだけにする 取り消し 1 回で戻る",
     ),
     hidden("エクスプローラーの右クリック/エクスプローラーで開く", _OUTSIDE),
+    # お気に入り（本人の要望 2026-11-24） 作品ではなく本人の側に覚えるアプリ自身の設定（#350）
+    # AI は search_library の favorite と favorites_only で読む
+    read_only(
+        "エクスプローラーの右クリック/お気に入りに入れる",
+        _SETTINGS,
+        "preferences.explorer_favorite_paths",
+    ),
+    read_only(
+        "エクスプローラーの右クリック/お気に入りから外す",
+        _SETTINGS,
+        "preferences.explorer_favorite_paths",
+    ),
+    read_only(
+        "エクスプローラーの木の右クリック/お気に入りに入れる",
+        _SETTINGS,
+        "preferences.explorer_favorite_paths",
+    ),
+    read_only(
+        "エクスプローラーの木の右クリック/お気に入りから外す",
+        _SETTINGS,
+        "preferences.explorer_favorite_paths",
+    ),
     # --- 字幕パネル ---
     same("字幕パネル/起こす…", "transcribe"),
     same("字幕パネル/整形…", "clean_subtitles"),

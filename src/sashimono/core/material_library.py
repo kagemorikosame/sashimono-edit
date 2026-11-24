@@ -53,14 +53,18 @@ __all__ = [
     "MeasureBook",
     "add_folder",
     "file_id",
+    "is_favorite",
     "kind_of",
     "list_folder",
     "match_files",
     "parse_categories",
     "parse_folders",
+    "parse_paths",
     "remove_folder",
+    "same_place",
     "scan_folder",
     "set_category",
+    "toggle_favorite",
 ]
 
 CATEGORY_SOUND_EFFECT = "sound_effect"
@@ -366,6 +370,47 @@ def parse_folders(value: object) -> tuple[LibraryFolder, ...]:
     return tuple(folders)
 
 
+# --- お気に入り（#521 本人の要望 2026-11-24） ---
+
+
+def same_place(a: str | Path, b: str | Path) -> bool:
+    """同じ場所か 大文字と小文字・区切りの書き方の違いを同じと見る（Windows の場所の決まり）"""
+    return _folder_key(str(a)) == _folder_key(str(b))
+
+
+def toggle_favorite(favorites: Sequence[str], path: str | Path, wanted: bool) -> tuple[str, ...]:
+    """お気に入りに入れた（``wanted`` が偽なら外した）後の一覧 並びは入れた順
+
+    場所で覚える 消えた・移った物も外さずに残す（外付けのドライブを挿し直せば戻る物を、
+    勝手に忘れない 登録したフォルダと同じ扱い）
+    """
+    kept = [entry for entry in favorites if not same_place(entry, path)]
+    if wanted:
+        kept.append(str(path))
+    return tuple(kept)
+
+
+def is_favorite(favorites: Sequence[str], path: str | Path) -> bool:
+    """``path`` がお気に入りか、お気に入りのフォルダの中の物か"""
+    key = _folder_key(str(path))
+    for entry in favorites:
+        mark = _folder_key(entry)
+        if key == mark or key.startswith(mark.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+def parse_paths(value: object) -> tuple[str, ...]:
+    """設定のファイルから読んだ場所の一覧 壊れた物と重なりは落とす（起動を止めない）"""
+    if not isinstance(value, list | tuple):
+        return ()
+    kept: list[str] = []
+    for entry in value:
+        if isinstance(entry, str) and entry.strip() and not any(same_place(entry, k) for k in kept):
+            kept.append(entry)
+    return tuple(kept)
+
+
 def parse_categories(value: object, default: tuple[str, ...]) -> tuple[str, ...]:
     """設定のファイルから読んだ AI に使わせる分類 知らない分類は落とす 形が違えば既定"""
     if not isinstance(value, list | tuple):
@@ -515,6 +560,11 @@ class MaterialLibrary:
     auto_bgm: bool = False
     book: MeasureBook = field(default_factory=MeasureBook)
     measure: Measurer | None = None
+    #: お気に入りの場所（ファイルかフォルダ） 本人の設定 :attr:`Preferences.explorer_favorite_paths`
+    favorites: tuple[str, ...] = ()
+
+    def is_favorite(self, file: LibraryFile) -> bool:
+        return is_favorite(self.favorites, file.path)
 
     @property
     def ai_folders(self) -> tuple[LibraryFolder, ...]:

@@ -88,6 +88,7 @@ from PySide6.QtWidgets import (
 from sashimono.core.io.atomic import write_atomic_bytes
 from sashimono.core.material_library import (
     CATEGORIES,
+    CATEGORY_OTHER,
     KIND_IMAGE,
     KIND_SOUND,
     KIND_VIDEO,
@@ -96,11 +97,14 @@ from sashimono.core.material_library import (
     Measure,
     MeasureBook,
     add_folder,
+    is_favorite,
     kind_of,
     list_folder,
     match_files,
     remove_folder,
+    same_place,
     scan_folder,
+    toggle_favorite,
 )
 from sashimono.engine.audio.library_sound import (
     PreviewPlayer,
@@ -118,7 +122,10 @@ __all__ = [
     "DOUBLE_CLICK_ACTIONS",
     "DOUBLE_CLICK_PREVIEW",
     "DOUBLE_CLICK_TIMELINE",
+    "FAVORITES",
     "ICON_SIZE_RANGE",
+    "STAR_OFF",
+    "STAR_ON",
     "VIEW_ICONS",
     "VIEW_LIST",
     "VIEW_MODES",
@@ -146,8 +153,15 @@ DOUBLE_CLICK_ACTIONS = {
 }
 
 #: 一覧の列 測っていない値は空で出し、裏で測れたら埋める
-COLUMNS = ("名前", "種類", "長さ", "大きさ", "解像度", "フレームレート", "更新日", "フォルダ")
-_NAME, _KIND, _LENGTH, _LOUDNESS, _SIZE, _FPS, _MODIFIED, _FOLDER = range(len(COLUMNS))
+#: 頭の ☆ はお気に入りの印 押すと入れる・外すが切り替わる
+COLUMNS = ("☆", "名前", "種類", "長さ", "大きさ", "解像度", "フレームレート", "更新日", "フォルダ")
+_STAR, _NAME, _KIND, _LENGTH, _LOUDNESS, _SIZE, _FPS, _MODIFIED, _FOLDER = range(len(COLUMNS))
+#: お気に入りの印 付いている・付いていない
+STAR_ON = "★"
+STAR_OFF = "☆"
+#: 木のお気に入りの根と、その下の項目の印（登録したフォルダの場所の代わりに持つ）
+FAVORITES = "お気に入り"
+_FAVORITE_NODE = "★"
 _KIND_NAMES = {KIND_SOUND: "音", KIND_VIDEO: "動画", KIND_IMAGE: "画像"}
 #: 種類の絞り込み（空はすべて）
 _KIND_FILTERS = (("", "すべて"), (KIND_SOUND, "音"), (KIND_VIDEO, "動画"), (KIND_IMAGE, "画像"))
@@ -158,6 +172,8 @@ _SORT = Qt.ItemDataRole.UserRole + 1
 _ID = Qt.ItemDataRole.UserRole + 2
 #: アイコン表示で名前の下に出す長さ
 _UNDER = Qt.ItemDataRole.UserRole + 3
+#: お気に入りか（アイコン表示で名前の頭に印を出す）
+_FAV = Qt.ItemDataRole.UserRole + 4
 
 #: 木の項目の持つ物 （登録したフォルダの場所, 開いたフォルダの場所） 分類の根は分類の名前
 _NODE = Qt.ItemDataRole.UserRole
@@ -368,6 +384,9 @@ class _UnderDelegate(QStyledItemDelegate):
         self, option: QStyleOptionViewItem, index: QModelIndex | QPersistentModelIndex
     ) -> None:
         super().initStyleOption(option, index)
+        if index.data(_FAV):
+            # アイコン表示には印の列が無い 名前の頭に印を出して、一覧と同じく見分けられるようにする
+            option.text = f"{STAR_ON} {option.text}"
         under = index.data(_UNDER)
         if under:
             # 行の区切りの字で渡す 改行の字のままだと 1 行に詰まって名前と長さがくっつく
@@ -670,6 +689,11 @@ class ExplorerPanel(QWidget):
     icon_size_changed = Signal(int)
     #: 知らせ（下見できない など） 窓がステータスバーへ出す
     message = Signal(str)
+    #: お気に入りを変えた 引数は新しい一覧（``tuple[str, ...]``） 覚えるのは窓の仕事
+    favorites_changed = Signal(object)
+    #: 開いている場所か選んだファイルが変わった（開いたフォルダ, 選んだファイル 無ければ空）
+    #: 窓が覚え、次の起動でそこから開く
+    location_changed = Signal(str, str)
 
     def __init__(
         self,
@@ -689,6 +713,7 @@ class ExplorerPanel(QWidget):
         """
         super().__init__(parent)
         self._folders: tuple[LibraryFolder, ...] = tuple(folders)
+        self._favorites: tuple[str, ...] = ()
         self._book = book if book is not None else MeasureBook()
         self._measure = measure
         self._thumbs = _ThumbStore(thumbs)
@@ -724,6 +749,8 @@ class ExplorerPanel(QWidget):
         self._tree.setHeaderHidden(True)
         self._tree.itemExpanded.connect(self._expand)
         self._tree.currentItemChanged.connect(lambda *_args: self._show_files())
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._show_tree_menu)
         left = QWidget(self)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -785,8 +812,11 @@ class ExplorerPanel(QWidget):
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setShowGrid(False)
         self._table.setWordWrap(False)
+        # 印の列は 1 字なので細くする 既定の幅だと名前の列が右へ押し出される
+        self._table.setColumnWidth(_STAR, 32)
         self._icons_view = QListView(self)
         self._icons_view.setModel(self._proxy)
+        self._icons_view.setModelColumn(_NAME)
         self._icons_view.setViewMode(QListView.ViewMode.IconMode)
         self._icons_view.setResizeMode(QListView.ResizeMode.Adjust)
         self._icons_view.setMovement(QListView.Movement.Static)
@@ -808,6 +838,7 @@ class ExplorerPanel(QWidget):
         # 2 つの表示で選んだ行をそろえる（切り替えても同じファイルを選んだまま）
         self._icons_view.setSelectionModel(self._table.selectionModel())
         self._table.selectionModel().selectionChanged.connect(lambda *_a: self._on_selection())
+        self._table.clicked.connect(self._on_cell_clicked)
         self._views = QStackedWidget(self)
         self._views.addWidget(self._table)
         self._views.addWidget(self._icons_view)
@@ -908,6 +939,40 @@ class ExplorerPanel(QWidget):
         self._folders = folders
         self._fill_tree()
 
+    @property
+    def favorites(self) -> tuple[str, ...]:
+        return self._favorites
+
+    def set_favorites(self, favorites: Sequence[str]) -> None:
+        """お気に入りを差し替える（起動したとき） 知らせは出さない"""
+        favorites = tuple(favorites)
+        if favorites == self._favorites:
+            return
+        self._favorites = favorites
+        self._fill_tree()
+
+    def set_favorite(self, paths: Sequence[Path | str], wanted: bool) -> None:
+        """お気に入りに入れる（``wanted`` が偽なら外す） 窓へ知らせて覚えさせる"""
+        favorites = self._favorites
+        for path in paths:
+            favorites = toggle_favorite(favorites, path, wanted)
+        if favorites == self._favorites:
+            return
+        self._favorites = favorites
+        self._fill_tree()
+        self.favorites_changed.emit(self._favorites)
+
+    def is_favorite(self, path: Path | str) -> bool:
+        return any(same_place(entry, path) for entry in self._favorites)
+
+    def restore_location(self, folder: str, file: str) -> bool:
+        """前回の場所から開く そのフォルダが消えていれば何もしない（先頭から開く）"""
+        if not folder or not Path(folder).is_dir() or not self.open_folder(folder):
+            return False
+        if file:
+            self.select_file(Path(file))
+        return True
+
     def set_preview_volume(self, percent: int) -> None:
         self._preview.set_volume(percent)
 
@@ -998,7 +1063,27 @@ class ExplorerPanel(QWidget):
         menu.addSeparator()
         reveal = menu.addAction("エクスプローラーで開く")
         reveal.triggered.connect(lambda _checked=False: self._reveal(chosen))
+        self._add_favorite_actions(menu, chosen)
         return menu
+
+    def build_tree_menu(self, path: Path) -> QMenu:
+        """木のフォルダの右クリックメニュー お気に入りの付け外し"""
+        menu = QMenu(self)
+        self._add_favorite_actions(menu, [path])
+        return menu
+
+    def _add_favorite_actions(self, menu: QMenu, chosen: list[Path]) -> None:
+        """お気に入りに入れる・外す 両方をいつも並べ、今の状態で押せる方だけを押せるようにする
+        （出したり消したりすると、同じ所を押したつもりで別の項目を押す）
+        """
+        menu.addSeparator()
+        marked = [self.is_favorite(path) for path in chosen]
+        add = menu.addAction("お気に入りに入れる")
+        add.setEnabled(not all(marked))
+        add.triggered.connect(lambda _checked=False: self.set_favorite(chosen, True))
+        drop = menu.addAction("お気に入りから外す")
+        drop.setEnabled(any(marked))
+        drop.triggered.connect(lambda _checked=False: self.set_favorite(chosen, False))
 
     # --- 登録と木 ---
 
@@ -1020,7 +1105,7 @@ class ExplorerPanel(QWidget):
 
     def _remove(self) -> None:
         node = self._node()
-        registered = node[0] if node is not None else None
+        registered = node[0] if node is not None and node[0] != _FAVORITE_NODE else None
         if not registered:
             self.message.emit("外すフォルダを左の木で選んでください")
             return
@@ -1033,6 +1118,27 @@ class ExplorerPanel(QWidget):
         current = self._node()
         self._tree.blockSignals(True)
         self._tree.clear()
+        if self._favorites:
+            # 一番上に置く すぐ呼び出したい素材をまとめる所（2026-11-24 本人の要望）
+            root = QTreeWidgetItem([f"{STAR_ON} {FAVORITES}"])
+            root.setData(0, _NODE, (_FAVORITE_NODE, ""))
+            self._tree.addTopLevelItem(root)
+            for entry in self._favorites:
+                place = Path(entry)
+                if place.is_file():
+                    # ファイルは根を選んだときの中身に出す 木にはフォルダだけを並べる
+                    continue
+                missing = not place.is_dir()
+                label = place.name or entry
+                item = QTreeWidgetItem([f"{label}（見つかりません）" if missing else label])
+                item.setToolTip(0, entry)
+                item.setData(0, _NODE, (_FAVORITE_NODE, entry))
+                if missing:
+                    item.setForeground(0, Colors.TEXT_MUTED)
+                else:
+                    item.addChild(QTreeWidgetItem([_PLACEHOLDER]))
+                root.addChild(item)
+            root.setExpanded(True)
         for key, name in CATEGORIES.items():
             members = [folder for folder in self._folders if folder.category == key]
             if not members:
@@ -1061,9 +1167,14 @@ class ExplorerPanel(QWidget):
         self._show_files()
 
     def _find_node(self, target: str) -> QTreeWidgetItem | None:
-        """場所の木の項目 まだ開いていない下のフォルダは、辿りながら開く"""
-        for top in range(self._tree.topLevelItemCount()):
-            root = self._tree.topLevelItem(top)
+        """場所の木の項目 まだ開いていない下のフォルダは、辿りながら開く
+
+        登録したフォルダの下を先に探す お気に入りのフォルダは登録したフォルダの中にもあるので、
+        先に探すと前回の場所がいつもお気に入りの下で開く
+        """
+        roots = [self._tree.topLevelItem(top) for top in range(self._tree.topLevelItemCount())]
+        favorites = [r for r in roots if r is not None and r.data(0, _NODE) == (_FAVORITE_NODE, "")]
+        for root in [r for r in roots if r not in favorites] + favorites:
             if root is None:
                 continue
             for index in range(root.childCount()):
@@ -1098,19 +1209,41 @@ class ExplorerPanel(QWidget):
             return
         item.takeChild(0)
         node = item.data(0, _NODE)
-        folder = self._registered(node[0]) if isinstance(node, tuple) else None
+        if not isinstance(node, tuple):
+            return
+        folder = (
+            self._owner(Path(node[1])) if node[0] == _FAVORITE_NODE else self._registered(node[0])
+        )
         if folder is None:
             return
         listing = list_folder(folder, Path(node[1]), limit=0)
         for directory in listing.folders:
             child = QTreeWidgetItem([directory.name])
             child.setToolTip(0, str(directory))
-            child.setData(0, _NODE, (folder.path, str(directory)))
+            child.setData(0, _NODE, (node[0], str(directory)))
             child.addChild(QTreeWidgetItem([_PLACEHOLDER]))
             item.addChild(child)
 
     def _registered(self, path: str) -> LibraryFolder | None:
         return next((folder for folder in self._folders if folder.path == path), None)
+
+    def _owner(self, path: Path) -> LibraryFolder:
+        """お気に入りの物が入っている登録したフォルダ 登録の外（登録を外した後など）なら、
+        その場所を「その他」として扱う（お気に入りは登録と別に覚えるので、外しても残る）
+        """
+        for folder in self._folders:
+            if is_favorite([folder.path], path):
+                return folder
+        return LibraryFolder(str(path if path.is_dir() else path.parent), CATEGORY_OTHER)
+
+    def _show_tree_menu(self, position: QPoint) -> None:
+        item = self._tree.itemAt(position)
+        node = item.data(0, _NODE) if item is not None else None
+        if not isinstance(node, tuple) or not node[0] or not node[1]:
+            return
+        menu = self.build_tree_menu(Path(node[1]))
+        menu.exec(self._tree.viewport().mapToGlobal(position))
+        menu.deleteLater()
 
     def _node(self) -> tuple[str, str] | None:
         """選んでいる木の項目 （登録したフォルダの場所, 開いた場所） 分類の根は（空, 分類）"""
@@ -1126,6 +1259,10 @@ class ExplorerPanel(QWidget):
         if node is None:
             return [(folder, Path(folder.path)) for folder in self._folders], ["すべてのフォルダ"]
         registered, where = node
+        if registered == _FAVORITE_NODE:
+            if not where:
+                return [], [FAVORITES]
+            return [(self._owner(Path(where)), Path(where))], [FAVORITES, Path(where).name]
         if not registered:
             members = [folder for folder in self._folders if folder.category == where]
             return [(folder, Path(folder.path)) for folder in members], [CATEGORIES[where]]
@@ -1142,10 +1279,15 @@ class ExplorerPanel(QWidget):
         self._worker.forget()
         pairs, crumbs = self._location()
         node = self._node()
-        self._remove_button.setEnabled(node is not None and bool(node[0]))
+        self._remove_button.setEnabled(
+            node is not None and bool(node[0]) and node[0] != _FAVORITE_NODE
+        )
         self._crumbs.setText(" › ".join(crumbs))
         query = self._filter.text().strip()
         kind = str(self._kind_box.currentData() or "")
+        if node == (_FAVORITE_NODE, ""):
+            self._show_favorite_files(query, kind)
+            return
         if not self._folders:
             self._fill_rows([])
             self._status.setText(
@@ -1156,6 +1298,8 @@ class ExplorerPanel(QWidget):
         notes: list[str] = []
         files: list[LibraryFile] = []
         deep = bool(query) or node is None or not node[0]
+        if node is not None and node[0] == _FAVORITE_NODE:
+            deep = bool(query)
         for folder, directory in pairs:
             if not Path(folder.path).is_dir():
                 notes.append(
@@ -1185,6 +1329,33 @@ class ExplorerPanel(QWidget):
             count += f"（頭の {DISPLAY_LIMIT} 個を表示 名前で絞り込んでください）"
         self._status.setText("  ".join([count, *notes]))
 
+    def _show_favorite_files(self, query: str, kind: str) -> None:
+        """お気に入りの根 印を付けたファイル（フォルダは木から辿る）"""
+        files: list[LibraryFile] = []
+        missing = 0
+        for entry in self._favorites:
+            place = Path(entry)
+            if place.is_dir():
+                continue
+            try:
+                stat = place.stat()
+            except OSError:
+                # 消えた・移った物も外さずに残す 数だけ知らせる
+                missing += 1
+                continue
+            files.append(LibraryFile(place, self._owner(place), stat.st_size, stat.st_mtime_ns))
+        matched = [
+            file for file in match_files(files, query) if not kind or kind_of(file.path) == kind
+        ]
+        self._fill_rows(matched)
+        notes = [f"{len(matched)} 個"]
+        if missing:
+            notes.append(f"{missing} 個が見つかりません（消えたか移った） 右クリックで外せます")
+        if not self._favorites:
+            notes = ["お気に入りはありません"]
+        self._status.setText("  ".join(notes))
+        self._emit_location()
+
     def _fill_rows(self, files: Sequence[LibraryFile]) -> None:
         selected = set(self.selected_files())
         self._table.setSortingEnabled(False)
@@ -1212,6 +1383,12 @@ class ExplorerPanel(QWidget):
     def _row(self, file: LibraryFile, measure: Measure | None) -> list[QStandardItem]:
         kind = kind_of(file.path)
         cells = [QStandardItem() for _ in COLUMNS]
+        favorite = self.is_favorite(file.path)
+        cells[_STAR].setText(STAR_ON if favorite else STAR_OFF)
+        cells[_STAR].setData(int(favorite), _SORT)
+        cells[_STAR].setToolTip("押すとお気に入りに入れる・外す")
+        cells[_STAR].setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        cells[_NAME].setData(favorite, _FAV)
         cells[_NAME].setText(file.name)
         cells[_NAME].setData(str(file.path), _PATH)
         cells[_NAME].setData(file.id, _ID)
@@ -1350,7 +1527,21 @@ class ExplorerPanel(QWidget):
 
     # --- 選ぶ・下見・置く ---
 
+    def _on_cell_clicked(self, index: QModelIndex) -> None:
+        """印の列を押した お気に入りを切り替える"""
+        if index.column() != _STAR:
+            return
+        path = Path(str(index.siblingAtColumn(_NAME).data(_PATH)))
+        self.set_favorite([path], not self.is_favorite(path))
+
+    def _emit_location(self) -> None:
+        node = self._node()
+        folder = node[1] if node is not None and node[0] and node[1] else ""
+        files = self.selected_files()
+        self.location_changed.emit(folder, str(files[0]) if len(files) == 1 else "")
+
     def _on_selection(self) -> None:
+        self._emit_location()
         files = self.selected_files()
         self._place_button.setEnabled(bool(files))
         if len(files) != 1:

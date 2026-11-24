@@ -70,6 +70,7 @@ from sashimono.core.material_library import (
     LibraryFolder,
     parse_categories,
     parse_folders,
+    parse_paths,
 )
 from sashimono.core.mixing import (
     DEFAULT_DUCK_ATTACK_MS,
@@ -901,6 +902,15 @@ class Preferences:
     #: タイムラインへ置くか 置く方に慣れた人は変えられる
     #: 置くのはドラッグと〔タイムラインへ〕でもできる
     explorer_double_click: str = EXPLORER_DOUBLE_CLICKS[0]
+    #: エクスプローラーのお気に入り（ファイルとフォルダの場所 入れた順） すぐ呼び出したい素材を
+    #: 木の一番上にまとめる（2026-11-24 本人の要望） 作品ではなく本人に付ける（どの作品を開いても
+    #: 同じ） 消えた・移った物も外さずに残す 欄の名前を ``_paths`` で終えるのは、AI へ送る設定の
+    #: 写しで名前と場所として値ごと伏せるため（:mod:`sashimono.ai.outbound`）
+    explorer_favorite_paths: tuple[str, ...] = ()
+    #: 最後に開いていたフォルダと選んでいたファイル 次の起動ではそこから開く 好みではなく
+    #: 覚えている物なので、書き出しのフォルダと同じく設定画面には出さない
+    explorer_last_folder: str = ""
+    explorer_last_file: str = ""
     #: AI アシスタントがジャンプカットのつなぎ目を目立たなくする（#332）ときの既定
     #: 溶かすか寄るか・どれだけの長さかは人と作品で違う AI に値を言わなければこれを使う
     #: 既定は短いクロスフェードと 20 ms の音のフェード（絵の中身が欠けない側
@@ -1485,6 +1495,9 @@ class PreferenceStore:
                 EXPLORER_DOUBLE_CLICKS,
                 plain.explorer_double_click,
             ),
+            explorer_favorite_paths=parse_paths(data.get("explorer_favorite_paths")),
+            explorer_last_folder=_text(data.get("explorer_last_folder"), ""),
+            explorer_last_file=_text(data.get("explorer_last_file"), ""),
             seam_video=_choice(data.get("seam_video"), SEAM_VIDEOS, plain.seam_video),
             seam_crossfade_ms=_within(
                 data.get("seam_crossfade_ms"), SEAM_CROSSFADE_MS_RANGE, plain.seam_crossfade_ms

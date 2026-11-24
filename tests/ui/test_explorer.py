@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 
 from sashimono.core.material_library import (
     CATEGORY_MUSIC,
@@ -30,6 +30,9 @@ from sashimono.ui import explorer as explorer_module
 from sashimono.ui.explorer import (
     COLUMNS,
     DOUBLE_CLICK_TIMELINE,
+    FAVORITES,
+    STAR_OFF,
+    STAR_ON,
     VIEW_ICONS,
     ExplorerPanel,
 )
@@ -216,7 +219,13 @@ class TestUsingAFile:
         panel._place_button.click()
         menu = panel.build_menu([sounds / "ドン.wav"])
         names = [action.text() for action in menu.actions() if action.text()]
-        assert names == ["タイムラインへ置く", "素材一覧へ読み込む", "エクスプローラーで開く"]
+        assert names == [
+            "タイムラインへ置く",
+            "素材一覧へ読み込む",
+            "エクスプローラーで開く",
+            "お気に入りに入れる",
+            "お気に入りから外す",
+        ]
         menu.actions()[0].trigger()
         menu.actions()[1].trigger()
         assert placed == [[sounds / "ドン.wav"], [sounds / "ドン.wav"]]
@@ -424,3 +433,102 @@ class TestTheWindow:
         finally:
             window.close()
             window.deleteLater()
+
+
+class TestFavorites:
+    def test_marking_files_and_folders_puts_them_on_top(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、いつも使う効果音を毎回フォルダを辿って探すことになる
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        told: list[object] = []
+        panel.favorites_changed.connect(told.append)
+        star = COLUMNS.index("☆")
+        assert panel.cell(sounds / "ドン.wav", star) == STAR_OFF
+        # 一覧の印の列を押すと入れる・外すが切り替わる
+        panel.select_file(sounds / "ドン.wav")
+        row = panel._table.currentIndex().row()
+        panel._on_cell_clicked(panel._proxy.index(row, star))
+        assert told == [(str(sounds / "ドン.wav"),)]
+        assert panel.cell(sounds / "ドン.wav", star) == STAR_ON
+        menu = panel.build_tree_menu(sounds / "爆発")
+        enabled = {a.text(): a.isEnabled() for a in menu.actions() if a.text()}
+        assert enabled == {"お気に入りに入れる": True, "お気に入りから外す": False}
+        menu.actions()[1].trigger()
+        menu.deleteLater()
+        root = panel._tree.topLevelItem(0)
+        assert root is not None and root.text(0) == f"{STAR_ON} {FAVORITES}"
+        # 根はお気に入りのファイル、フォルダは木から中へ辿れる
+        panel._tree.setCurrentItem(root)
+        assert [p.name for p in panel.visible_files()] == ["ドン.wav"]
+        folder = root.child(0)
+        assert folder is not None and folder.text(0) == "爆発"
+        panel._tree.setCurrentItem(folder)
+        assert [p.name for p in panel.visible_files()] == ["ドカン.mp3"]
+        assert panel.location_text() == f"{FAVORITES} › 爆発"
+
+    def test_vanished_favorites_stay_and_say_so(self, panel: ExplorerPanel, tmp_path: Path) -> None:
+        # 壊れると、外付けのドライブを外しただけでお気に入りが消えるか、パネルが落ちる
+        panel.set_favorites([str(tmp_path / "無い"), str(tmp_path / "無い.wav")])
+        root = panel._tree.topLevelItem(0)
+        assert root is not None
+        child = root.child(0)
+        assert child is not None and child.text(0).endswith("（見つかりません）")
+        panel._tree.setCurrentItem(root)
+        # 消えた物はファイルかフォルダか分からない どちらも木に残し、数も知らせる
+        assert root.childCount() == 2
+        assert "2 個が見つかりません" in panel.status_text()
+        assert len(panel.favorites) == 2
+
+    def test_icons_show_the_mark_too(self, panel: ExplorerPanel, sounds: Path) -> None:
+        # 壊れると、アイコン表示に切り替えたときにどれがお気に入りか分からない
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        panel.set_favorite([sounds / "ドン.wav"], True)
+        panel.set_view_mode(VIEW_ICONS)
+        panel.select_file(sounds / "ドン.wav")
+        index = panel._icons_view.currentIndex()
+        option = QStyleOptionViewItem()
+        panel._icons_view.itemDelegate().initStyleOption(option, index)  # type: ignore[attr-defined]
+        assert option.text.startswith(STAR_ON)
+
+
+class TestLastPlace:
+    def test_the_window_reopens_where_it_was(
+        self, qt_application: QApplication, sounds: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、起動するたびに木の先頭から辿り直すことになる
+        del qt_application
+        saved: list[Preferences] = []
+        monkeypatch.setattr(PreferenceStore, "save", lambda _self, prefs: saved.append(prefs))
+        monkeypatch.setattr(
+            PreferenceStore,
+            "load",
+            lambda _self: Preferences(
+                explorer_folders=(LibraryFolder(str(sounds), CATEGORY_SOUND_EFFECT),)
+            ),
+        )
+        first = MainWindow(Project.create(), confirm_unsaved=False)
+        first._explorer.open_folder(str(sounds / "爆発"))
+        first._explorer.select_file(sounds / "爆発" / "ドカン.mp3")
+        first.close()
+        first.deleteLater()
+        assert saved
+        remembered = saved[-1]
+        assert remembered.explorer_last_folder == str(sounds / "爆発")
+        assert remembered.explorer_last_file == str(sounds / "爆発" / "ドカン.mp3")
+        monkeypatch.setattr(PreferenceStore, "load", lambda _self: remembered)
+        second = MainWindow(Project.create(), confirm_unsaved=False)
+        try:
+            assert second._explorer.location_text().endswith("› 爆発")
+            assert second._explorer.selected_files() == [sounds / "爆発" / "ドカン.mp3"]
+        finally:
+            second.close()
+            second.deleteLater()
+
+    def test_a_vanished_place_opens_from_the_top(
+        self, panel: ExplorerPanel, sounds: Path, tmp_path: Path
+    ) -> None:
+        # 壊れると、前回のフォルダが消えていたときに空の場所が開くか落ちる
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        assert not panel.restore_location(str(tmp_path / "無い"), "")
+        assert panel.restore_location(str(sounds / "爆発"), "")
