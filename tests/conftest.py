@@ -37,6 +37,7 @@ from sashimono.engine.gpu import GLContextError, OffscreenGLContext, preferred_s
 from sashimono.ui import system_clipboard
 from tests.fake_clipboard import FakeClipboard
 from tests.media_fixtures import SampleMedia, ffmpeg_available, make_sample
+from tests.offscreen_windows import hide_windows
 
 RATE_30 = FrameRate(30)
 
@@ -79,7 +80,10 @@ def qt_application() -> Iterator[QApplication]:
     existing = QApplication.instance()
     application = existing if isinstance(existing, QApplication) else QApplication([])
     QSurfaceFormat.setDefaultFormat(preferred_surface_format())
+    keeper = hide_windows(application)
     yield application
+    if keeper is not None:
+        application.removeEventFilter(keeper)
 
 
 @pytest.fixture(autouse=True)
