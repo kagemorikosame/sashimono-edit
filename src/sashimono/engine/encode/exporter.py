@@ -32,8 +32,9 @@ import numpy as np
 from OpenGL.error import Error as GLLibraryError
 
 from sashimono.core.chapters import chapters_of
-from sashimono.core.model import Project, TrackKind
+from sashimono.core.model import Project, SceneId, Timeline, TrackKind
 from sashimono.engine.audio import AudioMixer
+from sashimono.engine.audio.mixer import MAX_SCENE_DEPTH
 from sashimono.engine.colorspace import (
     VideoReformatter,
     bt709_planes,
@@ -251,16 +252,38 @@ def _audio_rate(codec: str, rate: int) -> int:
 def has_sound(project: Project) -> bool:
     """書き出したときに鳴る物があるか 音声の道を作るか・音声だけの書き出しを受けるかを決める
 
-    混合トラックは音を鳴らすクリップがあるときだけ数える 絵だけの混合トラックで音の
-    道を作ると、今まで無音の道を持たなかった書き出しに黙った音声が付く 無効にした
-    クリップはミキサが飛ばすので、同じく数えない
+    ミキサ（``AudioMixer._render_timeline``）と同じ物を数える 聞こえる音声と混合のトラックの
+    鳴らすクリップ（:meth:`Project.plays_sound`）と、映る映像トラックに置いたシーン 無効の
+    クリップはミキサが飛ばすので数えない 置いたシーンは中まで見て、鳴る物があるときだけ数える
+    ずれると、映像トラックのシーンの BGM だけが鳴る作品を音声だけで書き出せないか（PR #547 の
+    指摘）、無効のクリップしか無いトラックで無音のファイルを書く 絵だけの混合トラックで音の
+    道を作ると、今まで無音の道を持たなかった書き出しに黙った音声が付く
     """
-    return any(
-        bool(track.clips)
-        if track.kind is TrackKind.AUDIO
-        else any(clip.enabled and project.plays_sound(track, clip) for clip in track.clips)
-        for track in project.timeline.active_sound_tracks()
-    )
+    return _sounds(project, project.timeline, 0, set())
+
+
+def _sounds(project: Project, timeline: Timeline, depth: int, seen: set[SceneId]) -> bool:
+    """``timeline`` に鳴る物があるか ``seen`` はもう中を見たシーン（入れ子の輪で回り続けない）
+
+    シーンの深さの上限はミキサと同じ（:data:`MAX_SCENE_DEPTH` より深いシーンは鳴らない）
+    """
+    tracks = [
+        *timeline.active_sound_tracks(),
+        *(track for track in timeline.active_picture_tracks() if track.kind is TrackKind.VIDEO),
+    ]
+    for track in tracks:
+        for clip in track.clips:
+            if not clip.enabled or not project.plays_sound(track, clip):
+                continue
+            if clip.scene_id is None:
+                return True
+            if depth >= MAX_SCENE_DEPTH or clip.scene_id in seen:
+                continue
+            seen.add(clip.scene_id)
+            scene = project.find_scene(clip.scene_id)
+            if scene is not None and _sounds(project, scene.timeline, depth + 1, seen):
+                return True
+    return False
 
 
 def automatic_codecs(chosen: ExportFormat) -> tuple[str, ...]:

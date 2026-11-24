@@ -42,6 +42,7 @@ from sashimono.engine.encode import (
     FORMATS,
     RANGE_ALL,
     RANGE_WORK_AREA,
+    WEB_AUTOMATIC_CODECS,
     BitrateChoice,
     ExportError,
     ExportFormat,
@@ -426,10 +427,18 @@ class ExportDialog(QDialog):
     def _fill_codecs(self, codecs: list[str]) -> None:
         """確かめた候補を「コーデック」の欄へ並べる"""
         self._codec.clear()
-        if codecs:
+        # 「自動」は書き出し側が名指し無しで試す物だけから作る WebM の自動は VP9 だけで、
+        # AV1 は選べるだけ 先頭の AV1 を自動と出すと、VP9 が使えない機械で自動のまま押して
+        # 失敗する（PR #547 の指摘） 自動の候補が無ければ自動を出さず、名指しだけを並べる
+        automatic = (
+            [name for name in codecs if name in WEB_AUTOMATIC_CODECS]
+            if self._chosen_format.video == VIDEO_WEB
+            else codecs
+        )
+        if automatic:
             # 既定は名指しせず書き出し側に選ばせる 先頭を名指しで渡すと、試しには開けても
             # 作品の大きさで断られたとき（NVENC は幅 4096 まで）に次の候補へ落ちられない
-            first = CODEC_LABELS.get(codecs[0], codecs[0])
+            first = CODEC_LABELS.get(automatic[0], automatic[0])
             self._codec.addItem(f"自動（{first}、使えなければ次の候補）", AUTO_CODEC)
         for name in codecs:
             self._codec.addItem(CODEC_LABELS.get(name, name), name)

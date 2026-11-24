@@ -78,6 +78,21 @@ def test_choosing_webm_changes_the_name_and_the_codecs(qt_application: QApplicat
         dialog.deleteLater()
 
 
+def test_webm_auto_is_only_vp9(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、VP9 が使えない機械で AV1 を自動と出し、自動のまま押して失敗する"""
+    del qt_application
+    monkeypatch.setattr(export_dialog, "available_web_codecs_now", lambda _p: ["libsvtav1"])
+    dialog = settled(ExportDialog(_picture_only(), export_format="webm"))
+    try:
+        assert _codecs(dialog) == ["libsvtav1"]
+        settings = dialog._settings()
+        assert settings is not None and settings.video_codec == "libsvtav1"
+    finally:
+        dialog.deleteLater()
+
+
 def test_audio_only_hides_the_video_rows(qt_application: QApplication, sounding: Project) -> None:
     """壊れると、音声だけなのに映像のコーデックやビットレートを替えられ、効かない理由を探す"""
     del qt_application

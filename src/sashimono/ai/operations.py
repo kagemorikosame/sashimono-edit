@@ -503,6 +503,7 @@ from sashimono.engine.encode import (
     DEFAULT_BITRATE_MBPS,
     RANGE_ALL,
     RANGE_WORK_AREA,
+    WEB_AUTOMATIC_CODECS,
     WEB_VIDEO_CODECS,
     available_video_codecs,
     available_web_codecs,
@@ -10712,7 +10713,8 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
     raw_bitrate = arguments.get("bitrate_mbps")
     if chosen.audio_only:
         # 音声だけの形式（#527）は映像を書かない 映像の引数を受けると効いたと思わせる
-        if raw_codec != AUTO or raw_bitrate is not None:
+        # 値ではなく渡したかで見る codec="auto" も渡した物なので断る（PR #547 の指摘）
+        if "codec" in arguments or "bitrate_mbps" in arguments:
             raise ToolError(
                 f"{path.suffix} は音声だけの書き出しです codec と bitrate_mbps は渡さないでください"
                 "（音質は audio_kbps）"
@@ -10733,6 +10735,16 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
         if raw_codec != AUTO and raw_codec not in codecs:
             raise ToolError(
                 f"codec は {AUTO} か、{path.suffix} で使える物（{', '.join(codecs)}）から"
+                "選んでください"
+            )
+        if (
+            raw_codec == AUTO
+            and chosen.video == VIDEO_WEB
+            and not (set(codecs) & set(WEB_AUTOMATIC_CODECS))
+        ):
+            # WebM の自動は VP9 だけ（AV1 へは落とさない） 使えないのに許すと書き出しで失敗する
+            raise ToolError(
+                f"この機械では VP9 を使えません .webm の codec は {', '.join(codecs)} から"
                 "選んでください"
             )
         codec = None if raw_codec == AUTO else raw_codec

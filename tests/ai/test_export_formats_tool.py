@@ -84,6 +84,7 @@ def test_webm_offers_vp9_and_av1(saved: FakeHost, web_codecs: list[str]) -> None
     ("arguments", "message"),
     [
         ({"path": "a.wav", "codec": "libx264"}, "音声だけ"),
+        ({"path": "a.mp3", "codec": "auto"}, "音声だけ"),
         ({"path": "a.flac", "bitrate_mbps": 8}, "音声だけ"),
         ({"path": "a.mp4", "audio_kbps": 320}, "audio_kbps"),
         ({"path": "a.wav", "audio_kbps": 320}, "audio_kbps"),
@@ -107,6 +108,16 @@ def test_wrong_choices_are_refused_before_asking(
     assert seen == []
     assert isinstance(box.get("error"), ToolError)
     assert message in str(box["error"])
+    assert saved.exports == []
+
+
+def test_webm_auto_without_vp9_is_refused(saved: FakeHost, monkeypatch: pytest.MonkeyPatch) -> None:
+    """壊れると、VP9 の無い機械で自動の WebM を許し、書き出しで失敗する"""
+    monkeypatch.setattr(operations, "available_web_codecs", lambda: ["libsvtav1"])
+    bridge = allow_sending(EditorBridge(saved, auto_approve=True))
+    seen, box = _run(bridge, EXPORT, {"path": "a.webm"})
+    assert seen == []
+    assert "VP9" in str(box.get("error"))
     assert saved.exports == []
 
 

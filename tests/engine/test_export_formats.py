@@ -7,13 +7,23 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import av
 import pytest
 
-from sashimono.core.commands import AddClip, AddTrack, Document, insert_media
-from sashimono.core.model import Clip, Project, ProjectSettings, Track, TrackKind
+from sashimono.core.commands import AddClip, AddScene, AddTrack, Document, insert_media
+from sashimono.core.model import (
+    Clip,
+    MediaId,
+    Project,
+    ProjectSettings,
+    Scene,
+    Timeline,
+    Track,
+    TrackKind,
+)
 from sashimono.core.timebase import FrameRate
 from sashimono.engine import gpu
 from sashimono.engine.decode import probe_media
@@ -118,6 +128,42 @@ class TestTheTable:
     def test_chapters_only_where_the_container_holds_them(self) -> None:
         """壊れると、章を持てない入れ物へ渡して多重化に断られ、書き出しごと失敗する"""
         assert {item.key for item in FORMATS if item.chapters} == {"mp4", "mov", "mkv"}
+
+
+def _with_scene(sound_inside: bool, kind: TrackKind) -> Project:
+    """``kind`` のトラックにシーンを 1 つ置いた作品 シーンの中は音のクリップか絵だけ"""
+    inner_kind = TrackKind.AUDIO if sound_inside else TrackKind.VIDEO
+    inner = Clip(timeline_start=0, duration=SECOND, media_id=MediaId("音"))
+    scene = Scene("BGM", Timeline(rate=FrameRate(30), tracks=(Track(inner_kind, "中", (inner,)),)))
+    project = AddScene(scene).apply(Project.create())
+    track = Track(kind, "外")
+    project = AddTrack(track).apply(project)
+    return AddClip(track.id, Clip(timeline_start=0, duration=SECOND, scene_id=scene.id)).apply(
+        project
+    )
+
+
+class TestHasSound:
+    """鳴る物の判定はミキサと同じ物を数える（PR #547 の指摘）"""
+
+    def test_a_scene_on_a_video_track_sounds(self) -> None:
+        """壊れると、映像トラックのシーンの BGM だけが鳴る作品を音声だけで書き出せない"""
+        assert has_sound(_with_scene(True, TrackKind.VIDEO))
+
+    def test_a_scene_without_sound_is_silent(self) -> None:
+        """壊れると、絵だけのシーンを置いた作品で無音のファイルを書く"""
+        assert not has_sound(_with_scene(False, TrackKind.VIDEO))
+        assert not has_sound(_with_scene(False, TrackKind.AUDIO))
+
+    def test_disabled_clips_are_silent(self) -> None:
+        """壊れると、無効のクリップしか無い音声トラックで無音のファイルを書く"""
+        clip = Clip(timeline_start=0, duration=SECOND, media_id=MediaId("音"), enabled=False)
+        project = AddTrack(Track(TrackKind.AUDIO, "A1", (clip,))).apply(Project.create())
+        assert not has_sound(project)
+        enabled = AddTrack(Track(TrackKind.AUDIO, "A1", (replace(clip, enabled=True),))).apply(
+            Project.create()
+        )
+        assert has_sound(enabled)
 
 
 class TestBuildSettings:
