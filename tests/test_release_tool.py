@@ -1599,7 +1599,14 @@ class TestBill:
 
     @pytest.mark.parametrize(
         "previous",
-        [b'{"metadata": null, "components": []}', b"[]", b'{"metadata": {}, "components": [1]}'],
+        [
+            b'{"metadata": null, "components": []}',
+            b"[]",
+            b'{"metadata": {}, "components": [1]}',
+            # 版は読めるが、中のファイルのハッシュの並びが空
+            b'{"metadata": {"component": {"version": "1.2.2"}},'
+            b' "components": [{"name": "x", "components": [{"name": "a.dll", "hashes": []}]}]}',
+        ],
     )
     def test_a_broken_previous_bill_does_not_stop(
         self,

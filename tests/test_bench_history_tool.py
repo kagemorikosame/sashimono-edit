@@ -260,6 +260,21 @@ class TestCompare:
         assert "測れなかった回 2" in tool.report(tool.compare(base, target))
         assert "測れなかった回 2" in tool.describe(target)
 
+    def test_a_skipped_bench_still_shows_its_failures(self, tool: ModuleType) -> None:
+        """飛ばした回があるときに落ちた理由まで隠すと、素材を作れなかったのか見分けられない"""
+        runs = _runs([10.0] * 3)
+        failed = _record({"gop1": 1.0})
+        failed["items"][0]["status"] = "failed"
+        runs.append({"run": 4, **failed})
+        runs.append({"run": 5, "status": "failed", "reason": "素材を作れない"})
+        skipped = _record({}, status="skipped")
+        skipped["reason"] = "ffmpeg が無い"
+        runs.append({"run": 6, **skipped})
+        shown = tool.describe(_history("0.2.7", "2026-11-24", {"seek": runs}))
+        assert "飛ばした（ffmpeg が無い）" in shown
+        assert "素材を作れない" in shown
+        assert "測れなかった回 1" in shown
+
     def test_only_failures_exit_zero(
         self, tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

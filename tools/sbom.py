@@ -428,7 +428,10 @@ def unclaimed(names: list[str], used: set[str], parts: list[Found]) -> list[str]
     物と見る ``_internal`` の直下の DLL は Python 本体と実行時の部品の名前の型（:data:`ROOT_DLLS`）
     だけを許す 直下の ``.pyd`` は標準ライブラリと包みの拡張で、Python が読む物
     """
-    tops = set(build_package.NATIVE_FOLDERS)
+    tops: set[str] = set()
+    # DLL を 1 つずつ部品へ当てるフォルダ（av.libs と lupa）は、当てたファイルだけを許す
+    # 頭のフォルダで許すと、当てる走査が見ない下のフォルダの DLL が、部品もハッシュも無いまま通る
+    assigned = {f"{_APP}/{path}" for part in parts for path in part.files}
     for part in parts:
         # 置き場の頭のフォルダ（``_internal/OpenGL/DLLS/`` なら OpenGL） 直下（Python）は数えない
         if part.evidence.startswith(_INTERNAL):
@@ -452,6 +455,13 @@ def unclaimed(names: list[str], used: set[str], parts: list[Found]) -> list[str]
             found.append(f"_internal/{inner} がどの部品の物か決まっていない")
             continue
         top = inner.split("/", 1)[0]
+        if top in build_package.NATIVE_FOLDERS:
+            # lupa の直下の Lua 5.x の拡張は lupa の包みの物（写しは lupa の dist-info にある）
+            lupa_own = top == "lupa" and inner.count("/") == 1 and "lupa" in used
+            if name in assigned or lupa_own:
+                continue
+            found.append(f"_internal/{inner} がどの部品の物か決まっていない")
+            continue
         imported = {IMPORT_FOLDERS.get(key, key) for key in used}
         if top in tops or top in imported or canonical_name(top) in used:
             continue

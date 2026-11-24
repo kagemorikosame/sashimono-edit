@@ -929,7 +929,8 @@ class Release:
             # 中身を辿る所まで含めて、読めないのと同じに扱う
             before = previous["metadata"]["component"]["version"]
             lines = sbom.differences(previous, current)
-        except (OSError, ValueError, sbom.BomError, KeyError, TypeError, AttributeError) as exc:
+        # LookupError は欠けた欄（KeyError）と空のハッシュの並び（IndexError）の両方を受ける
+        except (OSError, ValueError, sbom.BomError, LookupError, TypeError, AttributeError) as exc:
             return [f"[--] 前に公開した版の部品の一覧を読めず、比べていない（{exc!r}）"]
         return [f"{before} から: {line}" for line in lines] or [f"{before} から: 部品の違いは無い"]
 

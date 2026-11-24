@@ -171,6 +171,10 @@ class TestGenerate:
         [
             "Sashimono/_internal/unlisted.dll",
             "Sashimono/_internal/stranger/helper.dll",
+            # 部品へ当てる走査は av.libs の直下だけを見る
+            # 下のフォルダの DLL を頭のフォルダの名前で許さない
+            "Sashimono/_internal/av.libs/nested/libnew.dll",
+            "Sashimono/_internal/lupa/nested/lua.pyd",
             "Sashimono/tool.exe",
         ],
     )

@@ -497,10 +497,8 @@ def describe(data: dict[str, Any]) -> str:
     for name, entry in sorted(data.get("benches", {}).items()):
         summary = summarize(name, entry)
         head = f"{name}" + (f"（GPU {summary.gpu}）" if summary.gpu else "")
-        if summary.skipped:
-            lines.append(f"{head}: 飛ばした（{summary.skipped}）")
-            continue
-        lines.append(head)
+        # 飛ばした回があっても、落ちた回の理由と項目ごとの数は出す（比べないのは compare の側）
+        lines.append(f"{head}: 飛ばした（{summary.skipped}）" if summary.skipped else head)
         for failure in summary.failures:
             lines.append(f"  落ちた {failure}")
         for item in summary.items.values():
