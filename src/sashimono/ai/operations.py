@@ -10179,6 +10179,10 @@ def still_plan(host: EditorHost, arguments: dict[str, Any]) -> StillPlan:
         f" PNG にし、作品のフォルダの {STILLS_FOLDER} に書いて素材一覧へ読み込みます",
         f"再生ヘッド（{host.playhead} フレーム）へ置きます" if place else "",
         f"作品のフォルダに {STILLS_FOLDER} フォルダを作ります" if making else "",
+        # 描くタイムラインを確かめの中身に入れる 許した後に作り直した確かめと照らすので、
+        # 確かめの窓が出ている間に別のシーンへ切り替えると食い違って断られる 入れないと、
+        # 同じコマ・同じ大きさなら同じ中身になり、許していないシーンの絵を書いて置く
+        f"描くタイムライン: {_timeline_label(host)}",
     ]
     _refuse_elsewhere()
     return StillPlan(
@@ -10257,6 +10261,15 @@ def write_and_import_still(
     }
 
 
+def _timeline_label(host: EditorHost) -> str:
+    """確かめに出す、描くタイムラインの名前 メインかシーンの名前と ID"""
+    scene_id = host.active_scene
+    if scene_id is None:
+        return "メイン"
+    scene = host.document.project.find_scene(scene_id)
+    return f"シーン {scene.name if scene is not None else ''}（{scene_id}）"
+
+
 def _still_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     return still_consent(host, arguments)
 
@@ -10271,17 +10284,23 @@ def _freeze_frame(host: EditorHost, arguments: dict[str, Any]) -> object:
     _, clip = _target_clip(host, arguments)
     frame = _frame_argument(arguments, "frame", host.playhead)
     command = FreezeFrame(clip.id, frame)
+    # 先に試して断る理由を AI へ返す 試した結果の ID は使わない 割るたびに後ろの片割れへ
+    # 新しい ID が振られるので、試した作品の ID は本物の作品に無い
     try:
-        after = command.apply(_project(host))
+        command.apply(_project(host))
     except (ValueError, KeyError) as exc:
         raise ToolError(str(exc)) from exc
+    track = _project(host).timeline.locate_clip(clip.id)
+    track_id = track[0].id if track is not None else None
     host.apply_commands([command], "このコマで止める")
+    # 当てた後の作品から取り直す 止めた後ろの片割れは同じトラックの frame から始まる
     held = next(
         (
             c
-            for track in after.timeline.tracks
-            for c in track.clips
-            if c.media_id == clip.media_id and c.timeline_start == frame and c.hold_at is not None
+            for t in _project(host).timeline.tracks
+            if t.id == track_id
+            for c in t.clips
+            if c.timeline_start == frame and c.hold_at is not None
         ),
         None,
     )
@@ -14943,6 +14962,8 @@ OPERATIONS: tuple[Operation, ...] = (
         consent=_still_consent,
         sends=_WITH_FILES,
         preview=from_arguments(),
+        # PNG を書くだけでなく素材一覧へ読み込み、置く 直しの回数の上限（#339）の後は断る
+        edits=True,
         name_keys=frozenset({"file"}),
     ),
     Operation(

@@ -28,6 +28,7 @@ from sashimono.core.commands.fixed import (
     TRANSFORM_EFFECT_KIND,
     VOLUME_EFFECT_KIND,
 )
+from sashimono.core.commands.insert import media_alone
 from sashimono.core.io import media_memory
 from sashimono.core.io.media_memory import MediaMemory, fingerprint, with_remembered
 from sashimono.core.io.serialize import project_from_dict, project_to_dict
@@ -357,6 +358,27 @@ class TestSaved:
         assert reopened.media[0].defaults is None
 
 
+class TestBrokenValues:
+    def test_a_broken_effect_value_drops_only_the_defaults(self, tuned: Project) -> None:
+        # 壊れると、既定の中の 1 つの値の形の違いで作品ごと開けなくなる
+        data = project_to_dict(_remembered(tuned, _picture(tuned).id))
+        data["media"][0]["defaults"]["picture"] = [
+            {"kind": "transform", "params": {"pos_x": ["bad"]}, "fixed": True}
+        ]
+        reopened = project_from_dict(data)
+        assert reopened.media[0].defaults is None
+        assert reopened.timeline == project_from_dict(project_to_dict(tuned)).timeline
+
+    def test_media_alone_ignores_the_defaults(self, video_media: MediaItem) -> None:
+        # 壊れると、素材の場面の説明の絵が、素材の頭のずれのぶん後ろのコマを描く
+        remembered = replace(video_media, defaults=MediaDefaults(offset=Fraction(2), opacity=0.3))
+        alone = media_alone(ProjectSettings(frame_rate=RATE_30), remembered)
+        clips = [c for _, c in _clips(alone)]
+        assert clips
+        assert {c.source_in for c in clips} == {Fraction(0)}
+        assert all(c.opacity == AnimatedValue(1.0) for c in clips)
+
+
 class TestMemory:
     """作品をまたいで本人の置き場に覚える分"""
 
@@ -388,6 +410,32 @@ class TestMemory:
         moved.parent.mkdir()
         moved.write_bytes(sound_file.read_bytes())
         assert fingerprint(moved) == fingerprint(sound_file)
+
+    def test_a_file_that_differs_only_in_the_middle_is_not_mistaken(self, tmp_path: Path) -> None:
+        # 壊れると、頭と尻が同じ無音の録音どうしで、別の素材に覚えた音量や頭のずれが当たる
+        size = media_memory.SAMPLE_BYTES * 6
+        quiet = bytearray(size)
+        loud = bytearray(size)
+        # 中ほどの 1 MiB だけが違う（間の話し声だけが違う録音） 標本の間隔より広い違いは見つける
+        middle = media_memory.SAMPLE_BYTES
+        loud[size // 2 - middle // 2 : size // 2 + middle // 2] = b"\x7f" * middle
+        first, second = tmp_path / "無音1.wav", tmp_path / "無音2.wav"
+        first.write_bytes(bytes(quiet))
+        second.write_bytes(bytes(loud))
+        assert fingerprint(first) != fingerprint(second)
+
+    def test_broken_effect_values_are_dropped_from_the_memory(
+        self, tmp_path: Path, defaults: MediaDefaults
+    ) -> None:
+        # 壊れると、手で書き換えた置き場の 1 件で、素材を読み込むたびに落ちる
+        path = tmp_path / "memory.json"
+        MediaMemory(path).remember("k", "効果音", defaults)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["entries"]["k"]["defaults"]["sounds"] = [
+            {"stream": 0, "effects": [{"kind": "audio_volume", "params": {"volume": ["bad"]}}]}
+        ]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        assert MediaMemory(path).recall("k") is None
 
     def test_a_different_file_is_not_mistaken(self, tmp_path: Path, sound_file: Path) -> None:
         # 壊れると、別の素材に覚えた置き方が当たり、思わぬ位置や音量で置かれる

@@ -622,7 +622,21 @@ def media_defaults_to_json(defaults: MediaDefaults) -> dict[str, Any]:
 
 
 def media_defaults_from_json(raw: object) -> MediaDefaults:
-    """:func:`media_defaults_to_json` の逆 形の違う物は :class:`ProjectFileError`"""
+    """:func:`media_defaults_to_json` の逆 形の違う物は :class:`ProjectFileError`
+
+    中のエフェクトの値の形の違い（数の欄に配列など）で出る :class:`ValueError` と
+    :class:`TypeError` もここでまとめて直す 出したままだと、作品を開く側が既定だけを
+    捨てられずに作品ごと開けなくなる
+    """
+    try:
+        return _media_defaults(raw)
+    except ProjectFileError:
+        raise
+    except (ValueError, TypeError) as error:
+        raise ProjectFileError(f"置き方の既定が壊れている: {error}") from error
+
+
+def _media_defaults(raw: object) -> MediaDefaults:
     data = _require(raw, "defaults")
     sounds = []
     for entry in _get_list(data, "sounds"):
@@ -636,16 +650,13 @@ def media_defaults_from_json(raw: object) -> MediaDefaults:
     if native_size is not None and not isinstance(native_size, bool):
         raise ProjectFileError(f"native_size が真偽ではない: {native_size!r}")
     offset = data.get("offset")
-    try:
-        return MediaDefaults(
-            picture=tuple(effect_from_json(effect) for effect in _get_list(data, "picture")),
-            opacity=None if opacity is None else float(opacity),
-            native_size=native_size,
-            sounds=tuple(sorted(sounds, key=lambda pair: pair[0])),
-            offset=None if offset is None else _fraction_from_json(offset, "offset"),
-        )
-    except ValueError as error:
-        raise ProjectFileError(f"置き方の既定が壊れている: {error}") from error
+    return MediaDefaults(
+        picture=tuple(effect_from_json(effect) for effect in _get_list(data, "picture")),
+        opacity=None if opacity is None else float(opacity),
+        native_size=native_size,
+        sounds=tuple(sorted(sounds, key=lambda pair: pair[0])),
+        offset=None if offset is None else _fraction_from_json(offset, "offset"),
+    )
 
 
 def _media_place(

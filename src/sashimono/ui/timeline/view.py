@@ -1971,6 +1971,7 @@ class TimelineView(QWidget):
             if (
                 media is not None
                 and media.has_video
+                and not media.is_still
                 and located_hit is not None
                 and self._project.draws_picture(located_hit[0], hit[1])
             ):

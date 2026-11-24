@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+import sys
 from pathlib import Path
 
 import pytest
@@ -42,7 +42,15 @@ def _make(host: FakeHost, **arguments: object) -> dict[str, object]:
     return write_and_import_still(host, plan, consent, host.apply_commands)
 
 
+#: AI がファイルを書けるのは、書く先のフォルダを書き終えるまで持てる Windows だけ
+#: （pin_holds_the_folder） 書けることを見る試験にだけ付け、断る試験には付けない
+WINDOWS_WRITES = pytest.mark.skipif(
+    sys.platform != "win32", reason="AI がファイルを書くのは Windows だけ（pin_holds_the_folder）"
+)
+
+
 class TestSnapshotToMedia:
+    @WINDOWS_WRITES
     def test_the_png_goes_to_the_stills_folder_and_into_the_pool(self, host: FakeHost) -> None:
         # 壊れると、AI が素材にした静止画が作品のフォルダの外へ書かれるか、素材一覧に出ず使えない
         before = len(host.document.project.media)
@@ -54,6 +62,7 @@ class TestSnapshotToMedia:
         # 置くと頼まなければタイムラインは変えない
         assert result["clip_ids"] == []
 
+    @WINDOWS_WRITES
     def test_placing_puts_the_still_for_the_set_length(self, host: FakeHost) -> None:
         # 壊れると、置いた静止画が再生ヘッドからずれるか、設定した長さにならない
         host.seek(30)
@@ -69,6 +78,7 @@ class TestSnapshotToMedia:
         )
         assert (clip.timeline_start, clip.duration) == (30, host.still_frames)
 
+    @WINDOWS_WRITES
     def test_a_second_still_of_the_same_frame_gets_a_new_name(self, host: FakeHost) -> None:
         # 上書きすると、先に置いた静止画の絵が後から黙って変わる
         first = Path(str(_make(host, frame=0)["file"]))
@@ -76,6 +86,7 @@ class TestSnapshotToMedia:
         assert first != second
         assert first.is_file() and second.is_file()
 
+    @WINDOWS_WRITES
     def test_one_undo_takes_back_the_import_and_the_clip(self, host: FakeHost) -> None:
         # 壊れると、取り消しても読み込んだ素材か置いた静止画が残り、何回も戻す羽目になる
         before = host.document.project
@@ -97,6 +108,23 @@ class TestSnapshotToMedia:
         (host.saved_at.parent / STILLS_FOLDER).write_text("", encoding="utf-8")
         with pytest.raises(ToolError, match="ファイルがある"):
             still_plan(host, {})
+
+    @WINDOWS_WRITES
+    def test_the_consent_names_the_timeline_it_draws(self, host: FakeHost) -> None:
+        # 壊れると、確かめの窓が出ている間に別のシーンへ切り替えても、許した時と同じ中身に
+        # 見えて照らしを通り、許していないシーンの絵を書いて置く
+        from sashimono.core.commands import AddScene
+        from sashimono.core.model import Clip, Scene, Timeline, Track, TrackKind
+
+        main = still_consent(host, {})
+        # 中身の無いシーンは静止画にできずに断るので、1 本置いたシーンを足して開く
+        track = Track(TrackKind.VIDEO, "V1", (Clip(timeline_start=0, duration=30),))
+        scene = Scene("場面", Timeline(rate=host.document.project.rate, tracks=(track,)))
+        host.apply_commands([AddScene(scene)], "シーン")
+        host.set_active_scene(scene.id)
+        inside = still_consent(host, {})
+        assert "メイン" in main.detail
+        assert main.detail != inside.detail
 
     def test_a_frame_that_is_not_a_number_is_refused(self, host: FakeHost) -> None:
         # 壊れると、AI が渡した文字のフレームで落ちるか、意図しないコマを描く
@@ -120,6 +148,11 @@ class TestFreezeFrameTool:
         result = operation(host, {"clip_id": str(video.id), "frame": 15})
         assert isinstance(result, dict)
         assert result["hold_seconds"] == 0.5
+        # 返した ID が本物の作品にあり、そのクリップが止まっている 試した作品の ID を返すと、
+        # 続けてその ID を指す編集が「クリップが見つからない」で落ちる
+        held = host.document.project.timeline.locate_clip(result["held_clip_id"])
+        assert held is not None
+        assert held[1].hold_at is not None
 
     def test_a_text_clip_is_refused(self, host: FakeHost) -> None:
         # 壊れると、止める絵の無いテキストに止めた印だけ付き、何も変わらず理由も分からない
@@ -130,6 +163,7 @@ class TestFreezeFrameTool:
         )
         operation = find_operation("freeze_frame")
         assert operation is not None
+        before = host.document.project
         with pytest.raises(ToolError, match="動画の絵"):
             operation(host, {"clip_id": str(text.id), "frame": 0})
-        assert replace(host.document.project) == host.document.project
+        assert host.document.project == before

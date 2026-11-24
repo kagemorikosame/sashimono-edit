@@ -29,6 +29,8 @@ from sashimono.core.userdirs import config_root
 
 __all__ = [
     "MEMORY_LIMIT",
+    "MIDDLE_SAMPLES",
+    "MIDDLE_SAMPLE_BYTES",
     "SAMPLE_BYTES",
     "MediaMemory",
     "fingerprint",
@@ -38,6 +40,11 @@ __all__ = [
 #: 中身の見分けに読む頭と尻の大きさ（バイト） 1 MiB ずつなら、読み込みのたびに読んでも
 #: 1 本あたり数ミリ秒で済む 小さすぎると、頭に同じ見出しを持つ録画どうしを取り違える
 SAMPLE_BYTES = 1 << 20
+
+#: 頭と尻の間から読む標本の数と 1 つの大きさ（バイト） 頭と尻が同じ無音の WAV のように、
+#: 中ほどだけが違う同じ大きさの素材を取り違えないため 全体を読むと長い動画で読み込みが待たされる
+MIDDLE_SAMPLES = 8
+MIDDLE_SAMPLE_BYTES = 64 << 10
 
 #: 覚えておく素材の数 越えたら古く覚えた物から忘れる 置き場のファイルが際限なく育つと、
 #: 読み込みのたびに読む時間が延びる
@@ -60,6 +67,11 @@ def fingerprint(path: Path) -> str | None:
             digest.update(size.to_bytes(8, "little"))
             digest.update(file.read(SAMPLE_BYTES))
             if size > SAMPLE_BYTES * 2:
+                # 頭と尻の間を等しい間隔で区切った所から少しずつ読む
+                span = size - SAMPLE_BYTES * 2
+                for index in range(1, MIDDLE_SAMPLES + 1):
+                    file.seek(SAMPLE_BYTES + span * index // (MIDDLE_SAMPLES + 1))
+                    digest.update(file.read(MIDDLE_SAMPLE_BYTES))
                 file.seek(size - SAMPLE_BYTES)
                 digest.update(file.read(SAMPLE_BYTES))
             elif size > SAMPLE_BYTES:
@@ -85,7 +97,8 @@ class MediaMemory:
             return None
         try:
             defaults = media_defaults_from_json(entry.get("defaults"))
-        except ProjectFileError:
+        except (ProjectFileError, ValueError, TypeError):
+            # 手で書き換えた値や前の版の形で落とさない 覚えた既定が効かないだけにする
             return None
         return None if defaults.is_empty else defaults
 

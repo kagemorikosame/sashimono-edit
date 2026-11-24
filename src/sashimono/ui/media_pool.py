@@ -327,8 +327,16 @@ class MediaPoolWidget(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, str(media.id))
             item.setData(_BASE_TEXT, _describe(media, project.rate))
             # アイコン表示でも HDR の印は名前の下に出す 補足だけにすると、指すまで気付かない
-            outside = media.color_outside_sdr
-            item.setData(_NAME_TEXT, f"{media.name}\n{outside}" if outside else media.name)
+            # 置き方の既定（#524）の印も同じく名前の下に出す 一覧表示だけだと、アイコン表示で
+            # 置いた素材がなぜ初めから位置や音量の違う形で置かれるのか分からない
+            marks = [
+                mark
+                for mark in (media.color_outside_sdr, "既定あり" if media.defaults else "")
+                if mark
+            ]
+            item.setData(
+                _NAME_TEXT, "\n".join((media.name, " / ".join(marks))) if marks else media.name
+            )
             item.setIcon(self._icon_for(media))
             self._show_note(item, media)
             self._list.addItem(item)

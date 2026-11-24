@@ -807,12 +807,12 @@ AI のパネルの会話の欄に「引き継ぎ」として残し、欄の下�
   `_keep_within_budget`）の後、送る前の同意と確かめの窓より先（断ると決まった道具のために尋ねない） 作品を変えない
   取り消し・やり直し・書き出しの中止（`undo` `redo` `cancel_export` `ai/fixes.py` の `PASSES_AFTER_LIMIT`）と、
   取り消せない保存と書き出し（`save_project` `save_project_as` `export_video` `export_subtitles`
-  `save_snapshot` 持ち出し用パッケージの `export_package` #423 静止画を素材にする `snapshot_to_media`
-  #525）と、取り消せない開く・新規（`open_project`
+  `save_snapshot` 持ち出し用パッケージの `export_package` #423）と、取り消せない開く・新規（`open_project`
   `new_project` #349 `open_package` #423）は通す どれも毎回確かめの窓を
   出し、開く・新規の後はその指示の編集を `Document.replaced_in_checkpoint` で断るので、直しの続きにはならない
   取り消せない操作でも作品を変える物（`Operation.edits` ナレーションの `generate_narration` #335 は
-  WAV を書いて声と字幕を置く）は、取り消せる編集と同じく断る 同じ指示の中で開く・新規をした後も、
+  WAV を書いて声と字幕を置く 静止画を素材にする `snapshot_to_media` #525 は PNG を書いて読み込み、
+  置く）は、取り消せる編集と同じく断る 同じ指示の中で開く・新規をした後も、
   確かめの窓を出す前に断る（ブリッジの `_refuse_after_reopen` 置く所で断ると書いた WAV だけが残る）
 - 色とノイズの自動補正（#336 `auto_color` `reduce_noise`）は作品を変える取り消せる編集なので、
   上限の後は断る側に入れる（`PASSES_AFTER_LIMIT` に足さない） `FIXES` の直し方にも足さない

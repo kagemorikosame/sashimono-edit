@@ -134,6 +134,9 @@ def media_alone(settings: ProjectSettings, media: MediaItem) -> Project:
     する置き方（``native_size``）で枠いっぱいに出すため 作品の大きさのままだと、縦の
     素材や小さい素材が黒い縁の中に小さく出る 映像の無い素材は空の作品になる
     """
+    # 置き方の既定（#524）は当てない 素材の時刻 t 秒を作品の t 秒に描く決まりが、頭のずれで
+    # 崩れる（頭のずれ 2 秒の素材で 5 秒を頼むと 7 秒を描く） 不透明度なども素材の絵ではない
+    media = replace(media, defaults=None)
     if not media.has_video:
         return Project.create(settings, media=(media,))
     width, height = media.video_streams[0].display_size

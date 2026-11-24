@@ -80,8 +80,17 @@ class FreezeFrame(Command):
             raise KeyError(f"クリップが見つからない: {self.clip_id}")
         track, clip = located
         media = None if clip.media_id is None else project.find_media(clip.media_id)
-        if media is None or not media.has_video or not project.draws_picture(track, clip):
+        if (
+            media is None
+            or not media.has_video
+            or media.is_still
+            or not project.draws_picture(track, clip)
+        ):
             raise ValueError("止められるのは動画の絵を描くクリップだけ")
+        # 頭で止めるときは割らないので、割る命令のロックの確かめを通らない 先に確かめないと、
+        # 同じ操作がロックしたトラックで再生ヘッドの位置によって通ったり断られたりする
+        if track.locked:
+            raise ValueError(f"トラック {track.name or track.id} はロックしているので止められない")
         if not clip.timeline_start <= self.frame < clip.timeline_end:
             raise ValueError(
                 f"止める位置がクリップの内側にない: {self.frame} は "

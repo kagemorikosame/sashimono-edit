@@ -28,6 +28,7 @@ from sashimono.core.model import (
     ProjectSettings,
     Track,
     TrackKind,
+    VideoStreamInfo,
 )
 from tests.conftest import RATE_30
 
@@ -102,6 +103,28 @@ class TestFreezeFrame:
         project = _placed(video_media)
         with pytest.raises(ValueError, match="内側にない"):
             FreezeFrame(_picture(project).id, 9999).apply(project)
+
+    def test_a_locked_track_is_refused_at_the_head_too(self, video_media: MediaItem) -> None:
+        # 壊れると、ロックしたトラックの絵が、再生ヘッドがクリップの頭にあるときだけ止まる
+        project = _placed(video_media)
+        picture = _picture(project)
+        track = next(t for t, c in _clips(project) if c.id == picture.id)
+        locked = project.with_timeline(project.timeline.replace_track(replace(track, locked=True)))
+        for frame in (picture.timeline_start, 60):
+            with pytest.raises(ValueError, match="ロック"):
+                FreezeFrame(picture.id, frame).apply(locked)
+
+    def test_a_still_image_is_refused(self) -> None:
+        # 壊れると、動かない静止画に止めた印だけ付き、何も変わらない
+        still = MediaItem(
+            path=Path("C:/素材/表紙.png"),
+            video_streams=(VideoStreamInfo(0, 640, 360, RATE_30, Fraction(1, 30), "png"),),
+        )
+        project = Project.create(ProjectSettings(frame_rate=RATE_30), media=(still,))
+        project = _apply(project, place_media(project, [still], at_frame=0))
+        ((_, clip),) = _clips(project)
+        with pytest.raises(ValueError, match="動画の絵"):
+            FreezeFrame(clip.id, 10).apply(project)
 
     def test_a_sound_or_text_clip_is_refused(
         self, video_media: MediaItem, audio_media: MediaItem
