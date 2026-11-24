@@ -70,6 +70,8 @@ OWN_LIBRARY = {
     "seam_style",
     # ナレーション（#335）のエンジンの場所と既定の声 使う道具は sends にアプリの設定を書く
     "narration_settings",
+    # 静止画を置く長さ（#525） 本人の設定の秒をフレームへ直した数だけ 名前も場所も返さない
+    "still_frames",
     # 色と雑音の自動補正の強さ・下げる量の既定（#336）
     "auto_color_strength",
     "denoise_reduction",
@@ -177,6 +179,8 @@ PROJECT_SIDE = {
     # （作品の場所の下なので伏せ字の表に直に入る）で、書いた場所は remembered_names からも返す
     "make_narration_folder",
     "write_narration",
+    # 静止画を素材にする（#525） 書くのは作品のフォルダの stills だけ 返すのはそのフォルダの場所
+    "make_still_folder",
     "start_export",
     "export_waiter",
     "cancel_export",

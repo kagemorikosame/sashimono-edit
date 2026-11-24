@@ -90,6 +90,9 @@ from sashimono.ai.operations import (
     narration_consent,
     narration_plan,
     remember_voice_catalog,
+    still_consent,
+    still_plan,
+    write_and_import_still,
     write_and_place_narration,
 )
 from sashimono.ai.outbound import Outbound, SendChoice
@@ -102,21 +105,25 @@ from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core import userdirs
 from sashimono.core.clipboard import ClipboardContent
 from sashimono.core.commands import (
+    STILLS_FOLDER,
     AddClip,
     AddMedia,
     AddScene,
     Author,
     Command,
     Document,
+    FreezeFrame,
     InScene,
     ParamPath,
     RemoveMedia,
     RemoveScene,
     RenameScene,
     SetBlending,
+    SetMediaDefaults,
     SetResolution,
     SetStyleGuide,
     convert_layers,
+    defaults_from_clip,
     insert_filter,
     insert_generated,
     insert_media,
@@ -164,6 +171,7 @@ from sashimono.core.io import (
 )
 from sashimono.core.io.atomic import Expected, expect_now, write_atomic_bytes
 from sashimono.core.io.library import Library
+from sashimono.core.io.media_memory import MediaMemory, fingerprint, with_remembered
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
 from sashimono.core.mixing import (
@@ -179,6 +187,7 @@ from sashimono.core.model import (
     EffectId,
     GeneratedSource,
     LayerMode,
+    MediaDefaults,
     MediaId,
     MediaItem,
     Project,
@@ -663,6 +672,8 @@ class MainWindow(QMainWindow):
         #: 並べて走らせると、後から頼んだ方が先に置かれることがあり、置く順が
         #: 頼んだ順と食い違う
         self._import: ProbeBatch | None = None
+        #: 作品をまたいで覚える素材の置き方の既定（#524）
+        self._media_memory = MediaMemory()
         #: 待っている読み込み パスと、タイムラインへ落とされた位置（落とされていなければ ``None``）
         self._import_queue: list[tuple[list[Path], _DropTarget | None]] = []
         #: タイムラインへ落とされた読み込みの、置く位置 走っている分の結果と一緒に引く
@@ -1062,6 +1073,16 @@ class MainWindow(QMainWindow):
         # Ctrl+C はクリップのコピーが使っている 絵のコピーは Alt を足して分ける
         self._snapshot_copy_action = self._add(
             edit_menu, "静止画をコピー", QKeySequence("Ctrl+Alt+C"), self.copy_snapshot
+        )
+        # 書き出さずに編集の中で使う静止画（#525） 書く先は作品のフォルダの stills
+        self._still_media_action = self._add(
+            edit_menu, "静止画を素材にする", QKeySequence(), lambda: self.still_to_media()
+        )
+        self._still_place_action = self._add(
+            edit_menu,
+            "静止画をタイムラインへ置く",
+            QKeySequence(),
+            lambda: self.still_to_media(place=True),
         )
         # 範囲を決めるのは目盛りの Shift+ドラッグ 解除は右クリックのほかにここにも置く
         # 範囲が横へスクロールして見えていなくても、書き出す前に消せるようにするため
@@ -1589,6 +1610,15 @@ class MainWindow(QMainWindow):
         self._media_pool.insert_requested.connect(self._insert_media_by_id)
         self._media_pool.transcribe_requested.connect(self._transcribe_media)
         self._media_pool.remove_requested.connect(self._remove_media)
+        self._media_pool.defaults_clear_requested.connect(
+            lambda media_id: self.clear_media_defaults(MediaId(media_id))
+        )
+        self._timeline.media_defaults_requested.connect(
+            lambda clip_id: self.remember_media_defaults(ClipId(clip_id))
+        )
+        self._timeline.freeze_requested.connect(
+            lambda clip_id: self.freeze_at_playhead(ClipId(clip_id))
+        )
         self._media_pool.search_requested.connect(self.show_media_search)
         self._timeline.status_message.connect(
             lambda message: self.statusBar().showMessage(message, 4000)
@@ -2060,11 +2090,70 @@ class MainWindow(QMainWindow):
         # 読み込み直しでは必ず開き直す 覚えた結果は再生中のデコーダの作り直しのための物
         for path in paths:
             forget_probe(path)
-        self._import = ProbeBatch(paths, probe_media)
+        self._import = ProbeBatch(paths, self._import_probe())
         if at is not None:
             self._import_spots[self._import] = at
         self._show_import_progress()
         self._import_timer.start()
+
+    def _import_probe(self) -> Callable[[Path], MediaItem]:
+        """読み込みで素材を調べる関数 本人の置き場に覚えた既定（#524）も写す
+
+        設定はここ（画面のスレッド）で読む 調べる関数は裏のスレッドで動くので、そこで
+        設定を読むと、読み込みの途中で設定を変えたときに素材ごとに扱いが割れる
+        """
+        memory = self._media_memory if self._preferences.media_defaults_global else None
+
+        def probe(path: Path) -> MediaItem:
+            # probe_media はこのモジュールの名前から呼ぶたびに引く 試験が差し替えるため
+            item = probe_media(path)
+            return item if memory is None else with_remembered(item, memory)
+
+        return probe
+
+    def remember_media_defaults(self, clip_id: ClipId) -> None:
+        """クリップの置き方を素材の既定にする（#524 右クリックの〔この設定を素材の既定にする〕）
+
+        作品の素材に覚え（取り消せる）、設定が入っていれば本人の置き場にも覚える
+        本人の置き場は取り消しで戻らない 作品の外の物で、取り消しの段に載らないため
+        消すのは素材一覧の〔素材の既定を消す〕
+        """
+        try:
+            media_id, defaults = defaults_from_clip(self.view_project, clip_id)
+        except (ValueError, KeyError) as exc:
+            self.statusBar().showMessage(str(exc), 4000)
+            return
+        if not self.execute(SetMediaDefaults(media_id, defaults)):
+            return
+        media = self._document.project.require_media(media_id)
+        note = self._remember_outside(media, defaults)
+        self.statusBar().showMessage(f"{media.name} の置き方を素材の既定にした{note}", 6000)
+
+    def clear_media_defaults(self, media_id: MediaId) -> None:
+        """素材の既定を消す（#524 素材一覧の右クリック） 設定が入っていれば本人の置き場からも"""
+        media = self._document.project.find_media(media_id)
+        if media is None:
+            return
+        if media.defaults is not None and not self.execute(SetMediaDefaults(media_id, None)):
+            return
+        note = self._remember_outside(media, None)
+        self.statusBar().showMessage(f"{media.name} の既定を消した{note}", 6000)
+
+    def _remember_outside(self, media: MediaItem, defaults: MediaDefaults | None) -> str:
+        """本人の置き場（作品の外）に既定を覚えるか忘れる ステータスバーに添える文を返す
+
+        書けなくても作品の中の既定は覚えたまま 止めずに、ほかの作品では効かないことを知らせる
+        """
+        if not self._preferences.media_defaults_global:
+            return ""
+        key = fingerprint(media.path)
+        if key is None:
+            return "（素材のファイルを読めないので、ほかの作品には覚えていない）"
+        try:
+            self._media_memory.remember(key, media.name, defaults)
+        except OSError as exc:
+            return f"（ほかの作品の分は覚えられなかった: {exc}）"
+        return "（ほかの作品でも使う）" if defaults is not None else "（ほかの作品の分も消した）"
 
     def _show_import_progress(self) -> None:
         batch = self._import
@@ -4360,6 +4449,8 @@ class MainWindow(QMainWindow):
         self._preview_menu = QMenu(self)
         self._preview_menu.addAction(self._snapshot_save_action)
         self._preview_menu.addAction(self._snapshot_copy_action)
+        self._preview_menu.addAction(self._still_media_action)
+        self._preview_menu.addAction(self._still_place_action)
         self._preview.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._preview.customContextMenuRequested.connect(self._show_preview_menu)
 
@@ -4522,7 +4613,9 @@ class MainWindow(QMainWindow):
     def probe(self, path: Path) -> MediaItem:
         forget_probe(path)
         try:
-            return probe_media(path)
+            # 人の読み込みと同じく、本人の置き場に覚えた既定（#524）を写す 読むだけで、
+            # アプリの設定は変えない
+            return self._import_probe()(path)
         except ProbeError as exc:
             raise ToolError(str(exc)) from exc
 
@@ -5482,6 +5575,59 @@ class MainWindow(QMainWindow):
             raise ToolError(str(exc)) from exc
         finally:
             self._on_project_changed()
+
+    def still_to_media(self, *, place: bool = False) -> None:
+        """〔静止画を素材にする〕〔静止画をタイムラインへ置く〕（#525）
+
+        AI の snapshot_to_media と同じ関数で、作品のフォルダの stills へ PNG を書いて読み込む
+        確かめの窓は出さない メニューを押したことが確かめに当たり、書くのは作品のフォルダの下の
+        決まった場所の新しい名前だけ（前の物を上書きしない）
+        """
+        if self._path is None:
+            QMessageBox.information(
+                self,
+                "静止画を素材にする",
+                f"作品をまだ保存していません 静止画は作品のフォルダの {STILLS_FOLDER} へ書くので、"
+                "先に〔名前を付けて保存〕で保存してください",
+            )
+            return
+        # 再生を止めてから再生ヘッドを 1 度だけ読む（〔静止画を保存…〕と同じ）
+        arguments: dict[str, object] = {"frame": self._snapshot_frame(), "place": place}
+        try:
+            plan = still_plan(self, arguments)
+            consent = still_consent(self, arguments)
+            result = write_and_import_still(self, plan, consent, self._apply_as_person)
+        except ToolError as exc:
+            QMessageBox.warning(self, "静止画を素材にする", str(exc))
+            return
+        name = Path(str(result["file"])).name
+        done = "タイムラインへ置いた" if place else "素材にした"
+        self.statusBar().showMessage(f"静止画を{done}: {name}", 5000)
+
+    def freeze_at_playhead(self, clip_id: ClipId) -> None:
+        """右クリック〔このコマで止める〕（#525） 再生ヘッドで割り、後ろをそのコマで止める"""
+        self._playback.stop()
+        self.execute(FreezeFrame(clip_id, self._timeline.playhead))
+
+    def make_still_folder(self) -> Path:
+        """静止画を素材にする（#525）ときに書くフォルダ 作品のフォルダの下の stills だけを作る"""
+        if self._path is None:
+            raise ToolError("作品をまだ保存していないので、静止画を書く場所がありません")
+        folder = self._path.parent / STILLS_FOLDER
+        try:
+            # 上のフォルダは作らない 作品のフォルダが消えていたら、そこへは書かない
+            folder.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise ToolError(f"静止画を書くフォルダを作れませんでした: {folder} ({exc})") from exc
+        if not folder.is_dir():
+            raise ToolError(f"{folder} はフォルダではないので、静止画を書けません")
+        return folder
+
+    @property
+    def still_frames(self) -> int:
+        # 本人の設定は秒 作品のフレームの数え方へ直す（30fps と 60fps で同じ秒の長さにする）
+        rate = self._document.project.rate
+        return max(1, round(self._preferences.still_seconds * rate.num / rate.den))
 
     def make_narration_folder(self) -> Path:
         """AI のナレーション（#335）を書くフォルダ 作品のフォルダの下の narration だけを作る"""

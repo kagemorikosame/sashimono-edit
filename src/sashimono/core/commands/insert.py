@@ -33,6 +33,11 @@ from sashimono.core.commands.layers import (
     places_mixed,
     solo_for_new_track,
 )
+from sashimono.core.commands.media_defaults import (
+    placed_offset,
+    with_picture_defaults,
+    with_sound_defaults,
+)
 from sashimono.core.model import (
     FILTER_KIND,
     TRANSITION_KIND,
@@ -148,6 +153,7 @@ def place_media(
     at_frame: int,
     track_id: TrackId | None = None,
     split_audio: bool = False,
+    still_frames: int | None = None,
 ) -> list[Command]:
     """素材を、落とした位置（フレームとトラック）から順に並べて置く
 
@@ -162,6 +168,7 @@ def place_media(
     もう片方は合う種類の空いたトラックへ入る
     混合の方式では落としたレイヤーが空いていれば絵がそこへ入る（まとめる設定なら 1 本のクリップ）
     映像と音声の置き方（``split_audio``）は :func:`insert_media` と同じ
+    ``still_frames`` は静止画を置く長さ（フレーム） 省くと :data:`DEFAULT_STILL_FRAMES`
     """
     commands: list[Command] = []
     cursor = max(0, at_frame)
@@ -172,6 +179,7 @@ def place_media(
             cursor,
             _free_picker(project, cursor, track_id),
             split_audio=split_audio,
+            still_frames=still_frames,
         )
         for command in placed:
             project = command.apply(project)
@@ -222,6 +230,7 @@ def _place(
     *,
     split_audio: bool,
     span: tuple[Fraction, Fraction] | None = None,
+    still_frames: int | None = None,
 ) -> list[Command]:
     """素材を 1 本、``start`` から置くコマンド トラックは ``pick`` が決める
 
@@ -244,7 +253,8 @@ def _place(
         # 区間が何か所かあれば一番長い所
         longest = max(media.packed, key=lambda packed: packed.end - packed.start)
         span = (longest.start, longest.end)
-    source_in = Fraction(0) if span is None else span[0]
+    # 全体を置くときは、覚えた頭のずれ（#524）から置く 範囲を頼まれたときは頼まれた範囲のまま
+    source_in = placed_offset(media) if span is None else span[0]
     # 範囲だけの素材で長さ 0 の区間は、止めた絵 1 枚を持ち出した所（前後の余裕を 0 にしたとき）
     # 1 コマ以上の長さで置くと続きの絵と音を読んで断られ、元の止め絵を消すと置き直せなくなる
     # その絵で止めた映像だけを、静止画と同じ長さで置く
@@ -252,7 +262,7 @@ def _place(
     if frozen and not media.has_video:
         return commands
     duration = (
-        _timeline_duration(project, media)
+        _timeline_duration(project, media, source_in, still_frames)
         if span is None
         else DEFAULT_STILL_FRAMES
         if frozen
@@ -283,6 +293,9 @@ def _place(
             ),
             picture=True,
         )
+        # 覚えた置き方（#524）は絵の止めの時刻を決める前に当てる 止めの時刻は素材の中の位置
+        # から決まり、置き方は位置を変えないが、順を逆にすると後から足す欄が止めを見落とす
+        picture = with_picture_defaults(picture, media.defaults)
         # 長さは音と映像の長い方（コンテナの長さ）を切り上げてあるので、音の方が長い素材や
         # 端数で 1 コマ増えた素材は、絵のクリップが映像の終わりを越える 越えた所を最後の
         # 絵で止める 止めないと書き出した動画の終わりが黒くなる（#402） 映像の長さで
@@ -295,14 +308,18 @@ def _place(
     # 音ごとに作る 音量とフェードの欄は 2 本目以降の音にも付ける 付けないと、
     # 置いた直後に 2 本目の音だけ音量をいじれない
     sounds = [
-        Clip(
-            timeline_start=start,
-            duration=duration,
-            media_id=media.id,
-            source_in=source_in,
-            stream_index=stream.index,
-            link_group=group,
-            effects=(default_volume_effect(), fixed_effect(FADE_EFFECT_KIND)),
+        with_sound_defaults(
+            Clip(
+                timeline_start=start,
+                duration=duration,
+                media_id=media.id,
+                source_in=source_in,
+                stream_index=stream.index,
+                link_group=group,
+                effects=(default_volume_effect(), fixed_effect(FADE_EFFECT_KIND)),
+            ),
+            media.defaults,
+            stream.index,
         )
         for stream in streams
     ]
@@ -432,14 +449,21 @@ def held_at_end(clip: Clip, media: MediaItem, rate: FrameRate) -> Fraction | Non
     return max(Fraction(0), end - tick)
 
 
-def _timeline_duration(project: Project, media: MediaItem) -> int:
-    """素材をタイムラインへ置いたときの長さ（フレーム）"""
+def _timeline_duration(
+    project: Project,
+    media: MediaItem,
+    source_in: Fraction = Fraction(0),
+    still_frames: int | None = None,
+) -> int:
+    """素材を ``source_in``（秒）から終わりまでタイムラインへ置いたときの長さ（フレーム）"""
     if media.is_still:
-        return DEFAULT_STILL_FRAMES
-    if media.duration <= 0:
+        return DEFAULT_STILL_FRAMES if still_frames is None else max(1, still_frames)
+    if media.duration - source_in <= 0:
         return 0
     # 切り上げる 切り捨てると素材の末尾が 1 フレーム欠ける
-    return max(1, seconds_to_frame(Fraction(media.duration), project.rate, Rounding.CEIL))
+    return max(
+        1, seconds_to_frame(Fraction(media.duration) - source_in, project.rate, Rounding.CEIL)
+    )
 
 
 def _find_or_create(

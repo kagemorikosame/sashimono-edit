@@ -328,7 +328,8 @@ AI の道具（`ai/operations.py`）はどれも次の 3 つのどれかに入�
   `write_snapshot` と、#349 の作品を扱う口（コピーの置き場 `set_clipboard`・開く `open_project_file`・
   新規 `start_new_project`・スクリプトの読み直し `reload_scripts`・配置の命令 `alignment_commands`・
   OS のクリップボードへ写す `copy_snapshot_image` `copy_text`）と、ナレーション（#335）の作品の
-  フォルダの narration を用意して WAV を書く口 `make_narration_folder` `write_narration` だけ
+  フォルダの narration を用意して WAV を書く口 `make_narration_folder` `write_narration` と、静止画を
+  素材にする（#525）作品のフォルダの stills を用意する口 `make_still_folder` だけ
   場面の説明を覚える `remember_scene_notes` #326 は素材の解析と同じ控えに書くだけで、アプリの
   設定は変えない 持ち出し用パッケージ（#423）の書き出しと展開の口 `start_package_export`
   `start_package_open` `package_status` `package_waiter` も足してよい（書くのは許した書き出し先と
@@ -806,7 +807,8 @@ AI のパネルの会話の欄に「引き継ぎ」として残し、欄の下�
   `_keep_within_budget`）の後、送る前の同意と確かめの窓より先（断ると決まった道具のために尋ねない） 作品を変えない
   取り消し・やり直し・書き出しの中止（`undo` `redo` `cancel_export` `ai/fixes.py` の `PASSES_AFTER_LIMIT`）と、
   取り消せない保存と書き出し（`save_project` `save_project_as` `export_video` `export_subtitles`
-  `save_snapshot` 持ち出し用パッケージの `export_package` #423）と、取り消せない開く・新規（`open_project`
+  `save_snapshot` 持ち出し用パッケージの `export_package` #423 静止画を素材にする `snapshot_to_media`
+  #525）と、取り消せない開く・新規（`open_project`
   `new_project` #349 `open_package` #423）は通す どれも毎回確かめの窓を
   出し、開く・新規の後はその指示の編集を `Document.replaced_in_checkpoint` で断るので、直しの続きにはならない
   取り消せない操作でも作品を変える物（`Operation.edits` ナレーションの `generate_narration` #335 は
@@ -1448,6 +1450,45 @@ YMM4 は画像と動画で書き出して測った 下の「拡大率 100% の�
 （前の版のファイル）は画面に収める 真のときだけ保存に書くので、形式の版は上げていない
 （前の版の本体は項目を捨てて開き、画面に収めて描く） 大きさは素材の解像度から出し、控えの
 大きさやプレビューの画質に左右されない 設定パネルの描画の組の「画素で置く」で切り替えられる
+
+### 素材の置き方の既定（#524）
+
+クリップの右クリック〔この設定を素材の既定にする〕で、そのクリップとリンクした仲間から
+置き方を素材（`MediaItem.defaults`）に覚え、次に置くとき（`core/commands/insert.py` の `_place`）の
+初めの値にする 集める・当てる所は `core/commands/media_defaults.py` の 1 か所
+
+- 覚えるのは固定の項目（反転・配置・音量・フェード）と、不透明度・画素で置くか・素材の頭のずれだけ
+  ふつうのエフェクトは覚えない（一度だけ掛けたぼかしが、以後置くたびに付いてくる）
+- キーフレームはクリップの頭の値で覚える 長さの違うクリップへ写すと動きが途中で切れる
+- 音声の欄は音声ストリームごと 置いたクリップへ写すたびにエフェクトの ID を振り直す
+- 頭のずれは全体を置くときだけ使い、そのぶん長さを縮める 素材の長さ以上のずれ・範囲だけを入れた
+  素材・静止画には使わない
+- 置いてあるクリップは変えない（場面ごとに位置を変えた立ち絵が全部同じ位置へ動く）
+- 保存の形式の版は上げない 既定があるときだけ書き、前の本体は項目を捨てて開く（絵は変わらない）
+  壊れた既定は捨てて作品を開く
+
+作品をまたいで効かせるため、本人の置き場（`core/io/media_memory.py` 設定の置き場の
+`media_defaults.json`）にも覚える 素材は中身（大きさと頭と尻の 1 MiB の SHA-256）で見分け、
+場所や名前を変えても効く 読み込み（`MainWindow._import_probe`）で写し、作品の中で既に既定を
+持つ素材は変えない 設定の「素材の既定をほかの作品でも使う」（`Preferences.media_defaults_global`
+既定は入）で切れる 本人の置き場は取り消しの段に載らないので、消すのは素材一覧の
+〔素材の既定を消す〕 AI の `set_media_defaults` は作品の中の既定だけを変え、本人の置き場には
+触らない（アプリ自身の設定は AI は読むだけ #350）
+
+### プレビューの 1 コマを編集の中で使う（#525）
+
+止め絵には 2 通りあり、メニューの文言で分ける
+
+- 〔このコマで止める〕（タイムラインの右クリック AI の `freeze_frame`） 映像のクリップを再生ヘッドで
+  割り、後ろ側を `Clip.hold_at` でそのコマの絵に止める（`core/commands/still.py` の `FreezeFrame`）
+  ファイルは作らない 止まるのはそのクリップの絵だけ リンクした音は一緒に割るが止めない
+- 〔静止画を素材にする〕〔静止画をタイムラインへ置く〕（編集メニューとプレビューの右クリック AI の
+  `snapshot_to_media`） 重ねた絵ごと〔静止画を保存…〕と同じ描き方で PNG にし、作品のフォルダの下の
+  `stills` へ書いて読み込む 名前は `<作品名>_<タイムコード>.png`、あれば番号を足して前の物を
+  上書きしない 保存していない作品では断る（アプリのキャッシュへ書くと、作品を移したときに素材を
+  見失う） 書く・読み込む・置くは 1 段で、取り消しても PNG は残す（ナレーションと同じ #341）
+  人のメニューは確かめの窓を出さず、AI は取り消せない操作として毎回確かめる 置く長さは設定の
+  「静止画をタイムラインへ置く長さ」（`Preferences.still_seconds` 既定 5 秒）
 
 ### 置いたクリップの終わりの絵（#402）
 

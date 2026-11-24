@@ -167,16 +167,19 @@ from sashimono.core.clipboard import (
 from sashimono.core.commands import (
     DEFAULT_GENERATED_FRAMES,
     MARKER_LABEL_LIMIT,
+    STILLS_FOLDER,
     AddClip,
     AddCredits,
     AddEffect,
     AddMarkers,
+    AddMedia,
     AddScene,
     AddStroke,
     AddTrack,
     Author,
     ClearKeyframes,
     Command,
+    FreezeFrame,
     GroupClips,
     MergeWithNext,
     MoveClip,
@@ -204,6 +207,7 @@ from sashimono.core.commands import (
     SetClipProperty,
     SetEffectEnabled,
     SetKeyframe,
+    SetMediaDefaults,
     SetParam,
     SetResolution,
     SetSegmentSpeaker,
@@ -222,6 +226,7 @@ from sashimono.core.commands import (
     Voice,
     burn_defaults,
     burn_subtitles,
+    defaults_from_clip,
     export_range,
     has_line_break,
     head_room,
@@ -234,6 +239,7 @@ from sashimono.core.commands import (
     new_scene,
     reorder_group,
     resolve_param,
+    still_file_name,
     subtitle_voices,
     subtitle_wrap_width,
     tail_room,
@@ -1273,6 +1279,8 @@ def _list_media(host: EditorHost, arguments: dict[str, Any]) -> object:
                 if item.packed
                 else {}
             ),
+            # 置き方の既定（#524）を覚えた素材 置くと初めから位置や音量が変わっている
+            "has_defaults": item.defaults is not None,
         }
 
     matched = [item for item in project.media if not wanted or wanted in item.name]
@@ -8919,6 +8927,41 @@ def _remove_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     return {"removed": str(media.id)}
 
 
+def _set_media_defaults(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """素材の置き方の既定（#524）を覚える・消す
+
+    覚えるのはタイムラインの右クリック〔この設定を素材の既定にする〕、消すのは素材一覧の
+    右クリック〔素材の既定を消す〕と同じ命令 作品の中の既定だけを変える 本人の置き場
+    （ほかの作品の分）はアプリ自身の設定の側なので、AI は変えない（#350 の決定）
+    """
+    if _flag_argument(arguments, "clear", False):
+        if arguments.get("clip_id"):
+            raise ToolError("clear と clip_id は一緒に渡せません（消すのは media_id）")
+        media = _require_media(_project(host), str(arguments.get("media_id", "")))
+        if media.defaults is None:
+            raise ToolError("この素材は既定を覚えていません")
+        host.apply_commands([SetMediaDefaults(media.id, None)], "素材の既定を消す")
+        return {"media_id": str(media.id), "defaults": None}
+    if arguments.get("media_id"):
+        raise ToolError("覚えるときは clip_id を渡してください（media_id は消すときだけ）")
+    _, clip = _target_clip(host, arguments)
+    try:
+        media_id, defaults = defaults_from_clip(_project(host), clip.id)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    host.apply_commands([SetMediaDefaults(media_id, defaults)], "素材の既定を覚える")
+    return {
+        "media_id": str(media_id),
+        "defaults": {
+            "picture": [effect.kind for effect in defaults.picture],
+            "opacity": defaults.opacity,
+            "native_size": defaults.native_size,
+            "sound_streams": [index for index, effects in defaults.sounds if effects],
+            "offset_seconds": None if defaults.offset is None else float(defaults.offset),
+        },
+    }
+
+
 # --- 書き出し範囲・フィルタ・グループ制御（#349） ---
 
 
@@ -10070,6 +10113,183 @@ def _save_snapshot(host: EditorHost, arguments: dict[str, Any], consent: Consent
     except OSError as exc:
         raise ToolError(f"静止画を保存できませんでした: {exc}") from exc
     return {"saved": str(path), "frame": drawn, **_kept(consent)}
+
+
+# --- 静止画を素材にする・このコマで止める（#525） ---
+#
+# 合成した絵を 1 枚の PNG にして作品のフォルダの stills へ書き、素材として読み込む（置いてもよい）
+# ナレーションと同じ考え方で、書く・読み込む・置くを 1 段にまとめ、取り消し 1 回で戻す
+# （書いた PNG は消さない #341） 人の〔静止画を素材にする〕〔静止画をタイムラインへ置く〕も
+# 同じ関数を通る
+
+
+@dataclass(frozen=True, slots=True)
+class StillPlan:
+    """静止画を素材にする 1 回の中身 確かめの箱を出す前に決める"""
+
+    path: Path
+    frame: int
+    place: bool
+    at_frame: int
+    detail: str
+    generation: int
+    scene: SceneId | None
+
+
+def still_plan(host: EditorHost, arguments: dict[str, Any]) -> StillPlan:
+    """描くコマ・書く場所・置くかを確かめる 書く名前は前の物を上書きしない番号付きの名前"""
+    project_path = host.project_path
+    if project_path is None:
+        raise ToolError(
+            "作品をまだ保存していないので、静止画を書く場所（作品のフォルダの"
+            f" {STILLS_FOLDER}）がありません save_project_as で保存するか、人に"
+            "〔名前を付けて保存〕で保存してもらってから、もう 1 度頼んでください"
+        )
+    project = _project(host)
+    if project.duration <= 0:
+        raise ToolError("タイムラインが空なので静止画にできません")
+    raw_frame = arguments.get("frame", host.playhead)
+    if isinstance(raw_frame, bool) or not isinstance(raw_frame, int):
+        raise ToolError("frame はフレーム番号（整数）で渡してください 省くと再生ヘッドの位置")
+    # 画面と同じく、終わり（最後のフレームの 1 つ後ろ）を指していれば最後のフレームを描く
+    frame = max(0, min(raw_frame, project.duration - 1))
+    place = _flag_argument(arguments, "place", False)
+    folder = project_path.parent / STILLS_FOLDER
+    if folder.exists() and not folder.is_dir():
+        raise ToolError(
+            f"作品のフォルダに {STILLS_FOLDER} という名前のファイルがあるので、"
+            "静止画を書くフォルダを作れません 名前を変えるか動かしてもらってください"
+        )
+    making = not folder.exists()
+    try:
+        name = still_file_name(
+            host.document.project.name, frame, project.rate, lambda n: (folder / n).exists()
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    # フォルダがまだ無ければ、フォルダの場所そのものを書ける場所の決まりに通す（ナレーションと同じ）
+    path = (
+        _write_target(host, str(folder)) / name
+        if making
+        else _write_target(host, str(folder / name))
+    )
+    width, height = project.settings.resolution
+    parts = [
+        f"{format_timecode(frame, project.rate)}（{frame} フレーム）を {width}x{height} の"
+        f" PNG にし、作品のフォルダの {STILLS_FOLDER} に書いて素材一覧へ読み込みます",
+        f"再生ヘッド（{host.playhead} フレーム）へ置きます" if place else "",
+        f"作品のフォルダに {STILLS_FOLDER} フォルダを作ります" if making else "",
+    ]
+    _refuse_elsewhere()
+    return StillPlan(
+        path=path,
+        frame=frame,
+        place=place,
+        at_frame=host.playhead,
+        detail="\n".join(part for part in parts if part),
+        generation=host.document.generation,
+        scene=host.active_scene,
+    )
+
+
+def still_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    """確かめに出す中身 人はメニューを押したことが確かめに当たり、ここで書く先の身元を採る"""
+    plan = still_plan(host, arguments)
+    action = "静止画を素材にしてタイムラインへ置きます" if plan.place else "静止画を素材にします"
+    return Consent(
+        action=action, target=str(plan.path), detail=plan.detail, basis=expect_now(plan.path)
+    )
+
+
+def write_and_import_still(
+    host: EditorHost,
+    plan: StillPlan,
+    consent: Consent,
+    apply: Callable[[list[Command], str], None],
+) -> dict[str, object]:
+    """静止画を書き、読み込み、頼まれれば置く 1 回の ``apply`` で 1 段にまとめる
+
+    書く先は許した確かめの場所（``consent.target``） 書いた PNG は置くのに失敗しても消さない
+    """
+    target = Path(consent.target)
+    document = host.document
+    if document.replaced_in_checkpoint:
+        raise ToolError(f"snapshot_to_media: {REPLACED_REFUSAL}")
+    if document.generation != plan.generation or host.active_scene != plan.scene:
+        raise ToolError(
+            "確かめている間に作品か開いているシーンが変わったので、PNG を書いていません"
+            " もう 1 度頼んでください"
+        )
+    folder = host.make_still_folder()
+    if os.path.normcase(str(folder.resolve())) != os.path.normcase(str(target.parent)):
+        raise ToolError(
+            "確かめている間に作品の場所が変わったので、PNG を書いていません もう 1 度頼んでください"
+        )
+    try:
+        with pinned_place(host, str(target)) as path:
+            drawn = host.write_snapshot(path, plan.frame, expect=_basis(consent))
+    except OSError as exc:
+        raise ToolError(f"静止画を書けませんでした: {exc}") from exc
+    media = host.probe(path)
+    project = _project(host)
+    commands: list[Command] = (
+        place_media(
+            project,
+            [media],
+            at_frame=plan.at_frame,
+            split_audio=host.splits_media,
+            still_frames=host.still_frames,
+        )
+        if plan.place
+        else [AddMedia(media)]
+    )
+    apply(commands, f"静止画を素材にする: {path.name}")
+    host.analyze(media)
+    added = [command for command in commands if isinstance(command, AddClip)]
+    return {
+        "file": str(path),
+        "frame": drawn,
+        "media_id": str(media.id),
+        "clip_ids": [str(command.clip.id) for command in added],
+        "note": (
+            "取り消し 1 回で、読み込みと置いた静止画がまとめて戻ります（書いた PNG は残ります）"
+        ),
+    }
+
+
+def _still_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
+    return still_consent(host, arguments)
+
+
+def _snapshot_to_media(host: EditorHost, arguments: dict[str, Any], consent: Consent) -> object:
+    plan = still_plan(host, arguments)
+    return write_and_import_still(host, plan, consent, host.apply_commands)
+
+
+def _freeze_frame(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """映像のクリップを frame で割り、後ろ側をそのコマの絵で止める（〔このコマで止める〕）"""
+    _, clip = _target_clip(host, arguments)
+    frame = _frame_argument(arguments, "frame", host.playhead)
+    command = FreezeFrame(clip.id, frame)
+    try:
+        after = command.apply(_project(host))
+    except (ValueError, KeyError) as exc:
+        raise ToolError(str(exc)) from exc
+    host.apply_commands([command], "このコマで止める")
+    held = next(
+        (
+            c
+            for track in after.timeline.tracks
+            for c in track.clips
+            if c.media_id == clip.media_id and c.timeline_start == frame and c.hold_at is not None
+        ),
+        None,
+    )
+    return {
+        "held_clip_id": str(held.id) if held is not None else None,
+        "frame": frame,
+        "hold_seconds": None if held is None or held.hold_at is None else float(held.hold_at),
+    }
 
 
 # --- ナレーション（#335） ---
@@ -12776,6 +12996,28 @@ OPERATIONS: tuple[Operation, ...] = (
         writes=True,
     ),
     Operation(
+        name="set_media_defaults",
+        description=(
+            "素材の置き方の既定を覚える・消す（クリップの右クリック〔この設定を素材の既定にする〕"
+            "と素材一覧の右クリック〔素材の既定を消す〕と同じ） 覚えると、その素材を次に置いた"
+            "ときに位置・拡大率・回転・反転・不透明度・画素で置くか・音量とパン・フェード・"
+            "素材の頭のずれが初めからその値になる 覚えるのは clip_id のクリップ（省くと選択中）と"
+            "リンクした仲間から キーフレームはクリップの頭の値で覚える 置いてあるクリップは変えない"
+            " clear を真にして media_id を渡すと消す この作品の中だけを変え、ほかの作品の分は"
+            "変えない 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("覚える元のクリップ 省くと選択中"),
+                "media_id": _string("既定を消す素材（clear のとき）"),
+                "clear": _boolean("既定を消す"),
+            }
+        ),
+        handler=_set_media_defaults,
+        sends=_STRUCTURE,
+        writes=True,
+    ),
+    Operation(
         name="set_work_area",
         description=(
             "書き出し範囲（目盛りの帯）を決める・解く"
@@ -14676,6 +14918,50 @@ OPERATIONS: tuple[Operation, ...] = (
         sends=_WITH_FILES,
         preview=from_arguments(),
         name_keys=frozenset({"saved", "previous_kept_as"}),
+    ),
+    Operation(
+        name="snapshot_to_media",
+        description=(
+            "開いているタイムラインの 1 フレームを重ねた絵ごと PNG にし、作品のフォルダの"
+            " stills へ書いて素材一覧へ読み込む（画面の〔静止画を素材にする〕） place を真に"
+            "すると再生ヘッドへ置く（〔静止画をタイムラインへ置く〕 長さは本人の設定）"
+            " 同じ名前があれば番号を足し、"
+            "前の物を上書きしない 作品を保存していなければ断る 毎回ユーザーに確かめる"
+            " 取り消し 1 回で読み込みと置いた物が戻る（書いた PNG は残る）"
+            " 1 本のクリップの絵だけを止めるなら freeze_frame"
+        ),
+        schema=_schema(
+            {
+                "frame": _integer("描くフレーム 省くと再生ヘッドの位置"),
+                "place": _boolean("再生ヘッドの位置へ置く"),
+            }
+        ),
+        handler=_consented(_snapshot_to_media, _still_consent),
+        approved=_snapshot_to_media,
+        writes=True,
+        irreversible=True,
+        consent=_still_consent,
+        sends=_WITH_FILES,
+        preview=from_arguments(),
+        name_keys=frozenset({"file"}),
+    ),
+    Operation(
+        name="freeze_frame",
+        description=(
+            "映像のクリップを frame（省くと再生ヘッド）で割り、後ろ側をそのコマの絵で止める"
+            "（クリップの右クリック〔このコマで止める〕） ファイルは作らない クリップの頭なら"
+            "割らずに全体を止める リンクした音は一緒に割るが止めない 止めるのはそのクリップの絵"
+            "だけで、重ねた絵ごと止めるなら snapshot_to_media 取り消し 1 回で戻る"
+        ),
+        schema=_schema(
+            {
+                "clip_id": _string("止めるクリップ 省くと選択中"),
+                "frame": _integer("止めるタイムラインのフレーム 省くと再生ヘッドの位置"),
+            }
+        ),
+        handler=_freeze_frame,
+        sends=_STRUCTURE,
+        writes=True,
     ),
     Operation(
         name="list_voices",

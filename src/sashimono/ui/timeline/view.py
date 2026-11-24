@@ -265,6 +265,11 @@ class TimelineView(QWidget):
     #: 右クリックの〔BGM を声に合わせて下げる…〕（#329） 下げるクリップの ID の並び
     #: 声のトラックと下げ方を尋ねて下げるのは窓の側（AI の duck_audio と同じ所を通す）
     duck_requested = Signal(list)
+    #: 右クリックの〔この設定を素材の既定にする〕（#524） 引数はクリップの ID
+    #: 素材とアプリ全体の置き場へ覚えるのは窓の側（本人の設定を見る）
+    media_defaults_requested = Signal(str)
+    #: 右クリックの〔このコマで止める〕（#525） 引数はクリップの ID 再生ヘッドは窓が読む
+    freeze_requested = Signal(str)
     #: 右クリックの〔音量を基準にそろえる…〕（#329） そろえるクリップの ID の並び
     loudness_requested = Signal(list)
     #: 右クリックの〔強調の動きを付ける…〕（#331） 動きを付けるクリップの ID の並び
@@ -1950,6 +1955,31 @@ class TimelineView(QWidget):
                 functools.partial(self.noise_requested.emit, sounds),
             )
             noise.setEnabled(bool(sounds))
+            if hit[1].media_id is not None:
+                # 素材を置いたクリップだけ テキストや図形は素材を持たず、覚える先が無い
+                _action(
+                    menu,
+                    "この設定を素材の既定にする",
+                    functools.partial(self.media_defaults_requested.emit, str(hit[1].id)),
+                )
+            # 動画の絵を描くクリップだけ 再生ヘッドが外にあるときは灰色で出す（隠すと在ることに
+            # 気付けない） 静止画と音だけの素材は止める絵の動きを持たない
+            located_hit = self._project.timeline.locate_clip(hit[1].id)
+            media = (
+                self._project.find_media(hit[1].media_id) if hit[1].media_id is not None else None
+            )
+            if (
+                media is not None
+                and media.has_video
+                and located_hit is not None
+                and self._project.draws_picture(located_hit[0], hit[1])
+            ):
+                freeze = _action(
+                    menu,
+                    "このコマで止める",
+                    functools.partial(self.freeze_requested.emit, str(hit[1].id)),
+                )
+                freeze.setEnabled(hit[1].timeline_start <= self._playhead < hit[1].timeline_end)
             if hit[1].scene_id is not None:
                 scene_id = hit[1].scene_id
                 _action(

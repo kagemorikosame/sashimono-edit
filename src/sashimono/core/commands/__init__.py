@@ -79,6 +79,13 @@ from sashimono.core.commands.markers import (
     marker_at,
     valid_marker_color,
 )
+from sashimono.core.commands.media_defaults import (
+    SetMediaDefaults,
+    defaults_from_clip,
+    placed_offset,
+    with_picture_defaults,
+    with_sound_defaults,
+)
 from sashimono.core.commands.project_format import (
     SetFrameRate,
     VideoFormat,
@@ -93,6 +100,12 @@ from sashimono.core.commands.scene import (
     RenameScene,
     insert_scene,
     new_scene,
+)
+from sashimono.core.commands.still import (
+    MAX_STILL_FILES,
+    STILLS_FOLDER,
+    FreezeFrame,
+    still_file_name,
 )
 from sashimono.core.commands.strokes import (
     AddStroke,
@@ -129,6 +142,8 @@ __all__ = [
     "DEFAULT_SCENE_FRAMES",
     "DEFAULT_STILL_FRAMES",
     "MARKER_LABEL_LIMIT",
+    "MAX_STILL_FILES",
+    "STILLS_FOLDER",
     "AddClip",
     "AddCredits",
     "AddEffect",
@@ -143,6 +158,7 @@ __all__ = [
     "Command",
     "ConvertLayers",
     "Document",
+    "FreezeFrame",
     "GroupClips",
     "HistoryEntry",
     "InScene",
@@ -179,6 +195,7 @@ __all__ = [
     "SetFrameRate",
     "SetKeyframe",
     "SetLayerMode",
+    "SetMediaDefaults",
     "SetParam",
     "SetResolution",
     "SetSegmentSpeaker",
@@ -205,6 +222,7 @@ __all__ = [
     "burn_defaults",
     "burn_subtitles",
     "convert_layers",
+    "defaults_from_clip",
     "export_range",
     "format_to_match",
     "has_line_break",
@@ -220,8 +238,10 @@ __all__ = [
     "new_scene",
     "place_media",
     "place_media_spans",
+    "placed_offset",
     "reorder_group",
     "resolve_param",
+    "still_file_name",
     "subtitle_voices",
     "subtitle_wrap_width",
     "switch_layer_mode",
@@ -229,4 +249,6 @@ __all__ = [
     "trimmable",
     "valid_marker_color",
     "voice_label",
+    "with_picture_defaults",
+    "with_sound_defaults",
 ]
