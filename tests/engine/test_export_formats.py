@@ -26,6 +26,7 @@ from sashimono.core.model import (
 )
 from sashimono.core.timebase import FrameRate
 from sashimono.engine import gpu
+from sashimono.engine.audio.mixer import MAX_SCENE_DEPTH
 from sashimono.engine.decode import probe_media
 from sashimono.engine.encode import (
     CONTAINER_SUFFIXES,
@@ -96,6 +97,17 @@ class TestTheTable:
 
     def test_every_suffix_is_accepted_and_unique(self) -> None:
         """壊れると、窓で選べる形式を AI の書き出しが知らない拡張子として断る"""
+        # 表が空でも下の 2 つは成り立つので、形式の名前をそのまま見る
+        assert [item.key for item in FORMATS] == [
+            "mp4",
+            "mov",
+            "mkv",
+            "webm",
+            "wav",
+            "mp3",
+            "m4a",
+            "flac",
+        ]
         suffixes = [item.suffix for item in FORMATS]
         assert len(set(suffixes)) == len(suffixes)
         assert set(CONTAINER_SUFFIXES) == set(suffixes)
@@ -155,6 +167,36 @@ class TestHasSound:
         assert not has_sound(_with_scene(False, TrackKind.VIDEO))
         assert not has_sound(_with_scene(False, TrackKind.AUDIO))
 
+    def test_a_scene_reached_deep_first_is_seen_again_from_above(self) -> None:
+        """壊れると、深い道で先に着いて上限で中を見切れなかったシーンを、浅い道でも飛ばす"""
+        sound = Clip(timeline_start=0, duration=SECOND, media_id=MediaId("音"))
+        bottom = Scene(
+            "音", Timeline(rate=FrameRate(30), tracks=(Track(TrackKind.AUDIO, "A", (sound,)),))
+        )
+        # 深い道 上から MAX_SCENE_DEPTH 段の鎖の底に bottom を置く 浅い道 メインに直に置く
+        chain: list[Scene] = []
+        below = bottom
+        for index in range(MAX_SCENE_DEPTH):
+            clip = Clip(timeline_start=0, duration=SECOND, scene_id=below.id)
+            below = Scene(
+                f"段{index}",
+                Timeline(rate=FrameRate(30), tracks=(Track(TrackKind.VIDEO, "V", (clip,)),)),
+            )
+            chain.append(below)
+        project = Project.create()
+        for scene in [bottom, *chain]:
+            project = AddScene(scene).apply(project)
+        # 深い道を先に見る並び（トラックは上から順に見る）
+        deep = Track(
+            TrackKind.VIDEO, "深", (Clip(timeline_start=0, duration=SECOND, scene_id=below.id),)
+        )
+        shallow = Track(
+            TrackKind.VIDEO, "浅", (Clip(timeline_start=0, duration=SECOND, scene_id=bottom.id),)
+        )
+        project = AddTrack(deep).apply(project)
+        project = AddTrack(shallow).apply(project)
+        assert has_sound(project)
+
     def test_disabled_clips_are_silent(self) -> None:
         """壊れると、無効のクリップしか無い音声トラックで無音のファイルを書く"""
         clip = Clip(timeline_start=0, duration=SECOND, media_id=MediaId("音"), enabled=False)
@@ -201,6 +243,7 @@ class TestVideoFormats:
     @pytest.mark.parametrize(
         ("name", "codec", "container", "video", "audio"),
         [
+            ("out.mp4", "libx264", "mov", "h264", "aac"),
             ("out.mov", "libx264", "mov", "h264", "aac"),
             ("out.mkv", "libx264", "matroska", "h264", "aac"),
             ("out.webm", None, "matroska", "vp9", "opus"),
@@ -225,6 +268,25 @@ class TestVideoFormats:
         assert len(videos) == 1 and video in videos[0]
         assert len(audios) == 1 and audio in audios[0]
         assert seconds == pytest.approx(1.0, abs=0.1)
+
+    def test_opus_from_a_44_1_khz_project(self, sample_av: SampleMedia, tmp_path: Path) -> None:
+        """壊れると、44.1 kHz の作品の WebM だけ Opus を開けないか、音の長さがずれる
+
+        Opus は 48 kHz で開き、44.1 kHz の音は PyAV のエンコーダの入口が変換する
+        """
+        document = Document(
+            Project.create(
+                ProjectSettings(width=320, height=240, frame_rate=FrameRate(30), sample_rate=44100)
+            )
+        )
+        for command in insert_media(document.project, probe_media(sample_av.path)):
+            document.execute(command)
+        path = export_project(document.project, _settings(tmp_path / "out.webm"))
+        with av.open(str(path)) as container:
+            audio = container.streams.audio[0]
+            assert audio.codec_context.name == "opus" and audio.rate == 48000
+            heard = sum(frame.samples for frame in container.decode(audio=0))
+        assert heard / 48000 == pytest.approx(1.0, abs=0.03)
 
     def test_a_webm_from_another_process(self, project: Project, tmp_path: Path) -> None:
         """壊れると、設定で別のプロセスを選んだ人だけ WebM を書けない（候補が H.264 のまま）"""
@@ -281,6 +343,18 @@ class TestAudioOnly:
         with pytest.raises(ExportError, match="鳴る物が無い"):
             export_project(project, _settings(target))
         assert not target.exists()
+
+    @pytest.mark.parametrize("name", ["out.wav", "out.mp3"])
+    def test_a_cancel_keeps_the_previous_file(
+        self, project: Project, tmp_path: Path, name: str
+    ) -> None:
+        """壊れると、前に書き出したファイルへ書き直して中止したとき、前のファイルまで消える"""
+        target = tmp_path / name
+        target.write_bytes(b"before")
+        with pytest.raises(ExportError, match="中止"):
+            export_project(project, _settings(target), should_cancel=lambda: True)
+        assert target.read_bytes() == b"before"
+        assert sorted(item.name for item in tmp_path.iterdir()) == [name]
 
     def test_cancel_leaves_no_file(self, project: Project, tmp_path: Path) -> None:
         """壊れると、中止した書きかけの音のファイルが残り、書けたのかが分からない"""

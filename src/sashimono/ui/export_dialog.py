@@ -164,7 +164,7 @@ class ExportDialog(QDialog):
 
     #: 素材に合わせたビットレートが出た（頼んだ印、Mbps） 読むのはスレッドの外
     _bitrate_found = Signal(object, int)
-    #: 裏で確かめ終えた候補を、窓のスレッドで並べる（形式の映像の作り方, 候補）
+    #: 裏で確かめ終えた候補を、窓のスレッドで並べる（頼んだときの印, 候補）
     _codecs_found = Signal(object, object)
 
     def __init__(
@@ -258,6 +258,8 @@ class ExportDialog(QDialog):
 
         self._codec = QComboBox(self)
         self._codecs_ready = False
+        #: 最後に候補を頼んだ印（:meth:`_load_codecs`）
+        self._codec_request: object = object()
         self._encoder_priority = encoder_priority
         self._codecs_found.connect(self._on_codecs_found)
         self._load_codecs()
@@ -407,6 +409,9 @@ class ExportDialog(QDialog):
         音声だけの形式は映像のコーデックを使わないので並べない（欄ごと隠す）
         """
         chosen = self._chosen_format
+        # 頼むたびに印を変える 前に頼んだ確かめが後から届いても、今の欄を作り直さない
+        # 作り直すと、待つ間に本人が選んだコーデックが黙って「自動」へ戻る（PR #547 の指摘）
+        self._codec_request = object()
         if chosen.audio_only:
             self._codec.clear()
             self._codecs_ready = False
@@ -420,7 +425,7 @@ class ExportDialog(QDialog):
             self._codec.addItem(CHECKING_CODECS, None)
             self._codec.setEnabled(False)
             self._codecs_ready = False
-            self._wait_for_codecs(chosen.video, self._encoder_priority)
+            self._wait_for_codecs(self._codec_request, self._encoder_priority)
         else:
             self._fill_codecs(codecs)
 
@@ -447,11 +452,12 @@ class ExportDialog(QDialog):
         self._codec.setEnabled(bool(codecs))
         self._codecs_ready = bool(codecs)
 
-    def _wait_for_codecs(self, video: str, encoder_priority: str) -> None:
+    def _wait_for_codecs(self, request: object, encoder_priority: str) -> None:
         """走っている確かめが終わるのを裏で待ち、終わったら候補を並べる
 
-        ``video`` は頼んだときの形式の映像の作り方 待つ間に形式を替えたら、届いた候補を捨てる
+        ``request`` は頼んだときの印 待つ間に形式を替えたら、届いた候補を捨てる
         """
+        video = self._chosen_format.video
 
         def work() -> None:
             try:
@@ -464,19 +470,20 @@ class ExportDialog(QDialog):
                 _log.exception("書き出しの窓でエンコーダを確かめられなかった")
                 codecs = []
             try:
-                self._codecs_found.emit(video, codecs)
+                self._codecs_found.emit(request, codecs)
             except RuntimeError:
                 # 先に窓を閉じた 届け先が無い
                 return
 
         threading.Thread(target=work, name="sashimono-export-codecs", daemon=True).start()
 
-    def _on_codecs_found(self, video: str, codecs: list[str]) -> None:
+    def _on_codecs_found(self, request: object, codecs: list[str]) -> None:
         """確かめ終えた候補を並べ、書き出しを押せるかを直す
 
-        待つ間に別の作り方の形式へ替えていたら捨てる 並べると、WebM の欄に H.264 が出る
+        今の印でない結果は捨てる 待つ間に別の作り方の形式へ替えていたら、並べると WebM の欄に
+        H.264 が出る 同じ作り方へ戻した後の古い結果を並べると、本人の選びが「自動」へ戻る
         """
-        if video != self._chosen_format.video:
+        if request is not self._codec_request:
             return
         self._fill_codecs(codecs)
         self._refresh_ok()

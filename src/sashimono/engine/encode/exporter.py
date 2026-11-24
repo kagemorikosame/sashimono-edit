@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -259,13 +260,16 @@ def has_sound(project: Project) -> bool:
     指摘）、無効のクリップしか無いトラックで無音のファイルを書く 絵だけの混合トラックで音の
     道を作ると、今まで無音の道を持たなかった書き出しに黙った音声が付く
     """
-    return _sounds(project, project.timeline, 0, set())
+    return _sounds(project, project.timeline, 0, {})
 
 
-def _sounds(project: Project, timeline: Timeline, depth: int, seen: set[SceneId]) -> bool:
-    """``timeline`` に鳴る物があるか ``seen`` はもう中を見たシーン（入れ子の輪で回り続けない）
+def _sounds(project: Project, timeline: Timeline, depth: int, seen: dict[SceneId, int]) -> bool:
+    """``timeline`` に鳴る物があるか ``seen`` は中を見たシーンと、見た中でいちばん浅い深さ
 
     シーンの深さの上限はミキサと同じ（:data:`MAX_SCENE_DEPTH` より深いシーンは鳴らない）
+    同じシーンを飛ばすのは、前に同じか浅い深さで見たときだけ 深い道で先に着いて上限で中を
+    見切れなかったシーンも、浅い道からはもう 1 度見る（ミキサは浅い道で鳴らす PR #547 の指摘）
+    同じシーンを各段に置いた作品でも、深さごとに 1 回しか見ない
     """
     tracks = [
         *timeline.active_sound_tracks(),
@@ -277,9 +281,9 @@ def _sounds(project: Project, timeline: Timeline, depth: int, seen: set[SceneId]
                 continue
             if clip.scene_id is None:
                 return True
-            if depth >= MAX_SCENE_DEPTH or clip.scene_id in seen:
+            if depth >= MAX_SCENE_DEPTH or seen.get(clip.scene_id, MAX_SCENE_DEPTH + 1) <= depth:
                 continue
-            seen.add(clip.scene_id)
+            seen[clip.scene_id] = depth
             scene = project.find_scene(clip.scene_id)
             if scene is not None and _sounds(project, scene.timeline, depth + 1, seen):
                 return True
@@ -519,11 +523,51 @@ def export_project(
     should_cancel: Callable[[], bool] | None = None,
     notice: Callable[[str], None] | None = None,
 ) -> Path:
-    """プロジェクトを 1 本の動画ファイルへ書き出す
+    """プロジェクトを 1 本の動画（音声だけの形式なら音声）ファイルへ書き出す
 
     ``should_cancel`` が真を返したら、書きかけのファイルを消して
     :class:`ExportError` を投げる 中途半端なファイルを残すと、書き出せたのか
     どうかが分からなくなる
+
+    書き出し先の隣の仮のファイルへ書き、書き上げてから名前を付け替える（PR #547 の指摘）
+    書き出し先へ直に書くと、開いた所で前のファイルが空になり、中止や失敗で消すと前に書き出した
+    物まで失う 仮のファイルは拡張子を残す（入れ物と章を拡張子で決めている）
+    同じフォルダに置くのは、付け替えをドライブを跨がない名前の付け替えで済ませるため
+    """
+    target = settings.path
+    # 知らない拡張子は仮のファイルを作る前に断る 仮の名前で断ると、どの名前が悪いのか分からない
+    _format(settings)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    scratch = target.with_name(f".{target.stem}.{uuid.uuid4().hex[:8]}.writing{target.suffix}")
+    try:
+        _export_to(
+            project,
+            replace(settings, path=scratch),
+            progress=progress,
+            should_cancel=should_cancel,
+            notice=notice,
+        )
+        try:
+            scratch.replace(target)
+        except OSError as exc:
+            raise ExportError(f"書き出したファイルを置き換えられない: {target} ({exc})") from exc
+    except BaseException:
+        scratch.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def _export_to(
+    project: Project,
+    settings: ExportSettings,
+    *,
+    progress: Callable[[float], None] | None,
+    should_cancel: Callable[[], bool] | None,
+    notice: Callable[[str], None] | None,
+) -> Path:
+    """:func:`export_project` の中身 ``settings.path`` は仮のファイル
+
+    中止や失敗のときは書きかけ（仮のファイル）を消してから投げる
 
     コーデックを名指ししない書き出しで、候補のエンコーダが開けなかったり途中で書けなく
     なったりしたら、次の候補で最初から書き出し直す 書き上げたら、何で書いたかを ``notice``

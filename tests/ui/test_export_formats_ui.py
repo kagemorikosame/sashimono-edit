@@ -93,6 +93,27 @@ def test_webm_auto_is_only_vp9(
         dialog.deleteLater()
 
 
+def test_a_late_result_does_not_undo_the_choice(
+    qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、前に頼んだ確かめが遅れて届き、本人の選んだ AV1 が黙って自動へ戻る"""
+    del qt_application
+    monkeypatch.setattr(export_dialog, "available_web_codecs_now", lambda _p: None)
+    monkeypatch.setattr(ExportDialog, "_wait_for_codecs", lambda *_args: None)
+    dialog = ExportDialog(_picture_only(), export_format="webm")
+    try:
+        stale = dialog._codec_request
+        dialog.select_format("mp4")
+        dialog.select_format("webm")
+        current = dialog._codec_request
+        dialog._on_codecs_found(current, ["libvpx-vp9", "libsvtav1"])
+        dialog._codec.setCurrentIndex(dialog._codec.findData("libsvtav1"))
+        dialog._on_codecs_found(stale, ["libvpx-vp9", "libsvtav1"])
+        assert dialog._codec.currentData() == "libsvtav1"
+    finally:
+        dialog.deleteLater()
+
+
 def test_audio_only_hides_the_video_rows(qt_application: QApplication, sounding: Project) -> None:
     """壊れると、音声だけなのに映像のコーデックやビットレートを替えられ、効かない理由を探す"""
     del qt_application
