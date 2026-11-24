@@ -28,6 +28,9 @@ from sashimono.core.model import Project
 from sashimono.ui import main_window as main_window_module
 from sashimono.ui.main_window import MainWindow
 
+#: リポジトリの根 子の台本が ``tests`` を読み込めるように渡す
+_ROOT = Path(__file__).resolve().parents[2]
+
 #: アプリの起動（``sashimono.app.main``）と同じ順で組み立てる 窓の作り直しを何度か
 #: 繰り返し、閉じた窓をごみ集めで壊す 最後はイベントループから戻った後に壊し、
 #: そのまま Python を終わらせる（アプリを閉じたときと同じ）
@@ -47,6 +50,10 @@ from sashimono.ui.translation import install_qt_translation
 
 QSurfaceFormat.setDefaultFormat(preferred_surface_format())
 application = QApplication(sys.argv[:1])
+# 子には conftest の見張りが届かない 掛けないと、試験を走らせるたびに編集画面が 4 回出る
+from tests.offscreen_windows import hide_windows
+
+hide_windows(application)
 application.setStyleSheet(style_sheet())
 install_qt_translation(application)
 
@@ -81,6 +88,11 @@ def _isolated_environment(tmp_path: Path) -> dict[str, str]:
     落ちたときに Python の呼び出しの跡が読めるよう、文字の符号も決めておく
     """
     environment = dict(os.environ)
+    # 子の台本は窓を隠す仕組み（tests/offscreen_windows.py）を読む 走らせる場所に頼らず
+    # 読めるよう、リポジトリの根を前に足す 後ろには verify.py が立てた本体の src が続く
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(_ROOT), *filter(None, [environment.get("PYTHONPATH")])]
+    )
     program_data = tmp_path / "programdata"
     program_data.mkdir()
     environment["PROGRAMDATA"] = str(program_data)

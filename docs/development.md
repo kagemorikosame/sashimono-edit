@@ -52,15 +52,23 @@ CPU の取り合いで落ちることがある 同じワーカーにまとめた
 `@pytest.mark.xdist_group("名前")` を付ける（`--dist loadgroup` で効く）
 遅いテストの上位 30 本は、毎回 pytest の出力の最後（`slowest 30 durations`）に出る
 
-試験の窓は画面へ出さない（`tests/conftest.py` の `OffScreenWindows`） 出すと、走らせる
-たびに編集画面が数百回出ては消え、本人の作業の前へ割り込む 窓は Qt の上では表示中のまま
-（大きさ・前面化・GL の描画も今まで通り）で、Windows の画面に映らないだけ CI も同じ形で走る
-`QT_QPA_PLATFORM=offscreen` は使わない Windows のオフスクリーンでは OpenGL を作れず、
-GPU の試験がまとめて飛ばされる 実際に画面へ出して確かめたいときだけ、次で戻す
+試験の窓は画面へ出さない（`tests/offscreen_windows.py` の `OffScreenWindows` conftest が
+掛ける） 出すと、走らせるたびに編集画面が数百回出ては消え、本人の作業の前へ割り込む
+窓は Qt の上では表示中のまま（大きさ・前面化・GL の描画も今まで通り）で、Windows の画面に
+映らないだけ CI も同じ形で走る `QT_QPA_PLATFORM=offscreen` は使わない Windows の
+オフスクリーンでは OpenGL を作れず、GPU の試験がまとめて飛ばされる 実際に画面へ出して
+確かめたいときだけ、次で戻す
 
 ```
 $env:SASHIMONO_TEST_SHOW_WINDOWS = "1"; .venv\Scripts\python.exe tools\verify.py
 ```
+
+- 試験が子として Python を起こし、子が自分で `QApplication` を作って窓を出すときは、子の
+  台本でも `tests.offscreen_windows.hide_windows(application)` を掛ける 子には conftest が
+  届かない（`tests/ui/test_window_teardown.py`）
+- `QTest.qWaitForWindowExposed` で待たない OS が窓を映さないので知らせが来ず、毎回 5 秒で
+  切れる 描かせたいときは `grab()` を使う 画面へ出す指定のときだけ待つなら
+  `windows_on_screen()` で分ける
 
 個別に走らせたいとき:
 

@@ -54,6 +54,7 @@ from sashimono.ui.timeline import view as view_module
 from sashimono.ui.timeline.layout import TimelineLayout, TrackBand
 from sashimono.ui.timeline.painter import draw_clip
 from sashimono.ui.workspace import Preferences, PreferenceStore
+from tests.offscreen_windows import windows_on_screen
 
 _LEFT = Qt.MouseButton.LeftButton
 _NONE = Qt.KeyboardModifier.NoModifier
@@ -140,7 +141,10 @@ def _open(
     # 窓が画面に出る（OS が描ける状態にする）まで待つ 出る前の repaint は何も描かない
     # CI の Windows では 1 回の processEvents で間に合わないことがあり、描いた記録が空のまま
     # 見出しや枠の試験が落ちた（#253 窓の状態を記録すると exposed=False だった）
-    QTest.qWaitForWindowExposed(area)
+    # 窓を画面へ出さない既定（tests/offscreen_windows.py）では OS が窓を映さず、待っても
+    # 知らせが来ないまま毎回 5 秒で切れる 描くのは下の ``_paint``（``grab``）なので待たない
+    if windows_on_screen():
+        QTest.qWaitForWindowExposed(area)
     QApplication.processEvents()
     areas.append(area)
     harness = _Harness(area.view)
