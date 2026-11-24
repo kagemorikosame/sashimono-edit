@@ -149,6 +149,28 @@ class TestPastRecords:
         assert "版 0.2.7" in masked
         assert "OSError:" in masked
 
+    def test_escaped_quotes_and_spaced_names_do_not_leave_pieces(self, tmp_path: Path) -> None:
+        # 壊れると、囲みの中の \' で囲みが終わったと見て後ろ半分（omega）が残るか、空白を含む
+        # 名前の頭（社外秘）が残る（PR #550 の指摘） 集める所から最後の伏せ方まで通して見る
+        errors = tmp_path / "errors.log"
+        errors.write_text(
+            "=== 2026-11-24T10:00:00 版 0.2.7\n"
+            "Traceback (most recent call last):\n"
+            '  File "sashimono/ui/main_window.py", line 3, in save\n'
+            "ValueError: password = 'alpha\\' omega'\n"
+            "OSError: 社外秘 顧客名簿.csv を読めない\n"
+            "ImportError: sashimono_native.pyd を読めない\n",
+            encoding="utf-8",
+        )
+        gathered = gather(FaultLog(tmp_path, catch_faults=False))
+        masked = mask(build_report(ENV, None, gathered), folders=FOLDERS)
+        assert "omega" not in masked and "alpha" not in masked
+        assert "社外秘" not in masked and "顧客名簿" not in masked
+        # 並びの行・例外の種類・残す文・部品のファイルの名前は読める
+        assert '  File "sashimono/ui/main_window.py", line 3, in save' in masked
+        assert f"OSError: {TEXT_MARK} を読めない" in masked
+        assert "sashimono_native.pyd" in masked
+
     def test_gathered_records_are_masked(self, tmp_path: Path) -> None:
         # 集めた所で伏せる 窓へ出る前に、表に無い名前が消えている
         errors = tmp_path / "errors.log"

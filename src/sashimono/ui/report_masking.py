@@ -213,8 +213,9 @@ def mask_places(text: str, mark: str) -> str:
 
 
 #: 引用符と括弧で囲んだ文 例外の文は名前や本文をここに入れる
-#: （``'旅行.mp4'`` ``「社長のあいさつ」``）
-_QUOTED = re.compile(r"""'[^'\n]*'|"[^"\n]*"|\u300c[^\u300d\n]*\u300d""")
+#: （``'旅行.mp4'`` ``「社長のあいさつ」``） 中の ``\'`` は囲みの終わりと見ない 終わりと見ると、
+#: 囲みの後ろ半分が伏せずに残る（PR #550 の CodeRabbit の指摘）
+_QUOTED = re.compile(r"""'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|\u300c[^\u300d\n]*\u300d""")
 #: 名前と拡張子の形の語 囲まずに書かれた素材の名前（``旅行.mp4 を読めない``）
 _FILE_NAME = re.compile(
     r"(?<![\w.\\/])[^\s\"'<>|*?\\/:\u3001\u3002()\uff08\uff09]+\.[A-Za-z][A-Za-z0-9]{1,4}\b"
@@ -238,16 +239,34 @@ def mask_record_text(text: str, mark: str) -> str:
             lines.append(line)
             continue
         line = _QUOTED.sub(lambda found: found.group(0)[0] + mark + found.group(0)[-1], line)
-        line = _FILE_NAME.sub(
-            lambda found: (
-                found.group(0)
-                if found.group(0).rsplit(".", 1)[1].lower() in _PROGRAM_SUFFIXES
-                else mark
-            ),
-            line,
-        )
-        lines.append(line)
+        lines.append(_hide_file_names(line, mark))
     return "\n".join(lines)
+
+
+def _hide_file_names(line: str, mark: str) -> str:
+    """名前と拡張子の語を、その前の文（行の頭か ``: `` の後ろから）ごと伏せる
+
+    空白を含む名前（``社外秘 顧客名簿.csv``）は、どこから名前かを文から決められない 語だけを
+    伏せると頭（``社外秘``）が残るので、例外の種類（``OSError: ``）の後ろから語の終わりまでを
+    まとめて伏せる 伏せすぎて困るのは読めないことだけ（PR #550 の CodeRabbit の指摘）
+    本体と部品のファイル（:data:`_PROGRAM_SUFFIXES`）は伏せない
+    """
+    parts: list[str] = []
+    position = 0
+    for found in _FILE_NAME.finditer(line):
+        start, end = found.span()
+        if found.group(0).rsplit(".", 1)[1].lower() in _PROGRAM_SUFFIXES or start < position:
+            continue
+        head = line[position:start]
+        colon = max(head.rfind(": "), head.rfind("\uff1a"))
+        if colon >= 0:
+            begin = position + colon + (2 if head.startswith(": ", colon) else 1)
+        else:
+            begin = position + len(head) - len(head.lstrip())
+        parts += [line[position:begin], mark]
+        position = end
+    parts.append(line[position:])
+    return "".join(parts)
 
 
 def root_key(text: str) -> str:
