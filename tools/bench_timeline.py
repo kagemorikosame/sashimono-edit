@@ -3,6 +3,7 @@ r"""タイムラインの描画の速さを測る
     .venv\Scripts\python.exe tools\bench_timeline.py
     .venv\Scripts\python.exe tools\bench_timeline.py --clips 5000 --tracks 10
     .venv\Scripts\python.exe tools\bench_timeline.py --media --clips 100
+    .venv\Scripts\python.exe tools\bench_timeline.py --json 結果.json  （版ごとの記録も書く #513）
 
 性能目標「スクロール / ズームが 60fps」（1 回の描画が 16.7ms 以内）を確かめる
 測らずに最適化しない、の測る側
@@ -44,7 +45,10 @@ if isinstance(sys.stdout, io.TextIOWrapper):
 _base = Path(tempfile.mkdtemp(prefix="sashimono-bench-"))
 os.environ["APPDATA"] = str(_base / "roaming")
 os.environ["LOCALAPPDATA"] = str(_base / "local")
+# 結果の形は隣の道具の物を使う 試験が importlib で読むときは tools が探す所に無い
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from bench_results import BenchRecord  # noqa: E402
 from PySide6.QtCore import QPoint  # noqa: E402
 from PySide6.QtGui import QImage, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -273,19 +277,31 @@ def report(name: str, times: list[float]) -> bool:
 
 
 def run_states(
-    view: TimelineView, project: Project, width: int, repeat: int, *, fresh: bool = False
+    view: TimelineView,
+    project: Project,
+    width: int,
+    repeat: int,
+    *,
+    fresh: bool = False,
+    record: BenchRecord | None = None,
 ) -> list[bool]:
-    """全体表示・スクロール・ズームを測って並べる"""
+    """全体表示・スクロール・ズームを測って並べる ``record`` があれば項目として記録にも足す"""
     duration = project.duration
     fit = TimelineLayout(pixels_per_frame=(width - 132) / max(1, duration))
     steps = 60
     scroll = [TimelineLayout(scroll_frame=duration * n / steps) for n in range(steps)]
     zoom = [TimelineLayout(pixels_per_frame=fit.pixels_per_frame * (1.25**n)) for n in range(40)]
-    return [
-        report("全体を表示", measure(view, [fit], repeat * 4, fresh=fresh)),
-        report("スクロール", measure(view, scroll, repeat, fresh=fresh)),
-        report("ズーム", measure(view, zoom, repeat, fresh=fresh)),
-    ]
+    results = []
+    for key, name, layouts, times in (
+        ("fit", "全体を表示", [fit], repeat * 4),
+        ("scroll", "スクロール", scroll, repeat),
+        ("zoom", "ズーム", zoom, repeat),
+    ):
+        measured = measure(view, layouts, times, fresh=fresh)
+        results.append(report(name, measured))
+        if record is not None:
+            record.add(key, measured, label=name)
+    return results
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -306,8 +322,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="ffmpeg で作った動画と音を並べ、サムネイルと波形を描いて測る",
     )
+    parser.add_argument(
+        "--json", type=Path, default=None, help="版ごとに比べる記録の形（bench_results）でも書く"
+    )
     arguments = parser.parse_args(argv)
     clips = arguments.clips if arguments.clips is not None else (100 if arguments.media else 3000)
+    conditions = {key: value for key, value in vars(arguments).items() if key != "json"}
+    record = BenchRecord("timeline", {**conditions, "clips": clips})
 
     application = QApplication.instance() or QApplication(sys.argv)
     del application
@@ -326,12 +347,16 @@ def main(argv: list[str] | None = None) -> int:
             # 受けないと、待つ上限に掛かったときにトレースバックで終わる
             except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                 print(f"素材を作れない（ffmpeg と libx264・aac を見てください）: {error}")
+                record.fail(f"素材を作れない: {error}")
+                record.write(arguments.json)
                 return 2
             started = time.perf_counter()
             try:
                 analyze(analyzer, media)
             except TimeoutError as error:
                 print(f"測らずに止めた: {error}")
+                record.fail(f"解析が終わらない: {error}")
+                record.write(arguments.json)
                 return 2
             print(f"サムネイルと波形の解析 {time.perf_counter() - started:.1f} 秒")
         project = build_project(clips, arguments.tracks, arguments.length, media=media)
@@ -344,7 +369,10 @@ def main(argv: list[str] | None = None) -> int:
             f"長さ {project.duration} フレーム / 画面 {arguments.width}x{arguments.height}"
         )
         print(f"予算 {BUDGET_MS:.1f} ms（60fps）  判定は 95 パーセンタイル")
-        results = run_states(view, project, arguments.width, arguments.repeat)
+        results = run_states(view, project, arguments.width, arguments.repeat, record=record)
+        # 判定に入れる表だけを記録する 下の比べるための表は条件の違う測りで、版をまたいで
+        # 同じ名前の項目にすると取り違える
+        record.write(arguments.json)
         if media is not None:
             print("\n波形の画像を貯めずに毎回作るとき（同じ並び 判定には入れない）")
             run_states(view, project, arguments.width, arguments.repeat, fresh=True)

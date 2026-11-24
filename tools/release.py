@@ -12,6 +12,8 @@ r"""リリースを 1 コマンドで終える（タグ → 下書きの確か�
 3. Actions の Release（release.yml）がそのタグで終わるのを待つ
 4. 下書き リリースが下書きであること zip を ``dist\release`` へ落とし、GitHub の digest と照らす
    zip に入った Python が下限（``build_package.MINIMUM_PYTHON``）より古ければ止める
+   部品の一覧（SBOM ``sbom.BOM_NAME``）を zip から作り直し、下書きの物と同じかを照らす
+   違えば止める（誤った一覧を公開しない） 下書きに無ければ手元で作って上げる
    公開済みなら差し替えず、目録が下書きのときと同じことを確かめて、公開した後の残りだけ続ける
 5. ソース 索引（``sources-manifest.json``）に載った物が全部下書きにあるか照らし、足りなければ
    ``collect_sources.py`` で集めて、本体 → 索引の順に上げる
@@ -24,6 +26,7 @@ r"""リリースを 1 コマンドで終える（タグ → 下書きの確か�
 7. 目録と署名 ``update_sign.py`` の manifest → sign → verify で作って上げる
    上げてあれば落として確かめ、通れば飛ばす
 8. 要約を出し、人が y と答えたときだけ公開する 公開した後、固定の URL が新しい版を指すかを見る
+   要約には、前に公開した版の一覧と比べて足した・外した・版が変わった部品を出す（読めなくても止めない）
 
 公開は必ず人が y と答える 確かめを全部飛ばす旗は作らない（取り返しが付かないのは公開だけで、
 そこを機械に任せると、署名の通らない版や描けない版を配って全員の自動更新を止める）
@@ -62,10 +65,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import build_package  # noqa: E402
 import collect_sources  # noqa: E402
+import sbom  # noqa: E402
 import update_sign  # noqa: E402
 from update_keys import KEY_FILES  # noqa: E402
 
-from sashimono.links import BETA_MANIFEST_URL, STABLE_MANIFEST_URL  # noqa: E402
+from sashimono.links import BETA_MANIFEST_URL, REPOSITORY_URL, STABLE_MANIFEST_URL  # noqa: E402
 from sashimono.update.manifest import (  # noqa: E402
     Manifest,
     ManifestError,
@@ -109,6 +113,8 @@ REBUILD_LIMIT = 5
 #: （#279） minimum をこれより下げると、失敗すると分かっている入れ替えを古い版に試させる
 #: --minimum を付け忘れても守れるよう既定にし、下げる指定は断る
 OLDEST_SWAPPABLE = "0.2.1"
+#: 前に公開した版の部品の一覧 名前に版を入れていないので、決まった URL で最新の公開版の物を読める
+PREVIOUS_BOM_URL = f"{REPOSITORY_URL}/releases/latest/download/{sbom.BOM_NAME}"
 #: Windows が「ウイルスが含まれている」としてファイルを開かせないときの番号（ERROR_VIRUS_INFECTED）
 VIRUS_WINERROR = 225
 #: 誤検出を Microsoft へ報告する所（利用者が手で送る 道具は送らない）
@@ -411,6 +417,12 @@ class Release:
     )
     #: Defender の検出の記録を読む（読むだけ） 試験では差し替える
     detections: Callable[[], list[dict[str, Any]]] = read_detections
+    #: zip から部品の一覧（SBOM）を作る 作れなければ ``sbom.BomError`` 試験では差し替える
+    bill: Callable[[Path], bytes] = field(
+        default=lambda archive: sbom.generate(archive).text().encode("utf-8")
+    )
+    #: 前に公開した版の一覧を読む（比べるだけ 読めなくても止めない） 試験では差し替える
+    previous_bill: Callable[[], bytes] = field(default=lambda: fetch_url(PREVIOUS_BOM_URL))
     #: 試しに見た（--dry-run）ときの、済んでいない前提
     problems: list[str] = field(default_factory=list)
     #: 出す commit（タグが指す物 タグが無ければ手元の HEAD）
@@ -787,6 +799,7 @@ class Release:
         self.zip_size = self.archive.stat().st_size
         self.check_python()
         self.extract()
+        self.ensure_bill()
         return True
 
     def check_python(self) -> None:
@@ -833,6 +846,92 @@ class Release:
     @property
     def home(self) -> Path:
         return self.extracted / build_package.APP_NAME
+
+    def ensure_bill(self) -> None:
+        """部品の一覧（SBOM）が下書きにあり、落とした zip から作り直した物と同じか
+
+        一覧は Release の run が zip と一緒に上げる（package.yml の build が作る） 作り直すのは
+        zip だけを読む道具（sbom.py）なので、ネットにも手元の Python 環境にもよらず同じ物ができる
+        違えば止める 前の zip の一覧が残っている・組み立てで一覧だけ古い、のどれでも、そのまま
+        公開すると配った物と違う一覧を配る 下書きに無い（一覧を作る前の版の run で上げた下書き）
+        なら手元で作って上げる 作れない（足し忘れ・版違い）なら、この zip は出さない
+        """
+        try:
+            expected = self.bill(self.archive)
+        except sbom.BomError as exc:
+            self.problem(
+                f"zip から部品の一覧（SBOM）を作れない この zip は出せない\n{exc}"
+                "\n（THIRD_PARTY_NOTICES.md と build_package.NATIVE_LICENSES を直し、"
+                "版を上げて出す）"
+            )
+            return
+        asset = self.assets().get(sbom.BOM_NAME)
+        if asset is not None:
+            out = self.call(
+                "gh",
+                "release",
+                "download",
+                self.tag,
+                "--pattern",
+                sbom.BOM_NAME,
+                "--output",
+                "-",
+                what="部品の一覧を読むの",
+            )
+            try:
+                published = json.loads(out)
+            except ValueError:
+                published = None
+            wanted = json.loads(expected)
+            if published == wanted:
+                self.done(f"部品の一覧（{sbom.BOM_NAME}）は zip から作り直した物と同じ")
+                return
+            found = (
+                sbom.differences(published, wanted) if isinstance(published, dict) else ["読めない"]
+            )
+            if isinstance(published, dict) and sbom.zip_digest(published) != self.zip_sha256:
+                found.insert(0, "一覧に書いた zip の SHA-256 が下書きの zip と違う")
+            self.problem(
+                f"下書きの部品の一覧（{sbom.BOM_NAME}）が zip から作り直した物と違う: "
+                + "、".join(found or ["書き方が違う"])
+                + f"（gh release delete-asset {self.tag} {sbom.BOM_NAME} -y で外して打ち直すと、"
+                "手元で作った物を上げる）"
+            )
+            return
+        if self.dry_run:
+            self.todo(f"zip から部品の一覧（{sbom.BOM_NAME}）を作って下書きへ上げる")
+            return
+        self.folder.mkdir(parents=True, exist_ok=True)
+        local = self.folder / sbom.BOM_NAME
+        local.write_bytes(expected)
+        self.call(
+            "gh",
+            "release",
+            "upload",
+            self.tag,
+            str(local),
+            "--clobber",
+            what="部品の一覧を上げるの",
+        )
+        self.load_release()
+        self.done(f"zip から部品の一覧（{sbom.BOM_NAME}）を作って上げた")
+
+    def bill_change(self) -> list[str]:
+        """前に公開した版の一覧と比べた違い 読めなければ、その旨の 1 行（止めない）
+
+        初めて一覧を添付する版や、通信の失敗では読めない 読めないのは公開を止める理由にならない
+        （一覧そのものは 4 で照らし済み） 違いは人が要約で見て、思っていない部品の出入りに気付く
+        """
+        try:
+            current = json.loads(self.bill(self.archive))
+            previous = json.loads(self.previous_bill())
+        except (OSError, ValueError, sbom.BomError) as exc:
+            return [f"[--] 前に公開した版の部品の一覧を読めず、比べていない（{exc}）"]
+        if not isinstance(previous, dict):
+            return ["[--] 前に公開した版の部品の一覧を読めず、比べていない"]
+        before = previous.get("metadata", {}).get("component", {}).get("version", "?")
+        lines = sbom.differences(previous, current)
+        return [f"{before} から: {line}" for line in lines] or [f"{before} から: 部品の違いは無い"]
 
     # --- 5. ソース -----------------------------------------------------------------
 
@@ -1312,6 +1411,8 @@ class Release:
         print(f"  資産      {len(self.assets())} 個")
         print(f"  署名      {key_label(self.signer)}")
         print(f"  公開先    {self.release.get('url', '')}")
+        for line in self.bill_change():
+            print(f"  部品      {line}")
         if self.beta:
             print(f"  ベータ    目録と署名を {BETA_TAG} へ上げ直す（{BETA_MANIFEST_URL}）")
         else:

@@ -60,6 +60,25 @@ def _sources(bodies: dict[str, bytes] = BODIES) -> dict[str, bytes]:
 
 SOURCES = _sources()
 
+#: 部品の一覧（SBOM）の資産の名前（tools/sbom.py の BOM_NAME）
+BOM = "SashimonoEdit-windows-x64.cdx.json"
+
+
+def _bill(data: bytes) -> bytes:
+    """zip から作る部品の一覧の偽物 本物と同じく zip の SHA-256 を頭に書き、zip で決まる
+
+    本物の一覧は zip の使用許諾の一覧と DLL を読む（tests/test_sbom_tool.py が見る） ここで
+    見たいのは、下書きの一覧と作り直した物の照らし方なので、zip ごとに違う最小の形にする
+    """
+    digest = hashlib.sha256(data).hexdigest()
+    bill = {
+        "metadata": {
+            "component": {"version": VERSION, "hashes": [{"alg": "SHA-256", "content": digest}]}
+        },
+        "components": [{"name": "部品", "version": digest[:8]}],
+    }
+    return json.dumps(bill).encode()
+
 
 @pytest.fixture(scope="module")
 def tool() -> ModuleType:
@@ -135,6 +154,15 @@ class FakeGitHub:
     #: Release の run の何回目の試みか ``gh run rerun`` で 1 つ進み、下書きの zip が入れ替わる
     attempt: int = 1
     rerun_conclusion: str = "success"
+    #: Release の run と同じく、下書きの zip の隣にその zip の一覧があるか
+    #: 偽なら ``files`` のまま（一覧の無い下書きや、別の zip の一覧を試す）
+    bill_follows_zip: bool = True
+
+    def assets_now(self) -> dict[str, bytes]:
+        """下書きの資産 一覧は Release の run が zip と一緒に上げるので、zip に合わせて置く"""
+        if self.bill_follows_zip and ZIP in self.files and BOM not in self.files:
+            return {**self.files, BOM: _bill(self.files[ZIP])}
+        return self.files
 
     def __post_init__(self) -> None:
         if not self.runs:
@@ -212,7 +240,7 @@ class FakeGitHub:
             case ["gh", "release", "view", tag, *_] if tag == TAG:
                 if self.draft is None:
                     return "", 1
-                assets = [_asset(name, data) for name, data in self.files.items()]
+                assets = [_asset(name, data) for name, data in self.assets_now().items()]
                 info = {
                     "isDraft": self.draft,
                     "isPrerelease": self.prerelease,
@@ -221,9 +249,9 @@ class FakeGitHub:
                 }
                 return json.dumps(info), 0
             case ["gh", "release", "download", _, "--pattern", name, "--output", "-"]:
-                if name not in self.files:
+                if name not in self.assets_now():
                     return "", 1
-                return self.files[name].decode("utf-8"), 0
+                return self.assets_now()[name].decode("utf-8"), 0
             case ["gh", "release", "download", _, "--pattern", name, "--dir", folder, *_]:
                 if name in self.fail_downloads:
                     return "", 1
@@ -289,6 +317,8 @@ class World:
     #: Defender の検出の記録（読むだけの偽物） ``detect`` の順に、確かめのたびに増やす
     defender: list[dict[str, Any]] = field(default_factory=list)
     detect: list[bool] = field(default_factory=list)
+    #: 前に公開した版の部品の一覧 None なら読めない（初めて一覧を添付する版）
+    previous: bytes | None = None
 
     def ask(self, prompt: str) -> str:
         return self.answers.pop(0) if self.answers else ""
@@ -333,6 +363,11 @@ class World:
         self.reached += 1
         return list(self.unreachable)
 
+    def previous_bill(self) -> bytes:
+        if self.previous is None:
+            raise OSError("前の一覧は無い")
+        return self.previous
+
     def fetch(self, url: str) -> bytes:
         self.fetched.append(url)
         return self.latest or self.github.files["update.json"]
@@ -355,6 +390,9 @@ class World:
             "reach": self.reach,
             # 本物の Defender の記録は読まない
             "detections": self.detections,
+            "bill": lambda archive: _bill(archive.read_bytes()),
+            # 本物の公開版の一覧は読みに行かない
+            "previous_bill": self.previous_bill,
         }
         code: int = tool.main(argv, **{**parts, **overrides})
         return code
@@ -417,7 +455,7 @@ class TestTheWholeRun:
         assert world.smoked and world.launched
         assert len(world.secrets) == 1
         assert "TRUSTED_PUBLIC_KEYS の 1 本目" in out
-        assert "資産      7 個" in out
+        assert "資産      8 個" in out
         # 1 回目は公開の前に、前の版から Python が変わるかを見る 2 回目は公開した後の確かめ
         assert world.fetched == [tool.STABLE_MANIFEST_URL, tool.STABLE_MANIFEST_URL]
         assert "Python が変わる" not in out
@@ -1500,3 +1538,70 @@ class TestThePythonInTheZip:
         assert world.main(tool, "--dry-run") == 1
         assert "[NG] zip に入った Python" in capsys.readouterr().out
         assert world.github.writes == []
+
+
+class TestBill:
+    """部品の一覧（SBOM #517） 下書きの一覧を zip から作り直して照らし、違えば公開しない"""
+
+    def test_a_draft_without_a_bill_gets_one_made_from_the_zip(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """一覧を作る前の版の run で上げた下書きでも、手元で zip から作って上げて進む"""
+        world.github.bill_follows_zip = False
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 0
+        assert world.github.files[BOM] == _bill(world.github.files[ZIP])
+        assert "作って上げた" in capsys.readouterr().out
+        assert world.published
+
+    def test_a_bill_for_another_zip_is_not_published(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """前の zip の一覧が残った下書きを公開すると、配った物と違う一覧を配る"""
+        world.github.files[BOM] = _bill(b"another zip")
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 1
+        out = capsys.readouterr().out
+        assert "zip から作り直した物と違う" in out
+        assert "SHA-256 が下書きの zip と違う" in out
+        assert f"gh release delete-asset {TAG} {BOM} -y" in out
+        assert world.secrets == [] and not world.published
+
+    def test_a_zip_that_cannot_be_listed_is_not_published(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """足し忘れ・版違いで一覧を作れない zip は、一覧の無いまま出さない"""
+
+        def broken(archive: Path) -> bytes:
+            raise tool.sbom.BomError(["av.libs/libnew.dll がどの部品の物か決まっていない"])
+
+        world.answers = ["y", "y"]
+        assert world.main(tool, bill=broken) == 1
+        out = capsys.readouterr().out
+        assert "部品の一覧（SBOM）を作れない" in out
+        assert "libnew.dll" in out
+        assert not world.published
+
+    def test_the_summary_names_the_parts_that_changed(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """前に公開した版の一覧と比べ、公開の前に部品の出入りを見せる 止めはしない"""
+        before = json.loads(_bill(b"previous zip"))
+        before["metadata"]["component"]["version"] = "1.2.2"
+        before["components"].append({"name": "外した部品", "version": "1.0"})
+        world.previous = json.dumps(before).encode()
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 0
+        out = capsys.readouterr().out
+        assert "部品      1.2.2 から: 外した: 外した部品 1.0" in out
+        assert "部品      1.2.2 から: 版が変わった: 部品" in out
+        assert world.published
+
+    def test_an_unreadable_previous_bill_does_not_stop(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """初めて一覧を添付する版では前の一覧が無い 比べられないことを出して進む"""
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 0
+        assert "前に公開した版の部品の一覧を読めず" in capsys.readouterr().out
+        assert world.published

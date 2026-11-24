@@ -577,6 +577,29 @@ def test_a_published_or_signed_release_is_not_replaced() -> None:
     assert guard.count("exit 1") >= 2
 
 
+def test_the_bill_is_made_from_the_built_zip_and_shipped_with_it() -> None:
+    """部品の一覧（SBOM #517）は組み立てた zip から作り、同じ artifact で zip と一緒に運ぶ
+
+    作れなければ組み立てのジョブが落ち、zip も上げない 一覧を作る段はネットへ出ない道具だけを
+    走らせる（上流の取得元が消えても止まらない 0.2.4 は collect_sources の取得元で止まった）
+    """
+    build = _jobs(PACKAGE)["build"]
+    made = build.index("python tools/sbom.py write")
+    assert build.index("python tools/build_package.py") < made < build.index("upload-artifact")
+    assert "dist/SashimonoEdit-windows-x64.cdx.json" in build[made:]
+    assert "tools/sbom.py" in PACKAGE.split("jobs:", 1)[0]
+
+
+def test_a_bill_for_another_zip_is_not_uploaded() -> None:
+    """一覧の頭に書いた zip の SHA-256 が組み立てた zip と違えば、どちらも上げずに止める"""
+    publish = _jobs(RELEASE)["publish"]
+    upload = publish.index("gh release upload")
+    check = publish.index(".metadata.component.hashes")
+    assert check < upload
+    assert "exit 1" in publish[check:upload]
+    assert '"$zip" "$bom"' in publish[upload:]
+
+
 def test_checkout_leaves_no_token_behind() -> None:
     """checkout は既定でトークンを .git/config に残し、後で走る依存のコードが読める"""
     for name, text in _all_jobs().items():
