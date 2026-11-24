@@ -18,8 +18,11 @@ from pathlib import Path
 
 __all__ = [
     "HOME_PLACEHOLDER",
+    "SECRET_MARK",
     "marked_root_labels",
     "mask_report",
+    "mask_secrets",
+    "mask_under_folders",
     "mask_user_folders",
     "root_key",
     "root_lines",
@@ -140,6 +143,63 @@ def mask_user_folders(text: str, folders: Sequence[tuple[str, str]]) -> str:
         replacement = placeholder.replace("\\", "\\\\")
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     return text
+
+
+#: 秘密を伏せた印
+SECRET_MARK = "〔秘密〕"
+
+#: 名前の分かる秘密の形 （正規表現, 残す頭の組の番号） 頭の組は伏せずに残し、何の秘密だったか
+#: （API の鍵か、トークンか）が報告から読めるようにする
+#: 診断情報（#516）に混ざりうるのは、AI の部品や更新の係が上げたエラーの文に入った鍵と、
+#: 設定の窓で打ち込んだ値を含む例外の文 形の分からない秘密は、本人が窓で見て消す
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], int], ...] = (
+    # Anthropic・OpenAI の API の鍵 ``sk-ant-api03-…`` ``sk-proj-…``
+    (re.compile(r"(sk-)(?:ant-|proj-)?[A-Za-z0-9_\-]{16,}"), 1),
+    # GitHub のトークン ``ghp_…`` ``github_pat_…``
+    (re.compile(r"((?:gh[pousr]|github_pat)_)[A-Za-z0-9_]{16,}"), 1),
+    # AWS の鍵の番号
+    (re.compile(r"(AKIA)[0-9A-Z]{16}"), 1),
+    # ``Authorization: Bearer …`` ``Bearer …``
+    (re.compile(r"((?i:bearer)\s+)[A-Za-z0-9._~+/\-]+=*"), 1),
+    # ``api_key=…`` ``"token": "…"`` ``password: …`` など 名前と区切りを残して値を伏せる
+    (
+        re.compile(
+            r"((?i:api[_\-]?key|access[_\-]?key|secret|token|password|passwd|pwd)"
+            r"[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}]+"
+        ),
+        1,
+    ),
+)
+
+
+def mask_secrets(text: str) -> str:
+    """API の鍵・トークン・パスワードを :data:`SECRET_MARK` に置き換える
+
+    鍵は 1 つ漏れるだけで他人に使われ、伏せすぎても困るのは値が読めないことだけなので、
+    名前の分かる形は値を丸ごと伏せる
+    """
+    for pattern, keep in _SECRET_PATTERNS:
+        text = pattern.sub(rf"\g<{keep}>{SECRET_MARK}", text)
+    return text
+
+
+#: 置き場の印（:data:`HOME_PLACEHOLDER` など）の後に続く場所 区切りから、空白・引用符・
+#: 括弧・文の区切りの前まで
+#: 文の区切りの記号（読点・句点・全角のカンマと括弧）は ``ai/outbound.py`` と同じく番号で書く
+_UNDER_FOLDER = re.compile(
+    r"((?:%[A-Z_]+%|\$XDG_[A-Z_]+))[\\/][^\s\"'<>|*?\u3001\u3002\uff0c\uff08\uff09()]*"
+)
+
+
+def mask_under_folders(text: str, mark: str) -> str:
+    r"""置き場の印の下の場所を、印だけ残して ``mark`` に置き換える
+
+    :func:`mask_user_folders` は利用者名の入った置き場だけを伏せ、その下のフォルダと
+    ファイルの名前（``%USERPROFILE%\Videos\旅行.mp4``）は残す 互換性レポートでは探索先の
+    中を読めるよう残すが、診断情報（#516）では素材の名前になるので伏せる
+    印は残す どの置き場（設定・退避・ホーム）の話かは報告から読める
+    """
+    return _UNDER_FOLDER.sub(lambda found: found.group(1) + "\\" + mark, text)
 
 
 def root_key(text: str) -> str:

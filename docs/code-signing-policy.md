@@ -87,6 +87,10 @@ Links in the Help menu (manual, reports) and in update messages (release notes, 
 in the user's web browser; the program itself does not connect when they are opened.
 Help → Roll back to the previous version (〔ヘルプ〕→〔前の版に戻す…〕) uses the copy kept on the
 computer and does not connect.
+Help → Create diagnostic information (〔ヘルプ〕→〔診断情報を作る…〕) builds a report from records kept
+on the computer (errors that were not handled and runs that did not end normally), hides file names,
+places, subtitles and keys, and shows it to the user. It is never sent: the user reads it, saves it,
+and attaches it to a report themselves.
 
 ---
 
@@ -167,3 +171,5 @@ Claude Agent SDK に同梱の新しい Claude Code でないと使えない 配�
 〔ヘルプ〕の中のリンク（使い方・報告の受け口）と、更新の知らせの中のリンク（変わった所・配布のページ）は、
 利用者のブラウザで開く 開くときにアプリ自身は通信しない
 〔ヘルプ〕→〔前の版に戻す…〕は手元に残した前の版を使い、通信しない
+〔ヘルプ〕→〔診断情報を作る…〕は、手元に残した記録（拾われなかったエラーと正しく終わらなかった起動）から
+報告を作り、ファイルの名前・場所・字幕・鍵を伏せて本人に見せる 送らない 本人が読んで保存し、自分で報告に添える

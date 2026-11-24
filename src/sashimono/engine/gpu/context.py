@@ -23,6 +23,9 @@ from PySide6.QtGui import (
     QSurfaceFormat,
 )
 
+# 形式は起動画面より前に決めるので、重い部品を読まない所に置く（#526） ここからも引けるように残す
+from sashimono.engine.gl_format import REQUIRED_GL_VERSION, preferred_surface_format
+
 __all__ = [
     "CurrentGLContext",
     "GLContextError",
@@ -32,10 +35,6 @@ __all__ = [
     "opengl_usable",
     "preferred_surface_format",
 ]
-
-#: 要求する OpenGL のバージョン フレームバッファの浮動小数点フォーマットと
-#: コンピュートシェーダ（将来のエフェクト用）が使える最低ラインとして 4.3 を選ぶ
-REQUIRED_GL_VERSION = (4, 3)
 
 
 class GLContextError(RuntimeError):
@@ -60,21 +59,6 @@ class GLScope(Protocol):
     ) -> None: ...
 
     def release(self) -> None: ...
-
-
-def preferred_surface_format() -> QSurfaceFormat:
-    """アプリ全体で使うサーフェス形式
-
-    ``QApplication`` を作る前に :meth:`QSurfaceFormat.setDefaultFormat` へ渡すこと
-    後から設定してもウィジェットのコンテキストには反映されない
-    """
-    fmt = QSurfaceFormat()
-    fmt.setVersion(*REQUIRED_GL_VERSION)
-    fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
-    fmt.setDepthBufferSize(0)
-    fmt.setStencilBufferSize(0)
-    fmt.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
-    return fmt
 
 
 def ensure_qt_application() -> QCoreApplication:

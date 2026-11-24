@@ -40,6 +40,7 @@ __all__ = [
     "LOG_NAME",
     "StallWatch",
     "default_log_path",
+    "program_place",
     "threshold_from_env",
 ]
 
@@ -114,6 +115,11 @@ def _where(filename: str) -> str:
         last = len(parts) - 1 - parts[-2::-1].index("sashimono") - 1
         return "/".join(parts[last:])
     return Path(filename).name
+
+
+#: 並びに書く場所の削り方 診断情報（#516）がエラーの並びにも同じ削り方を使う 別に書くと、
+#: 止まりの記録とエラーで同じファイルが違う名前で出て、突き合わせられない
+program_place = _where
 
 
 def _frame_lines(frame: FrameType | None) -> list[str]:

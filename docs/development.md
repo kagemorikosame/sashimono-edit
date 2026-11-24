@@ -5103,6 +5103,44 @@ Discussions で確かめた報告（再現した不具合、取り掛かると�
 書き込み欄のファイルの名前、`config.yml` の行き先、`sashimono.links.DISCUSSION_CATEGORIES` を
 一緒に直す（`tests/test_help_links.py` が食い違いを落とす）
 
+### 診断情報（#516）
+
+利用者の機械でだけ起きる不具合は、〔ヘルプ〕→〔診断情報を作る…〕で作った報告を添えてもらう
+**自動では送らない** 窓に伏せた後の全文を出し、本人が読んで（消したい所を消して）保存し、報告の窓口へ
+自分で添える 送る口とサーバーは持たない（要るかは #502 で別に決める）
+
+- 組むのは `sashimono/diagnostic_report.py`（Qt を使わない） 版と環境・設定・画面の止まりの表・拾われなかった
+  エラー・正しく終わらなかった起動だけを載せる 作品の中身（字幕・素材の一覧）は載せない
+- 伏せ方は書き足さない 素材の名前と場所・字幕と文字は AI へ送る物と同じ `ai/outbound.py`
+  （`file_secrets` `text_secrets` `redact` `hide_text`）、本人の置き場と秘密（API の鍵・トークン）は
+  `ui/report_masking.py` 並びの中の場所は伏せる前に `stall_watch.program_place` で本体の中の場所にする
+  （伏せると何行目で落ちたかが消える） 伏せる順は `diagnostic_report.mask` の説明に書いた
+- 記録は `sashimono/fault_log.py` 編集画面の起動だけが掛ける（自己診断・pip・書き出しの子は掛けない）
+  拾われなかったエラーは `diagnostics/errors.log` へ足し、落ちた起動は起動ごとの `diagnostics/sessions/<印>.log`
+  （`faulthandler` の書き先）で見分ける 正しく終わった起動は自分の記録を消すので、残っていて錠の持ち主が
+  いない物が落ちた起動 Windows の `faulthandler` は落ちない例外でも書くことがあるので、正しく終わった
+  起動の記録は中身を見ずに捨てる
+- 画面の止まりの数え方は `sashimono/stall_summary.py` に 1 つ `tools/stall_report.py` は入口だけ
+- 保存の窓を初めに開く所は設定の「診断情報を保存する場所」（`Preferences.report_folder` 空は「ドキュメント」）
+  保存した所を覚える 台帳の行は読むだけ（`help.diagnostics` と `preferences.report_folder`）
+
+### 起動画面（#526）
+
+`QApplication` を作った直後、編集画面の部品を読む前に、ロゴと版と進み具合の文字の起動画面を出す
+（`ui/splash.py`） 待たせているのはほぼ部品の import（2026-11-24 開発の環境で、`QApplication` まで 0.29 秒・
+`main_window` の import が温まって 1.66 秒・最初の 1 回 6.69 秒・`MainWindow` を作るのが 0.09 秒）
+
+- **起動画面より前に重い物を読まない** `sashimono.ui` の頭は `MainWindow` を引かれたときに読む（読むと
+  `ui` の下のどの部品を読んでも編集画面の部品まで読む） サーフェス形式は `engine/gl_format.py`
+  （`engine.gpu` の頭は合成とエフェクトの部品まで読む） `tests/ui/test_splash.py` が別のプロセスで見張る
+- 設定の読み手（`ui.workspace`）は重いので、テーマと「起動画面の動き」だけを直に読む（`splash_choices`
+  読み手と同じ決まりかを試験が照らす） 既定は `SPLASH_MOTION_DEFAULT` の 1 か所
+- ロゴは動かさない import の間は描けないので、段の間で文字を切り替える 設定で切ると「起動しています」のまま
+- 前に出し続ける印を付けない 編集画面を出したら `finish` で閉じる 失敗したら `showing_splash` が閉じてから
+  投げ直す 復元と素材の確かめの窓は、起動画面を閉じた後に出す
+- PyInstaller の起動画面（`pyi_splash`）は使っていない 配布版で、アイコンを押してから起動画面が出るまでを
+  測って、1 秒を超えるなら併用を考える
+
 ### Issue の書き方（#376）
 
 Issue を書くのは人・AI・並行して動く別のエージェントと複数いる 書く人によって節が
