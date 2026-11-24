@@ -60,6 +60,7 @@ __all__ = [
     "parse_categories",
     "parse_folders",
     "parse_paths",
+    "reachable_dir",
     "remove_folder",
     "same_place",
     "scan_folder",
@@ -191,16 +192,44 @@ class FolderScan:
     error: str = ""
 
 
-def scan_folder(folder: LibraryFolder, limit: int = SCAN_LIMIT) -> FolderScan:
+def reachable_dir(path: Path) -> tuple[bool, str]:
+    """フォルダがあって中を見られるか と、見られない訳（無ければ空）
+
+    登録先の親へのアクセス権を失うと ``Path.is_dir`` が ``PermissionError`` を投げることがある
+    1 つの登録先が見られないだけで、ほかの登録先の一覧や起動まで止めない
+    """
+    try:
+        return path.is_dir(), ""
+    except OSError as exc:
+        return False, f"見られません: {exc.strerror or exc}"
+
+
+def _inside(path: Path, root: Path) -> bool:
+    """``path`` の実体が ``root`` の中か（リンクを解いて比べる）"""
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
+def scan_folder(
+    folder: LibraryFolder, limit: int = SCAN_LIMIT, *, skip: Sequence[str] = ()
+) -> FolderScan:
     """``folder`` の中（下のフォルダも）を見て回り、分類に合うファイルを拾う
 
     ``os.scandir`` で 1 段ずつ見る ``Path.rglob`` は 1 ファイルごとに ``stat`` を呼び直し、
     数千のファイルで目に見えて遅い リンクを辿った先のフォルダには入らない 自分を指す
-    リンクがあると、見て回るのが終わらない
+    リンクがあると、見て回るのが終わらない ファイルのリンクも、実体が登録したフォルダの外なら
+    拾わない（登録したフォルダだけを素材の出どころにする決まりと、フォルダのリンクの扱いをそろえる）
+
+    ``skip`` は入らないフォルダ（別に登録したフォルダ） 親を効果音・子を動画として登録した
+    ときに、親から子の音を効果音として拾うと、子の分類の決まり（AI に使わせるか）が効かない
     """
     root = Path(folder.path)
-    if not root.is_dir():
-        return FolderScan(folder, missing=True)
+    present, problem = reachable_dir(root)
+    if not present:
+        return FolderScan(folder, missing=True, error=problem)
+    skipped = {_folder_key(entry) for entry in skip}
     suffixes = _SUFFIXES.get(folder.category, _SUFFIXES[CATEGORY_OTHER])
     found: list[LibraryFile] = []
     pending = [root]
@@ -218,11 +247,14 @@ def scan_folder(folder: LibraryFolder, limit: int = SCAN_LIMIT) -> FolderScan:
         for entry in listed:
             try:
                 if entry.is_dir(follow_symlinks=False):
-                    folders.append(Path(entry.path))
+                    if _folder_key(entry.path) not in skipped:
+                        folders.append(Path(entry.path))
                     continue
                 if Path(entry.name).suffix.lower() not in suffixes:
                     continue
                 if not entry.is_file():
+                    continue
+                if entry.is_symlink() and not _inside(Path(entry.path), root):
                     continue
                 stat = entry.stat()
             except OSError:
@@ -250,8 +282,10 @@ def list_folder(folder: LibraryFolder, directory: Path, limit: int = SCAN_LIMIT)
     木で開いたフォルダの中身を出すのに使う 下まで全部を見て回ると、根を開くたびに
     数万のファイルを待つ 名前で絞るときだけ :func:`scan_folder` で下まで見る
     """
-    if not directory.is_dir():
+    present, _problem = reachable_dir(directory)
+    if not present:
         return FolderListing(missing=True)
+    root = Path(folder.path)
     suffixes = _SUFFIXES.get(folder.category, _SUFFIXES[CATEGORY_OTHER])
     files: list[LibraryFile] = []
     folders: list[Path] = []
@@ -266,6 +300,8 @@ def list_folder(folder: LibraryFolder, directory: Path, limit: int = SCAN_LIMIT)
                 folders.append(Path(entry.path))
                 continue
             if Path(entry.name).suffix.lower() not in suffixes or not entry.is_file():
+                continue
+            if entry.is_symlink() and not _inside(Path(entry.path), root):
                 continue
             stat = entry.stat()
         except OSError:
@@ -360,7 +396,10 @@ def parse_folders(value: object) -> tuple[LibraryFolder, ...]:
         if not isinstance(row, dict):
             continue
         path, category = row.get("path"), row.get("category")
-        if not isinstance(path, str) or not path.strip() or category not in CATEGORIES:
+        # 分類を文字か確かめてから表で引く 壊れた行（分類が配列など）で引くと型の例外で起動が止まる
+        if not isinstance(path, str) or not path.strip():
+            continue
+        if not isinstance(category, str) or category not in CATEGORIES:
             continue
         key = _folder_key(path)
         if key in seen:
@@ -415,7 +454,8 @@ def parse_categories(value: object, default: tuple[str, ...]) -> tuple[str, ...]
     """設定のファイルから読んだ AI に使わせる分類 知らない分類は落とす 形が違えば既定"""
     if not isinstance(value, list | tuple):
         return default
-    chosen = {str(item) for item in value if item in CATEGORIES}
+    # 文字でない要素（{} など）を表で引くと型の例外で起動が止まる 文字だけを見る
+    chosen = {item for item in value if isinstance(item, str) and item in CATEGORIES}
     # 並びは分類の表の並びにそろえる 保存するたびに並びが変わると、設定の差が読みにくい
     return tuple(key for key in CATEGORIES if key in chosen)
 
@@ -470,6 +510,29 @@ class MeasureBook:
             return None
         return _measure_from(row)
 
+    def failed(self, file: LibraryFile) -> bool:
+        """前に測れなかったファイルか（変わっていなければ測り直さない）"""
+        with self._lock:
+            row = self._load().get(file.id)
+        return (
+            row is not None
+            and bool(row.get("failed"))
+            and row.get("size") == file.size
+            and row.get("mtime") == file.modified_ns
+        )
+
+    def put_failure(self, file: LibraryFile) -> None:
+        """測れなかったことを覚える 覚えないと、読めないファイルが頭に並んだときに、呼び直す
+        たびに同じ物で測る数を使い切り、後ろの読めるファイルがいつまでも測られない
+        """
+        with self._lock:
+            self._load()[file.id] = {
+                "size": file.size,
+                "mtime": file.modified_ns,
+                "failed": True,
+            }
+            self._dirty = True
+
     def put(self, file: LibraryFile, measure: Measure) -> None:
         row: dict[str, object] = {
             "size": file.size,
@@ -522,26 +585,46 @@ class MeasureBook:
         return entries
 
 
+#: 控えから読む数の上限 これを越える値（手で書き換えた 1e999 など）の行は測り直す
+_LIMIT = 1e9
+
+
 def _measure_from(row: dict[str, object]) -> Measure | None:
-    seconds = row.get("seconds")
-    if isinstance(seconds, bool) or not isinstance(seconds, int | float):
+    """控えの行を測った物に戻す 壊れた行は ``None``（測り直す） 一覧を作る途中で例外にしない"""
+    if row.get("failed"):
+        return None
+    numbers = ("seconds", "width", "height", "fps", "loudness", "peak")
+    if any(row.get(key) is not None and _number(row.get(key)) is None for key in numbers):
+        # 読めない数（文字・無限・桁違い）のある行は丸ごと捨てて測り直す 一部だけ 0 にすると、
+        # 壊れた値を正しい測った値として使い続ける
+        return None
+    seconds = _number(row.get("seconds"))
+    width, height = _number(row.get("width")), _number(row.get("height"))
+    fps = _number(row.get("fps"))
+    if seconds is None or seconds < 0:
+        return None
+    if any(value is not None and value < 0 for value in (width, height, fps)):
         return None
     return Measure(
-        seconds=float(seconds),
+        seconds=seconds,
         has_audio=bool(row.get("audio")),
         has_video=bool(row.get("video")),
         loudness=_number(row.get("loudness")),
         peak=_number(row.get("peak")),
-        width=int(_number(row.get("width")) or 0),
-        height=int(_number(row.get("height")) or 0),
-        fps=_number(row.get("fps")) or 0.0,
+        width=int(width or 0),
+        height=int(height or 0),
+        fps=fps or 0.0,
     )
 
 
 def _number(value: object) -> float | None:
+    """有限で上限より小さい数 そうでなければ ``None``"""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return float(value)
+    number = float(value)
+    if number != number or abs(number) > _LIMIT:
+        return None
+    return number
 
 
 # --- AI が使う口 ---
@@ -572,7 +655,17 @@ class MaterialLibrary:
         return tuple(folder for folder in self.folders if folder.category in self.ai_categories)
 
     def scan_for_ai(self) -> list[FolderScan]:
-        return [scan_folder(folder) for folder in self.ai_folders]
+        """AI が見てよいフォルダを見て回る 中に別に登録したフォルダがあれば、そこには入らない
+        （その登録の分類が AI に使わせる物なら、それ自身として別に見て回る）
+        """
+        others = [folder.path for folder in self.folders]
+        return [
+            scan_folder(
+                folder,
+                skip=[path for path in others if not same_place(path, folder.path)],
+            )
+            for folder in self.ai_folders
+        ]
 
     def find_for_ai(self, wanted: str) -> LibraryFile | None:
         """AI が渡した印のファイル AI に使わせない分類のフォルダからは探さない"""
@@ -587,7 +680,15 @@ class MaterialLibrary:
         known = self.book.get(file)
         if known is not None or not allow_measure or self.measure is None:
             return known
+        if self.book.failed(file):
+            return None
         fresh = self.measure(file.path)
-        if fresh is not None:
+        if fresh is None:
+            self.book.put_failure(file)
+        else:
             self.book.put(file, fresh)
         return fresh
+
+    def tried(self, file: LibraryFile) -> bool:
+        """前に測ろうとして測れなかったか（測る数を使わずに飛ばす）"""
+        return self.book.failed(file)

@@ -22,13 +22,16 @@ import io
 import os
 import threading
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import (
     QEvent,
+    QItemSelection,
+    QItemSelectionModel,
     QMimeData,
     QModelIndex,
     QObject,
@@ -101,14 +104,17 @@ from sashimono.core.material_library import (
     kind_of,
     list_folder,
     match_files,
+    reachable_dir,
     remove_folder,
     same_place,
     scan_folder,
     toggle_favorite,
 )
+from sashimono.core.model import MediaItem
 from sashimono.engine.audio.library_sound import (
     PreviewPlayer,
     measure_library_file,
+    probe,
     sound_peaks,
     still_of,
 )
@@ -238,11 +244,13 @@ class _Worker(QObject):
 
     finished = Signal(str, object)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None, *, workers: int = 2) -> None:
         super().__init__(parent)
         # 2 本だけ 測るのは頭の 1 分のデコードで重く、本数を増やすと作品の再生と取り合う
-        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="explorer")
-        self._pending: set[str] = set()
+        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="explorer")
+        #: 仕事の名前 → （登録の印, 仕事） 印は同じ名前の古い仕事が終わったときに、
+        #: 後から頼んだ新しい仕事の登録まで消さないため
+        self._pending: dict[str, tuple[object, Future[None]]] = {}
         self._lock = threading.Lock()
         self._closed = False
 
@@ -250,26 +258,39 @@ class _Worker(QObject):
         with self._lock:
             if self._closed or key in self._pending:
                 return
-            self._pending.add(key)
+            token = object()
 
-        def run() -> None:
-            try:
-                result = job()
-            except Exception:
-                # 1 つの壊れた素材で裏の仕事を止めない その行の列と絵が空のまま残るだけ
-                result = None
-            with self._lock:
-                self._pending.discard(key)
-                if self._closed:
-                    return
-            self.finished.emit(key, result)
+            def run() -> None:
+                try:
+                    result = job()
+                except Exception:
+                    # 1 つの壊れた素材で裏の仕事を止めない その行の列と絵が空のまま残るだけ
+                    result = None
+                with self._lock:
+                    entry = self._pending.get(key)
+                    if entry is not None and entry[0] is token:
+                        del self._pending[key]
+                    if self._closed:
+                        return
+                self.finished.emit(key, result)
 
-        self._pool.submit(run)
+            self._pending[key] = (token, self._pool.submit(run))
 
     def forget(self) -> None:
-        """待っている仕事を捨てる（別のフォルダを開いた） 走っている物は終わるまで待たない"""
+        """待っている仕事を捨てる（別のフォルダを開いた）
+
+        まだ始まっていない仕事は取り消す 残すと、前の場所の数千の見本を作り終えるまで、
+        新しく開いた場所の見本が待たされる 走っている物は終わるまで待たない
+        """
         with self._lock:
+            for _token, future in self._pending.values():
+                future.cancel()
             self._pending.clear()
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return bool(self._pending)
 
     def close(self) -> None:
         with self._lock:
@@ -490,6 +511,8 @@ class _PreviewPane(QWidget):
     """エクスプローラーの中の小さなプレーヤー 絵か波形・再生／一時停止・シーク・時刻・音量"""
 
     message = Signal(str)
+    #: 裏で調べ終えた（ファイル, 素材か断りの文） 裏のスレッドから送り、画面のスレッドで受ける
+    _probed = Signal(object, object)
 
     def __init__(
         self,
@@ -503,6 +526,11 @@ class _PreviewPane(QWidget):
         self._shown_frame = -1
         self._seeking = False
         self._last_error: str | None = None
+        #: 調べている（まだ開いていない）ファイルと、開いたらすぐ鳴らすか
+        self._wanted: Path | None = None
+        self._peaks_for_wanted: np.ndarray | None = None
+        self._play_when_open = False
+        self._probed.connect(self._on_probed)
 
         self._title = QLabel("ファイルを選ぶとここで下見できます", self)
         self._title.setWordWrap(True)
@@ -521,6 +549,10 @@ class _PreviewPane(QWidget):
         self._seek.sliderPressed.connect(self._press_seek)
         self._seek.sliderReleased.connect(self._release_seek)
         self._seek.sliderMoved.connect(self._move_seek)
+        # キーで動かしたときもシークする（ドラッグを離すのを待つ作りだと、キーの分は次の
+        # 描き直しで元へ戻る） 描き直しで値を入れたときは知らせが来ない（actionTriggered は
+        # 人の操作だけ）
+        self._seek.actionTriggered.connect(self._key_seek)
         self._time = QLabel("0:00 / 0:00", self)
         self._volume = QSlider(Qt.Orientation.Horizontal, self)
         self._volume.setRange(0, 100)
@@ -560,21 +592,56 @@ class _PreviewPane(QWidget):
         self._player.set_volume(self._volume.value() / 100)
 
     def show_file(self, path: Path | None, peaks: np.ndarray | None = None) -> None:
-        """下見に出す 同じファイルなら位置を保つ 再生はしない（ダブルクリックか〔再生〕）"""
-        if path is not None and path == self._player.path:
+        """下見に出す 同じファイルなら位置を保つ 再生はしない（ダブルクリックか〔再生〕）
+
+        素材を調べるのは裏のスレッド 初めて選んだ動画は開いて頭のコマを読むので、遅い
+        ドライブでは画面のスレッドで待つと次の素材を選べない 調べ終えたときにまだ同じ
+        ファイルを選んでいれば下見に出す
+        """
+        if path is not None and path in (self._player.path, self._wanted):
             return
         self._player.close()
         self._shown_frame = -1
         self._picture.set_tile(None)
         self._wave.set_peaks(None)
+        self._play_when_open = False
+        self._wanted = path
+        self._peaks_for_wanted = peaks
         if path is None:
             self._title.setText("ファイルを選ぶとここで下見できます")
             self._set_enabled(False)
             self._show_state()
+            self._timer.stop()
             return
-        info = self._player.open(path)
+        self._title.setText(f"{path.name}（調べています）")
+        self._set_enabled(False)
+        threading.Thread(
+            target=lambda: self._probed.emit(path, probe(path)),
+            name="explorer-probe",
+            daemon=True,
+        ).start()
+
+    @property
+    def opening(self) -> bool:
+        """調べている途中か"""
+        return self._wanted is not None
+
+    def _on_probed(self, path: Path, item: object) -> None:
+        if path != self._wanted:
+            # 調べている間に別のファイルを選んだ 古い結果は使わない
+            return
+        self._wanted = None
+        peaks = self._peaks_for_wanted
         self._title.setText(path.name)
+        if not isinstance(item, MediaItem):
+            # 開けなかった 開き直すと画面のスレッドでまた待つので、裏で調べた訳をそのまま出す
+            self._play_when_open = False
+            self.message.emit(str(item) if item else "下見できません")
+            self._set_enabled(False)
+            return
+        info = self._player.open(path, item)
         if info is None:
+            self._play_when_open = False
             self.message.emit(self._player.error or "下見できません")
             self._set_enabled(False)
             return
@@ -586,13 +653,21 @@ class _PreviewPane(QWidget):
         self._set_enabled(not info.is_still)
         self._timer.start()
         self._show_state()
+        if self._play_when_open:
+            self._play_when_open = False
+            self.play()
 
     def set_peaks(self, path: Path, peaks: np.ndarray | None) -> None:
         if path == self._player.path:
             self._wave.set_peaks(peaks)
+        elif path == self._wanted:
+            self._peaks_for_wanted = peaks
 
     def toggle(self) -> None:
         if self._player.info is None:
+            # 調べている途中に〔再生〕やダブルクリックが来たら、開き終えてから鳴らす
+            if self._wanted is not None:
+                self._play_when_open = True
             return
         if not self._player.playing and self._before_play is not None:
             self._before_play()
@@ -601,6 +676,9 @@ class _PreviewPane(QWidget):
         self._show_state()
 
     def play(self) -> None:
+        if self._wanted is not None:
+            self._play_when_open = True
+            return
         if not self._player.playing:
             self.toggle()
 
@@ -630,6 +708,13 @@ class _PreviewPane(QWidget):
         self._seeking = False
         self._seek_fraction(self._seek.value() / 1000)
 
+    def _key_seek(self, action: int) -> None:
+        if self._seeking or action == QSlider.SliderAction.SliderMove.value:
+            # ドラッグの途中は離したときにシークする
+            return
+        # 知らせは値が変わる前に来る 変わった後の値で飛ぶ
+        QTimer.singleShot(0, lambda: self._seek_fraction(self._seek.value() / 1000))
+
     def _seek_fraction(self, fraction: float) -> None:
         info = self._player.info
         if info is not None:
@@ -643,11 +728,22 @@ class _PreviewPane(QWidget):
         if error is not None and error != self._last_error:
             self.message.emit(error)
         self._last_error = error
-        if not self._player.playing and self._player.frame() is not None:
-            # 止まっていて絵も出し終えたら、描き直しを止める（何もしないのに 30 回/秒起きない）
-            frame = self._player.frame()
-            if frame is not None and frame[0] == self._shown_frame:
-                self._timer.stop()
+        player = self._player
+        info = player.info
+        if info is None:
+            # 開いていない（選んでいない・調べている途中） 描き直す物が無い
+            self._timer.stop()
+            return
+        if player.playing:
+            return
+        frame = player.frame()
+        waiting = (info.has_video or info.is_still) and (
+            frame is None or frame[0] != self._shown_frame
+        )
+        if not waiting:
+            # 止まっていて絵も出し終えた（音だけの素材は絵を待たない） 何もしないのに
+            # 30 回/秒起きないよう、描き直しを止める
+            self._timer.stop()
 
     def _show_state(self) -> None:
         player = self._player
@@ -730,6 +826,13 @@ class ExplorerPanel(QWidget):
 
         self._worker = _Worker(self)
         self._worker.finished.connect(self._on_worker)
+        # 中身を読むのは別の 1 本 測る・見本を作る仕事の後ろに並ぶと、開いた場所が出るまで待つ
+        self._lister = _Worker(self, workers=1)
+        self._lister.finished.connect(self._on_listed)
+        self._listing_number = 0
+        self._listed_number = 0
+        #: 前回の場所から開いたときに、読み終えたら選ぶファイル
+        self._pending_select: list[Path] = []
 
         # --- 左 木 ---
         register = QPushButton("登録…", self)
@@ -966,11 +1069,16 @@ class ExplorerPanel(QWidget):
         return any(same_place(entry, path) for entry in self._favorites)
 
     def restore_location(self, folder: str, file: str) -> bool:
-        """前回の場所から開く そのフォルダが消えていれば何もしない（先頭から開く）"""
-        if not folder or not Path(folder).is_dir() or not self.open_folder(folder):
+        """前回の場所から開く そのフォルダが消えていれば何もしない（先頭から開く）
+
+        選んでいたファイルは中身を読み終えてから選ぶ（中身は裏で読む）
+        """
+        if not folder or not reachable_dir(Path(folder))[0]:
             return False
-        if file:
-            self.select_file(Path(file))
+        self._pending_select = [Path(file)] if file else []
+        if not self.open_folder(folder):
+            self._pending_select = []
+            return False
         return True
 
     def set_preview_volume(self, percent: int) -> None:
@@ -1003,6 +1111,7 @@ class ExplorerPanel(QWidget):
         """窓を閉じる 下見を止め、裏の仕事を捨てる"""
         self._preview.close_player()
         self._worker.close()
+        self._lister.close()
 
     def visible_files(self) -> list[Path]:
         """中身に出ている行のファイル（今の並びで）"""
@@ -1019,14 +1128,35 @@ class ExplorerPanel(QWidget):
         return ""
 
     def select_file(self, path: Path) -> bool:
+        return self.select_files([path]) == 1
+
+    def select_files(self, paths: Sequence[Path]) -> int:
+        """中身に出ている行のうち ``paths`` の物をまとめて選ぶ 選べた数を返す"""
+        wanted = set(paths)
+        model = self._table.selectionModel()
+        chosen = QItemSelection()
+        first: QModelIndex | None = None
+        count = 0
         for row in range(self._proxy.rowCount()):
             index = self._proxy.index(row, _NAME)
-            if Path(str(index.data(_PATH))) == path:
-                self._table.selectionModel().clearSelection()
-                self._table.setCurrentIndex(index)
-                self._table.selectRow(row)
-                return True
-        return False
+            if Path(str(index.data(_PATH))) in wanted:
+                chosen.select(index, self._proxy.index(row, len(COLUMNS) - 1))
+                first = first or index
+                count += 1
+        flags = (
+            QItemSelectionModel.SelectionFlag.ClearAndSelect
+            | QItemSelectionModel.SelectionFlag.Rows
+        )
+        model.blockSignals(True)
+        model.select(chosen, flags)
+        if first is not None:
+            model.setCurrentIndex(first, QItemSelectionModel.SelectionFlag.NoUpdate)
+        model.blockSignals(False)
+        # 知らせを止めてまとめて選んだので、下見と〔タイムラインへ〕は最後に 1 回だけ直す
+        self._table.viewport().update()
+        self._icons_view.viewport().update()
+        self._on_selection()
+        return count
 
     def selected_files(self) -> list[Path]:
         rows = sorted({index.row() for index in self._table.selectionModel().selectedRows()})
@@ -1125,10 +1255,10 @@ class ExplorerPanel(QWidget):
             self._tree.addTopLevelItem(root)
             for entry in self._favorites:
                 place = Path(entry)
-                if place.is_file():
+                if _is_file(place):
                     # ファイルは根を選んだときの中身に出す 木にはフォルダだけを並べる
                     continue
-                missing = not place.is_dir()
+                missing = not reachable_dir(place)[0]
                 label = place.name or entry
                 item = QTreeWidgetItem([f"{label}（見つかりません）" if missing else label])
                 item.setToolTip(0, entry)
@@ -1148,7 +1278,7 @@ class ExplorerPanel(QWidget):
             self._tree.addTopLevelItem(root)
             for folder in members:
                 directory = Path(folder.path)
-                missing = not directory.is_dir()
+                missing = not reachable_dir(directory)[0]
                 label = directory.name or folder.path
                 item = QTreeWidgetItem([f"{label}（見つかりません）" if missing else label])
                 item.setToolTip(0, folder.path)
@@ -1234,7 +1364,7 @@ class ExplorerPanel(QWidget):
         for folder in self._folders:
             if is_favorite([folder.path], path):
                 return folder
-        return LibraryFolder(str(path if path.is_dir() else path.parent), CATEGORY_OTHER)
+        return LibraryFolder(str(path if reachable_dir(path)[0] else path.parent), CATEGORY_OTHER)
 
     def _show_tree_menu(self, position: QPoint) -> None:
         item = self._tree.itemAt(position)
@@ -1276,6 +1406,12 @@ class ExplorerPanel(QWidget):
         return [(folder, directory)], crumbs
 
     def _show_files(self) -> None:
+        """今の場所の中身を裏で読み、読めたら並べる
+
+        見て回るのは裏のスレッド 名前の欄を 1 文字変えるたびに下まで探すので、大きな登録先や
+        応答の遅い外付けのドライブでは、画面のスレッドで待つと次の字を打てない 読み終えたときに
+        場所と絞り込みが変わっていれば（頼みの番号が違えば）捨てる
+        """
         self._worker.forget()
         pairs, crumbs = self._location()
         node = self._node()
@@ -1285,79 +1421,52 @@ class ExplorerPanel(QWidget):
         self._crumbs.setText(" › ".join(crumbs))
         query = self._filter.text().strip()
         kind = str(self._kind_box.currentData() or "")
-        if node == (_FAVORITE_NODE, ""):
-            self._show_favorite_files(query, kind)
-            return
-        if not self._folders:
+        favorite_place = node is not None and node[0] == _FAVORITE_NODE
+        if not self._folders and not self._favorites:
+            self._listing_number += 1
+            self._listed_number = self._listing_number
             self._fill_rows([])
             self._status.setText(
                 "フォルダが登録されていません 〔登録…〕で効果音や BGM のフォルダを登録すると、"
                 "ここで探して下見し、置けます AI に使わせる分類は 表示 → 設定… で選びます"
             )
             return
-        notes: list[str] = []
-        files: list[LibraryFile] = []
-        deep = bool(query) or node is None or not node[0]
-        if node is not None and node[0] == _FAVORITE_NODE:
-            deep = bool(query)
-        for folder, directory in pairs:
-            if not Path(folder.path).is_dir():
-                notes.append(
-                    f"{folder.label} が見つかりません（消えたか移った） 戻すか〔外す〕で外せます"
-                )
-                continue
-            if deep:
-                # 名前で絞るときと分類の根では下まで探す 場所は登録したフォルダのまま数える
-                part = LibraryFolder(str(directory), folder.category)
-                scan = scan_folder(part)
-                if scan.truncated:
-                    notes.append(
-                        f"{folder.label} はファイルが多いので頭の {len(scan.files)} 個だけ"
-                    )
-                files.extend(
-                    LibraryFile(file.path, folder, file.size, file.modified_ns)
-                    for file in scan.files
-                )
-            else:
-                files.extend(list_folder(folder, directory).files)
-        matched = [
-            file for file in match_files(files, query) if not kind or kind_of(file.path) == kind
-        ]
-        self._fill_rows(matched[:DISPLAY_LIMIT])
-        count = f"{len(matched)} 個"
-        if len(matched) > DISPLAY_LIMIT:
-            count += f"（頭の {DISPLAY_LIMIT} 個を表示 名前で絞り込んでください）"
-        self._status.setText("  ".join([count, *notes]))
+        self._listing_number += 1
+        number = self._listing_number
+        if node == (_FAVORITE_NODE, ""):
+            job: Callable[[], object] = partial(
+                _favorite_listing, self._favorites, self._owner, query, kind
+            )
+        else:
+            deep = bool(query) if favorite_place else (bool(query) or node is None or not node[0])
+            job = partial(_listing, pairs, deep, query, kind)
+        self._lister.forget()
+        self._lister.submit(f"list:{number}", job)
 
-    def _show_favorite_files(self, query: str, kind: str) -> None:
-        """お気に入りの根 印を付けたファイル（フォルダは木から辿る）"""
-        files: list[LibraryFile] = []
-        missing = 0
-        for entry in self._favorites:
-            place = Path(entry)
-            if place.is_dir():
-                continue
-            try:
-                stat = place.stat()
-            except OSError:
-                # 消えた・移った物も外さずに残す 数だけ知らせる
-                missing += 1
-                continue
-            files.append(LibraryFile(place, self._owner(place), stat.st_size, stat.st_mtime_ns))
-        matched = [
-            file for file in match_files(files, query) if not kind or kind_of(file.path) == kind
-        ]
-        self._fill_rows(matched)
-        notes = [f"{len(matched)} 個"]
-        if missing:
-            notes.append(f"{missing} 個が見つかりません（消えたか移った） 右クリックで外せます")
-        if not self._favorites:
-            notes = ["お気に入りはありません"]
-        self._status.setText("  ".join(notes))
+    @property
+    def listing(self) -> bool:
+        """中身を裏で読んでいる途中か（読み終えて並べるまで）"""
+        return self._listed_number != self._listing_number
+
+    def _on_listed(self, key: str, result: object) -> None:
+        if key != f"list:{self._listing_number}":
+            # 読んでいる間に別の場所を開いたか、絞り込みを変えた 古い結果は並べない
+            return
+        self._listed_number = self._listing_number
+        if not isinstance(result, tuple):
+            self._fill_rows([])
+            self._status.setText("この場所を読めません")
+            return
+        files, status = result
+        self._fill_rows(files)
+        self._status.setText(status)
         self._emit_location()
 
     def _fill_rows(self, files: Sequence[LibraryFile]) -> None:
-        selected = set(self.selected_files())
+        selected = self.selected_files()
+        if self._pending_select:
+            # 前回の場所から開いたときの選び 中身を読み終えてから選ぶ
+            selected, self._pending_select = list(self._pending_select), []
         self._table.setSortingEnabled(False)
         self._model.removeRows(0, self._model.rowCount())
         self._files = {}
@@ -1370,12 +1479,12 @@ class ExplorerPanel(QWidget):
             self._model.appendRow(self._row(file, measure))
         self._table.setSortingEnabled(True)
         self._table.resizeColumnToContents(_NAME)
-        for path in selected:
-            self.select_file(path)
+        # 1 つずつ選ぶと前の選びが外れ、最後の 1 つしか残らない まとめて選び直す
+        self.select_files(selected)
         measurer = self._measure
         if measurer is not None:
             for file in unmeasured[:_MEASURE_LIMIT]:
-                self._worker.submit(f"measure:{file.id}", _bound(measurer, file.path))
+                self._worker.submit(f"measure:{file.id}", _measured(measurer, file))
         if self._view_mode == VIEW_ICONS:
             self._request_icons()
         self._on_selection()
@@ -1406,9 +1515,9 @@ class ExplorerPanel(QWidget):
             cell.setEditable(False)
             cell.setDropEnabled(False)
         if kind == KIND_SOUND:
-            cells[_NAME].setIcon(self._icons.get(file.id, self._audio_icon))
+            cells[_NAME].setIcon(self._icons.get(_stamp(file), self._audio_icon))
         else:
-            cells[_NAME].setIcon(self._icons.get(file.id, self._pending_icon))
+            cells[_NAME].setIcon(self._icons.get(_stamp(file), self._pending_icon))
         self._fill_measure(cells, measure)
         return cells
 
@@ -1444,29 +1553,35 @@ class ExplorerPanel(QWidget):
         if file is None:
             # 別の場所を開いた後に届いた 測った物だけは控えに入れる（次に開いたときに使う）
             return
-        if kind == "measure" and isinstance(result, Measure):
-            self._book.put(file, result)
+        if kind == "measure" and isinstance(result, tuple):
+            asked, measure = result
+            # 頼んだときのファイルと今の行のファイルが同じ（大きさと更新時刻まで）ときだけ使う
+            # 差し替わった後の行に前のファイルの長さを出さない
+            if asked != file or not isinstance(measure, Measure):
+                return
+            self._book.put(asked, measure)
             cells = self._row_of(file_key)
             if cells is not None:
-                self._fill_measure(cells, result)
+                self._fill_measure(cells, measure)
         elif kind == "still" and isinstance(result, np.ndarray):
-            self._icons[file_key] = thumbnail_icon(result)
-            self._set_icon(file_key)
+            self._icons[_stamp(file)] = thumbnail_icon(result)
+            self._set_icon(file)
         elif kind == "peaks" and isinstance(result, np.ndarray):
-            self._peaks[file_key] = result
-            self._icons[file_key] = _peaks_icon(result)
-            self._set_icon(file_key)
+            self._peaks[_stamp(file)] = result
+            self._icons[_stamp(file)] = _peaks_icon(result)
+            self._set_icon(file)
             self._preview.set_peaks(file.path, result)
 
-    def _set_icon(self, key: str) -> None:
-        cells = self._row_of(key)
+    def _set_icon(self, file: LibraryFile) -> None:
+        cells = self._row_of(file.id)
         if cells is not None:
-            cells[_NAME].setIcon(self._icons[key])
+            cells[_NAME].setIcon(self._icons[_stamp(file)])
 
     def _request_icons(self) -> None:
         """アイコン表示の見本の絵と波形を頼む 控えにあればそれを使う"""
-        for key, file in self._files.items():
-            if key in self._icons:
+        for file in self._files.values():
+            # 同じ場所でも中身を差し替えた素材は作り直す（大きさと更新時刻まで見る）
+            if _stamp(file) in self._icons:
                 continue
             self._request_picture(file)
 
@@ -1550,7 +1665,7 @@ class ExplorerPanel(QWidget):
             return
         path = files[0]
         file = next((f for f in self._files.values() if f.path == path), None)
-        peaks = self._peaks.get(file.id) if file is not None else None
+        peaks = self._peaks.get(_stamp(file)) if file is not None else None
         self._preview.show_file(path, peaks)
         if file is not None and peaks is None and kind_of(path) == KIND_SOUND:
             # 音の下見に波形を出す 一覧表示でも作る（作った物はアイコンの絵にも使う）
@@ -1615,3 +1730,103 @@ class ExplorerPanel(QWidget):
 def _bound(job: Callable[[Path], object], path: Path) -> Callable[[], object]:
     """裏の仕事へ渡す、場所を決めた呼び出し（繰り返しの中の lambda は最後の場所を掴む）"""
     return lambda: job(path)
+
+
+def _is_file(path: Path) -> bool:
+    """ファイルか 見られない場所（アクセス権を失った）でも投げずに偽"""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _measured(job: Callable[[Path], Measure | None], file: LibraryFile) -> Callable[[], object]:
+    """裏で測る仕事 頼んだときのファイルと組にして返す
+
+    測っている間に同じ名前のファイルが差し替わると、前のファイルの長さを新しいファイルの物
+    として覚えてしまう 測り終えたときに大きさと更新時刻が変わっていれば捨てる
+    """
+
+    def run() -> object:
+        measure = job(file.path)
+        try:
+            stat = file.path.stat()
+        except OSError:
+            return None
+        if (stat.st_size, stat.st_mtime_ns) != (file.size, file.modified_ns):
+            return None
+        return (file, measure)
+
+    return run
+
+
+def _listing(
+    pairs: Sequence[tuple[LibraryFolder, Path]], deep: bool, query: str, kind: str
+) -> tuple[list[LibraryFile], str]:
+    """場所の中身と状態の文（裏のスレッドで呼ぶ）"""
+    notes: list[str] = []
+    files: list[LibraryFile] = []
+    for folder, directory in pairs:
+        present, problem = reachable_dir(Path(folder.path))
+        if not present:
+            notes.append(
+                f"{folder.label} が見つかりません（消えたか移った） 戻すか〔外す〕で外せます"
+                if not problem
+                else f"{folder.label} を{problem}"
+            )
+            continue
+        if deep:
+            # 名前で絞るときと分類の根では下まで探す 場所は登録したフォルダのまま数える
+            scan = scan_folder(LibraryFolder(str(directory), folder.category))
+            if scan.missing:
+                notes.append(f"{directory.name} が見つかりません（消えたか移った）")
+            if scan.truncated:
+                notes.append(f"{folder.label} はファイルが多いので頭の {len(scan.files)} 個だけ")
+            files.extend(
+                LibraryFile(file.path, folder, file.size, file.modified_ns) for file in scan.files
+            )
+        else:
+            listed = list_folder(folder, directory)
+            if listed.missing:
+                # 開いていた下のフォルダが消えた 空のフォルダと見分けが付くように知らせる
+                notes.append(f"{directory.name} が見つかりません（消えたか移った）")
+            files.extend(listed.files)
+    matched = [file for file in match_files(files, query) if not kind or kind_of(file.path) == kind]
+    count = f"{len(matched)} 個"
+    if len(matched) > DISPLAY_LIMIT:
+        count += f"（頭の {DISPLAY_LIMIT} 個を表示 名前で絞り込んでください）"
+    return matched[:DISPLAY_LIMIT], "  ".join([count, *notes])
+
+
+def _favorite_listing(
+    favorites: Sequence[str],
+    owner: Callable[[Path], LibraryFolder],
+    query: str,
+    kind: str,
+) -> tuple[list[LibraryFile], str]:
+    """お気に入りの根の中身 印を付けたファイル（フォルダは木から辿る）"""
+    files: list[LibraryFile] = []
+    missing = 0
+    for entry in favorites:
+        place = Path(entry)
+        if reachable_dir(place)[0]:
+            continue
+        try:
+            stat = place.stat()
+        except OSError:
+            # 消えた・移った物も外さずに残す 数だけ知らせる
+            missing += 1
+            continue
+        files.append(LibraryFile(place, owner(place), stat.st_size, stat.st_mtime_ns))
+    matched = [file for file in match_files(files, query) if not kind or kind_of(file.path) == kind]
+    if not favorites:
+        return [], "お気に入りはありません"
+    notes = [f"{len(matched)} 個"]
+    if missing:
+        notes.append(f"{missing} 個が見つかりません（消えたか移った） 右クリックで外せます")
+    return matched, "  ".join(notes)
+
+
+def _stamp(file: LibraryFile) -> str:
+    """見本の絵と波形を覚える名前 同じ場所でも中身を差し替えたら別の名前になる"""
+    return f"{file.id}-{file.size}-{file.modified_ns}"

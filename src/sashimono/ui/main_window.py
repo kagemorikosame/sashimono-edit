@@ -1732,6 +1732,11 @@ class MainWindow(QMainWindow):
 
         self._playback.frame_changed.connect(self._on_playback_frame)
         self._playback.state_changed.connect(self._transport.set_playing)
+        # 作品を鳴らし始めたらエクスプローラーの下見を止める ボタンもショートカットも
+        # ここを通る 止めないと下見と作品の 2 つの音が重なる
+        self._playback.state_changed.connect(
+            lambda playing: self._explorer.preview.stop() if playing else None
+        )
         # 再生中は先読みを止める 同じ GPU を奪い合うと、いま出すべきコマが遅れる
         self._playback.state_changed.connect(self._preview.set_playing)
         # 先読みを止めたら伝える 黙って効かない状態にしない
@@ -2184,7 +2189,9 @@ class MainWindow(QMainWindow):
         spot = target.spot if target is not None else None
         scene = target.scene if target is not None else self._active_scene
         outcomes = batch.results()
-        if self._scene_project(scene) is not None:
+        # 素材一覧へ入れるだけなら作品の大きさとレートを合わせない 合わせるのは別の取り消しの
+        # 段なので、読み込みを取り消しても作品の設定だけが変わったまま残る
+        if self._scene_project(scene) is not None and batch not in self._pool_only:
             self._match_project_to([item for item in outcomes if isinstance(item, MediaItem)])
         if spot is not None and target is not None:
             now = self._document.project.rate

@@ -3546,7 +3546,9 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
         if favorites_only and not favorite:
             continue
         known = library.measured(file, allow_measure=False)
-        if known is None and budget > 0:
+        # 前に測れなかったファイルは、変わるまで測る数を使わずに飛ばす 飛ばさないと、読めない
+        # ファイルが頭に並んだときに、呼び直すたびに同じ物で数を使い切り、後ろが測られない
+        if known is None and budget > 0 and not library.tried(file):
             budget -= 1
             known = library.measured(file, allow_measure=True)
         if known is None:
@@ -5414,7 +5416,9 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
         if not path.exists():
             raise ToolError(f"ファイルがありません: {path}")
         sources.append((host.probe(path), True))
-    sources.extend(_library_media(host, entry) for entry in ids)
+    # 同じ印を 2 度渡されても 1 つにする 未取り込みのファイルを 2 度開くと別の素材として
+    # 2 つ登録される（どちらも前の文書を見て「まだ無い」と決めるため）
+    sources.extend(_library_media(host, entry) for entry in dict.fromkeys(ids))
 
     project = _project(host)
     commands: list[Command] = []

@@ -24,14 +24,20 @@ from tests.waiting import wait_until
 class _Sink:
     """鳴らさずに受け取る出口 機械の出口を待たないので、時計より速く読み進む"""
 
-    def __init__(self) -> None:
+    def __init__(self, gate: threading.Event | None = None) -> None:
         self.samples = 0
         self.closed = threading.Event()
+        self.drained: bool | None = None
+        #: 渡すと、最初の 1 回を書いた後はこれが立つまで次を書かせない（止める間合いを決める）
+        self._gate = gate
 
     def write(self, samples: np.ndarray) -> None:
         self.samples += len(samples)
+        if self._gate is not None:
+            self._gate.wait()
 
-    def close(self) -> None:
+    def close(self, drain: bool) -> None:
+        self.drained = drain
         self.closed.set()
 
 
@@ -124,15 +130,28 @@ class TestPreviewPlayer:
         # 壊れると、動画を選んでも下見が黒いままか、再生しても絵が動かない
         path = write_video(tmp_path / "動画.mp4", 2.0, tone_db=-20.0)
         clock = _Clock()
-        player = PreviewPlayer(sink=lambda _rate, _channels: _Sink(), clock=clock)
+        sinks: list[_Sink] = []
+
+        def make(_rate: int, _channels: int) -> _Sink:
+            sinks.append(_Sink())
+            return sinks[-1]
+
+        player = PreviewPlayer(sink=make, clock=clock)
         info = player.open(path)
         assert info is not None and info.has_video
         wait_until(lambda: player.frame() is not None, "頭の絵")
         first = player.frame()
         assert first is not None
         player.play()
+        # 音の出口を開き終えてから時計を進める 開くまでの時間は再生に数えない作りなので、
+        # 先に進めると開いたときに頭へ取り直される
+        wait_until(lambda: bool(sinks) and sinks[0].samples > 0, "下見の音")
         clock.now = 1.0
-        wait_until(lambda: (f := player.frame()) is not None and f[0] != first[0], "動いた絵")
+        # 番号でなく絵そのものが変わったかを見る 同じ頭の絵を出し直すだけでも番号は進む
+        wait_until(
+            lambda: (f := player.frame()) is not None and not np.array_equal(f[1], first[1]),
+            "動いた絵",
+        )
         player.close()
         assert player.frame() is None
 
@@ -143,3 +162,53 @@ class TestPreviewPlayer:
         assert player.error is not None and "開けません" in player.error
         player.play()
         assert not player.playing
+
+    def test_seeking_near_the_end_keeps_the_place(self, tmp_path: Path) -> None:
+        # 壊れると、再生中に終わりの近くへ飛ぶと頭へ戻り、飛んだ所が聞けない
+        path = write_tone(tmp_path / "音.wav", tone(3.0, -12.0))
+        clock = _Clock()
+        player = PreviewPlayer(sink=lambda _rate, _channels: _Sink(), clock=clock)
+        player.open(path)
+        player.play()
+        player.seek(2.98)
+        assert player.position == pytest.approx(2.98)
+        player.close()
+
+    def test_a_sound_that_cannot_play_stops(self, tmp_path: Path) -> None:
+        # 壊れると、出口を開けない機械で時計だけが進み、〔一時停止〕のまま押し直しても試せない
+        path = write_tone(tmp_path / "音.wav", tone(3.0, -12.0))
+
+        def broken(_rate: int, _channels: int) -> _Sink:
+            raise RuntimeError("出口がありません")
+
+        player = PreviewPlayer(sink=broken)
+        player.open(path)
+        player.play()
+        wait_until(lambda: player.error is not None, "鳴らせない知らせ")
+        assert not player.playing
+        assert "鳴らせません" in (player.error or "")
+
+    def test_stopping_throws_away_what_was_written(self, tmp_path: Path) -> None:
+        # 壊れると、止めた後も出口に書いた分が鳴り続け、古い音が聞こえる
+        path = write_tone(tmp_path / "音.wav", tone(3.0, -12.0))
+        sinks: list[_Sink] = []
+        gate = threading.Event()
+
+        def make(_rate: int, _channels: int) -> _Sink:
+            sinks.append(_Sink(gate if not sinks else None))
+            return sinks[-1]
+
+        clock = _Clock()
+        player = PreviewPlayer(sink=make, clock=clock)
+        player.open(path)
+        player.play()
+        wait_until(lambda: bool(sinks) and sinks[0].samples > 0, "下見の音")
+        player.pause()
+        gate.set()
+        wait_until(sinks[0].closed.is_set, "止めた後の片付け")
+        assert sinks[0].drained is False
+        # 終わりまで鳴らしたときだけ鳴らし切る
+        player.seek(0.0)
+        player.play()
+        wait_until(lambda: len(sinks) == 2 and sinks[1].closed.is_set(), "鳴らし切り")
+        assert sinks[1].drained is True

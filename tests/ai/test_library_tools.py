@@ -320,6 +320,17 @@ class TestImport:
         with pytest.raises(ToolError, match="どちらか"):
             run(work, "import_media")
 
+    def test_the_same_file_twice_is_read_once(self, work: _LibraryHost) -> None:
+        # 壊れると、同じ印を 2 度渡すと同じ音が素材一覧に 2 つ並ぶ
+        row = _file(work, "ドン.wav")
+        run(
+            work,
+            "import_media",
+            library_file_ids=[row["file_id"], row["file_id"]],
+            pool_only=True,
+        )
+        assert sum(m.path.name == "ドン.wav" for m in work.document.project.media) == 1
+
 
 class TestFavorites:
     def test_favorites_only_stays_inside_the_allowed_categories(

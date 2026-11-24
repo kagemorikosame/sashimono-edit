@@ -19,13 +19,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
-from itertools import pairwise
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 
 from sashimono.core.material_library import Measure
+from sashimono.core.model import MediaItem
 from sashimono.engine.checks.loudness import LoudnessMeter
 from sashimono.engine.decode.audio import AudioDecoder
 from sashimono.engine.decode.image import read_image
@@ -38,6 +38,7 @@ __all__ = [
     "AudioSink",
     "PreviewPlayer",
     "measure_library_file",
+    "probe",
     "sound_peaks",
     "still_of",
 ]
@@ -57,6 +58,8 @@ _BLOCK = 2048
 _FRAME_POLL = 1 / 60
 #: 波形の見本を作るときのサンプリングレート 見本は数百の点なので粗くてよく、長い BGM でも速い
 _PEAK_RATE = 8000
+#: 波形の見本を作るときに一度に読む長さ（サンプル 1 分）
+_PEAK_CHUNK = _PEAK_RATE * 60
 
 
 def measure_library_file(path: Path) -> Measure | None:
@@ -91,7 +94,12 @@ def measure_library_file(path: Path) -> Measure | None:
                 count = min(_CHUNK, total - cursor)
                 meter.add(decoder.read(cursor, count).astype(np.float64))
                 cursor += count
+            # 途中で読めなくなった音は、残りを無音で埋めて返ってくる その音から測った大きさを
+            # 覚えると、AI が実際より小さい音として選ぶ 長さと絵の大きさだけを残す
+            broken = decoder.decode_error is not None
     except (ProbeError, OSError, ValueError):
+        broken = True
+    if broken:
         # 音の道が壊れていても長さは分かる 大きさは測れなかったとだけ返す
         return Measure(
             seconds=seconds,
@@ -132,14 +140,20 @@ def sound_peaks(path: Path, columns: int) -> np.ndarray | None:
             total = int(decoder.duration * _PEAK_RATE)
             if total <= 0:
                 return None
-            samples = np.abs(decoder.read(0, total)[:, 0])
+            peaks = np.zeros(columns, dtype=np.float32)
+            # 塊ごとに読み、列ごとの山だけを足していく 全体を 1 度に読むと、3 時間の素材で
+            # 8 kHz でも数百 MB の配列を作る
+            cursor = 0
+            while cursor < total:
+                count = min(_PEAK_CHUNK, total - cursor)
+                block = np.abs(decoder.read(cursor, count)[:, 0])
+                where = (np.arange(cursor, cursor + len(block)) * columns // total).clip(
+                    0, columns - 1
+                )
+                np.maximum.at(peaks, where, block.astype(np.float32))
+                cursor += count
     except (ProbeError, OSError, ValueError):
         return None
-    edges = np.linspace(0, len(samples), columns + 1).astype(int)
-    peaks = np.array(
-        [samples[a:b].max() if b > a else 0.0 for a, b in pairwise(edges)],
-        dtype=np.float32,
-    )
     return np.clip(peaks, 0.0, 1.0)
 
 
@@ -148,7 +162,9 @@ class AudioSink(Protocol):
 
     def write(self, samples: np.ndarray) -> None: ...
 
-    def close(self) -> None: ...
+    def close(self, drain: bool) -> None:
+        """``drain`` が真なら書いた分を鳴らし切ってから閉じる 偽なら捨てて閉じる"""
+        ...
 
 
 def _device_sink(rate: int, channels: int) -> AudioSink:
@@ -161,8 +177,13 @@ def _device_sink(rate: int, channels: int) -> AudioSink:
         def write(self, samples: np.ndarray) -> None:
             stream.write(np.ascontiguousarray(samples, dtype=np.float32))
 
-        def close(self) -> None:
-            stream.stop()
+        def close(self, drain: bool) -> None:
+            # 止めた・飛んだときは書いた分を捨てる（stop は残りを鳴らし切るので、止めた後に
+            # 古い音が聞こえる） 終わりまで鳴らしたときだけ鳴らし切る
+            if drain:
+                stream.stop()
+            else:
+                stream.abort()
             stream.close()
 
     return _Sink()
@@ -207,15 +228,18 @@ class PreviewPlayer:
 
     # --- 外から ---
 
-    def open(self, path: Path) -> PreviewInfo | None:
-        """``path`` を開く 前のファイルは止める 開けなければ ``None``"""
+    def open(self, path: Path, item: MediaItem | None = None) -> PreviewInfo | None:
+        """``path`` を開く 前のファイルは止める 開けなければ ``None``
+
+        ``item`` は裏で調べておいた素材 渡せば画面のスレッドで素材を開かない（:func:`probe`）
+        """
         self.close()
-        try:
-            item = probe_media(path)
-        except (ProbeError, OSError) as exc:
+        found = probe(path) if item is None else item
+        if isinstance(found, str):
             with self._lock:
-                self._error = f"開けません: {exc}"
+                self._error = found
             return None
+        item = found
         info = PreviewInfo(
             duration=float(item.duration),
             has_video=item.has_video,
@@ -278,13 +302,18 @@ class PreviewPlayer:
         with self._lock:
             self._volume = max(0.0, min(1.0, volume))
 
-    def play(self) -> None:
+    def play(self, *, restart_at_end: bool = True) -> None:
+        """今の位置から鳴らす ``restart_at_end`` が真なら、終わりで止まっていれば頭から
+
+        シークした後に続けて鳴らすときは偽で呼ぶ 終わりの近くへ飛んだのに頭へ戻ると、
+        飛んだ所が聞けない
+        """
         with self._lock:
             info, path = self._info, self._path
             if info is None or path is None or info.is_still or self._anchor is not None:
                 return
             start = self._position
-            if info.duration > 0 and start >= info.duration - 0.05:
+            if restart_at_end and info.duration > 0 and start >= info.duration - 0.05:
                 # 終わりで止まっていたら頭から（メディアブラウザーと同じ）
                 start = 0.0
             self._generation += 1
@@ -322,7 +351,7 @@ class PreviewPlayer:
             self._anchor = None
             self._position = target
         if was_playing:
-            self.play()
+            self.play(restart_at_end=False)
         elif info.has_video:
             self._start_still(target)
 
@@ -397,17 +426,33 @@ class PreviewPlayer:
 
     def _play_sound(self, path: Path, generation: int, start: float) -> None:
         sink: AudioSink | None = None
+        finished = False
         try:
             with AudioDecoder(path, sample_rate=_RATE, channels=2) as decoder:
                 total = int(decoder.duration * _RATE)
                 cursor = int(start * _RATE)
                 sink = self._sink(_RATE, 2)
+                with self._lock:
+                    # 開くのに使った時間は再生の時間に数えない 数えると、開くのが音の長さより
+                    # 遅い短い効果音は、1 つも書かないまま終わったことになる
+                    # 止めた・飛んだ後（頼みの番号が違う）は取り直さない
+                    if generation == self._generation and self._anchor is not None:
+                        self._anchor = (self._anchor[0], self._clock())
                 while cursor < total and self._alive(generation):
                     count = min(_BLOCK, total - cursor)
                     with self._lock:
                         volume = self._volume
-                    sink.write((decoder.read(cursor, count) * volume).astype(np.float32))
+                    block = (decoder.read(cursor, count) * volume).astype(np.float32)
+                    # 読んでいる間に止めた・飛んだら書かない 書くと止めた後に古い音が鳴る
+                    if not self._alive(generation):
+                        break
+                    sink.write(block)
                     cursor += count
+                with self._lock:
+                    # 時計が終わりに来て止まった形になったのも、鳴らし切ってよい終わり
+                    info = self._info
+                    ended = info is not None and self._position >= info.duration - _BLOCK / _RATE
+                finished = cursor >= total or ended
         except (ProbeError, OSError, ValueError) as exc:
             self._fail(generation, f"音を読めません: {exc}")
         except Exception as exc:
@@ -417,13 +462,28 @@ class PreviewPlayer:
             # 閉じる失敗は鳴り終えた後なので知らせない
             if sink is not None:
                 with contextlib.suppress(Exception):
-                    sink.close()
+                    sink.close(drain=finished)
 
     def _fail(self, generation: int, message: str) -> None:
         with self._lock:
             if generation != self._generation:
                 return
             self._error = message
+            info = self._info
+            if info is not None and not info.has_video and self._anchor is not None:
+                # 音だけの素材で鳴らせなければ止まった形へ戻す 戻さないと時計だけが進み、
+                # 〔一時停止〕のまま押し直しても試し直せない 動画は絵だけを続ける
+                self._position = self._now()
+                self._anchor = None
+                self._generation += 1
+
+
+def probe(path: Path) -> MediaItem | str:
+    """下見のために素材を調べる 開けなければ断りの文 裏のスレッドから呼んでよい"""
+    try:
+        return probe_media(path)
+    except (ProbeError, OSError) as exc:
+        return f"開けません: {exc}"
 
 
 def _shrink(tile: np.ndarray) -> np.ndarray:

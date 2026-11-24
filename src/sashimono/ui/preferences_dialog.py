@@ -1722,6 +1722,8 @@ class PreferencesDialog(QDialog):
             explorer_ai_bgm=self._explorer_ai_bgm.isChecked(),
             explorer_preview_volume=self._explorer_volume.value(),
             explorer_double_click=str(self._explorer_double_click.currentData()),
+            explorer_view=str(self._explorer_view.currentData()),
+            explorer_icon_size=self._explorer_icon_size.value(),
             seam_video=str(self._seam_video.currentData()),
             seam_crossfade_ms=self._seam_crossfade.value(),
             seam_zoom_percent=self._seam_zoom.value(),
@@ -1906,7 +1908,14 @@ class PreferencesDialog(QDialog):
         登録はエクスプローラーのパネルでもできる ここにも出すのは、AI に使わせる分類と
         並べて見ながら決めたいため（どのフォルダが AI に見えるかが分かる）
         """
-        from sashimono.ui.explorer import ask_category, ask_folder
+        from sashimono.ui.explorer import (
+            DOUBLE_CLICK_ACTIONS,
+            ICON_SIZE_RANGE,
+            VIEW_ICONS,
+            VIEW_LIST,
+            ask_category,
+            ask_folder,
+        )
 
         self._explorer_folder_values: tuple[LibraryFolder, ...] = preferences.explorer_folders
         self._explorer_list = QListWidget(self)
@@ -2003,7 +2012,8 @@ class PreferencesDialog(QDialog):
         form.addRow("エクスプローラー: 下見の音量", self._explorer_volume)
 
         self._explorer_double_click = QComboBox(self)
-        for key, name in (("preview", "下見で再生する"), ("timeline", "タイムラインへ置く")):
+        # 選択肢はパネルと同じ表から作る ここで書き直すと、名前を変えたときに設定画面だけ古く残る
+        for key, name in DOUBLE_CLICK_ACTIONS.items():
             self._explorer_double_click.addItem(name, key)
         self._explorer_double_click.setCurrentIndex(
             max(0, self._explorer_double_click.findData(preferences.explorer_double_click))
@@ -2013,6 +2023,26 @@ class PreferencesDialog(QDialog):
             "ドラッグと〔タイムラインへ〕でもできる"
         )
         form.addRow("エクスプローラー: ダブルクリック", self._explorer_double_click)
+
+        # 表示とアイコンの幅はパネルのボタンとスライダーでも選べ、選んだ物を覚える
+        # ここにも出すのは、好みの設定を 1 か所で見渡せるようにするため
+        self._explorer_view = QComboBox(self)
+        for key, name in ((VIEW_LIST, "一覧（列のある表）"), (VIEW_ICONS, "アイコン（見本の絵）")):
+            self._explorer_view.addItem(name, key)
+        self._explorer_view.setCurrentIndex(
+            max(0, self._explorer_view.findData(preferences.explorer_view))
+        )
+        self._explorer_view.setToolTip(
+            "エクスプローラーの中身の出し方 パネルの〔一覧〕〔アイコン〕と同じ"
+        )
+        form.addRow("エクスプローラー: 表示", self._explorer_view)
+        self._explorer_icon_size = QSpinBox(self)
+        self._explorer_icon_size.setRange(*ICON_SIZE_RANGE)
+        self._explorer_icon_size.setSingleStep(16)
+        self._explorer_icon_size.setSuffix(" px")
+        self._explorer_icon_size.setValue(preferences.explorer_icon_size)
+        self._explorer_icon_size.setToolTip("アイコン表示の絵の幅 パネルのスライダーと同じ")
+        form.addRow("エクスプローラー: アイコンの幅", self._explorer_icon_size)
 
     def _add_seam_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """ジャンプカットのつなぎ目（#332）の既定 溶かすか寄るか・どれだけの長さかは人と作品で違う

@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
+import json
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -127,12 +127,10 @@ class TestScan:
         # 市販の効果音集は数千のファイルを持つ 一覧を開くたびに止まると使えない
         for number in range(4000):
             (tmp_path / f"音{number:04}.wav").write_bytes(b"")
-        started = time.perf_counter()
+        # 秒は測らない（CI の書き込みの混み具合で落ちる） 速さは 1 段ずつの scandir と、
+        # 画面では裏で読む作りで受け持つ ここは数千でも全部を拾うことだけを見る
         scan = scan_folder(LibraryFolder(str(tmp_path), CATEGORY_SOUND_EFFECT))
-        elapsed = time.perf_counter() - started
-        assert len(scan.files) == 4000
-        # 手元では 0.1 秒ほど CI の遅い機械と、並んで走る試験の分の余裕を見る
-        assert elapsed < 5
+        assert len(scan.files) == 4000 and not scan.truncated
 
     def test_a_huge_folder_is_cut_at_the_limit(self, tmp_path: Path) -> None:
         # 壊れると、ドライブの頭を登録しただけで一覧を作るたびに画面が止まる
@@ -247,3 +245,54 @@ class TestFavorites:
         # 壊れた値で起動を止めない
         assert parse_paths("D:/x") == ()
         assert parse_paths(["D:/x", "", 3, "D:/x"]) == ("D:/x",)
+
+
+class TestReviewFixes:
+    def test_broken_rows_do_not_stop_the_start(self) -> None:
+        # 壊れると、手で書き換えた設定の 1 行（分類が配列など）で型の例外になり起動が止まる
+        assert parse_folders([{"path": "D:/SE", "category": []}]) == ()
+        assert parse_categories(["music", {}], ()) == (CATEGORY_MUSIC,)
+        assert parse_categories([], DEFAULT_AI_CATEGORIES) == ()
+
+    def test_a_nested_registration_is_its_own_boundary(self, tmp_path: Path) -> None:
+        # 壊れると、親を効果音・子を動画で登録して効果音だけを AI に許したのに、子の音を
+        # 親の効果音として AI が選ぶ
+        _touch(tmp_path / "SE" / "ドン.wav")
+        _touch(tmp_path / "SE" / "動画" / "隠し.wav")
+        _touch(tmp_path / "SE" / "下" / "見える.wav")
+        library = MaterialLibrary(
+            folders=(
+                LibraryFolder(str(tmp_path / "SE"), CATEGORY_SOUND_EFFECT),
+                LibraryFolder(str(tmp_path / "SE" / "動画"), CATEGORY_VIDEO),
+            )
+        )
+        names = sorted(file.name for scan in library.scan_for_ai() for file in scan.files)
+        assert names == ["ドン.wav", "見える.wav"]
+        assert library.find_for_ai(file_id(tmp_path / "SE" / "動画" / "隠し.wav")) is None
+
+    def test_a_broken_cache_row_is_measured_again(self, tmp_path: Path) -> None:
+        # 壊れると、控えの 1 行（1e999 など）で一覧を作る途中に例外が出て一覧が止まる
+        sound = _touch(tmp_path / "SE" / "ドン.wav")
+        file = scan_folder(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT)).files[0]
+        path = tmp_path / "measures.json"
+        row = {"size": file.size, "mtime": file.modified_ns, "seconds": 1.0, "width": 1e999}
+        path.write_text(json.dumps({"version": 2, "files": {file.id: row}}), encoding="utf-8")
+        assert MeasureBook(path).get(file) is None
+
+    def test_a_file_that_cannot_be_measured_is_not_tried_again(self, tmp_path: Path) -> None:
+        # 壊れると、読めないファイルが頭に並んだときに、呼び直すたびに同じ物で測る数を使い切る
+        sound = _touch(tmp_path / "SE" / "壊れた.wav")
+        calls: list[Path] = []
+
+        def measure(path: Path) -> Measure | None:
+            calls.append(path)
+            return None
+
+        library = MaterialLibrary(
+            folders=(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT),), measure=measure
+        )
+        file = library.scan_for_ai()[0].files[0]
+        assert library.measured(file, allow_measure=True) is None
+        assert library.tried(file)
+        assert library.measured(file, allow_measure=True) is None
+        assert calls == [sound]
