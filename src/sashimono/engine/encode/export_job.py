@@ -33,6 +33,7 @@ from sashimono.engine.encode.exporter import (
     ExportSettings,
     export_project,
 )
+from sashimono.engine.encode.formats import DEFAULT_FORMAT, format_named, format_of
 from sashimono.engine.encoders import (
     PRIORITY_CPU,
     ProbeMemory,
@@ -150,14 +151,17 @@ def export_job(
     runtime.apply()
     if probes is not None:
         remember(probes)
-    # GL を作れるかを先に確かめる 書き出しの途中で作れないと分かると、どこまで書いたかの
-    # 後片付けまで子の中で済ませてから親が頭からやり直すことになり、時間が倍かかる
-    from sashimono.engine.gpu import GLContextError, OffscreenGLContext
+    if not _audio_only(settings):
+        # GL を作れるかを先に確かめる 書き出しの途中で作れないと分かると、どこまで書いたかの
+        # 後片付けまで子の中で済ませてから親が頭からやり直すことになり、時間が倍かかる
+        # 音声だけの書き出し（#527）は GL を使わないので確かめない 作れない機械で
+        # スレッドへ戻ると、音だけの書き出しまで画面と同じプロセスで回すことになる
+        from sashimono.engine.gpu import GLContextError, OffscreenGLContext
 
-    try:
-        OffscreenGLContext().release()
-    except GLContextError as exc:
-        raise RuntimeError(f"{GL_UNAVAILABLE_MARK}: {exc}") from exc
+        try:
+            OffscreenGLContext().release()
+        except GLContextError as exc:
+            raise RuntimeError(f"{GL_UNAVAILABLE_MARK}: {exc}") from exc
     notes: list[str] = []
     try:
         path = export_project(
@@ -177,6 +181,12 @@ def export_job(
             reason = f"{type(exc).__name__}: {exc}"
         return ExportOutcome(path="", notes=tuple(notes), records=records, error=reason)
     return ExportOutcome(path=str(path), notes=tuple(notes), records=global_report.records())
+
+
+def _audio_only(settings: ExportSettings) -> bool:
+    """音声だけの形式（#527）か 知らない拡張子は映像として扱い、書き出しの側に断らせる"""
+    chosen = format_of(settings.path)
+    return chosen is not None and chosen.audio_only
 
 
 def is_gl_unavailable(reason: str) -> bool:
@@ -228,11 +238,14 @@ def export_anywhere(
         # CPU を名指ししたときは GPU を確かめない 確かめの子を起こせない機械ではこの中で
         # GPU を開くことになり、CPU を選んだのに壊れた駆動でアプリごと落ちうる
         # 子の書き出しも CPU の名指しなら GPU を試さない（export_candidates）
+        # 音声だけの書き出し（#527）は映像のエンコーダを開かないので確かめない
+        # 自動の候補は形式で変わる（WebM は VP9） 書かない形式の候補を確かめても待つだけ
         named = settings.video_codec
-        if named and encoder_vendor(named) == PRIORITY_CPU:
+        chosen = format_of(settings.path) or format_named(DEFAULT_FORMAT)
+        if (named and encoder_vendor(named) == PRIORITY_CPU) or chosen.audio_only:
             probes = remembered()
         else:
-            names = list(exporter.VIDEO_CODEC_PREFERENCE)
+            names = list(exporter.automatic_codecs(chosen))
             if named:
                 names.append(named)
             probes = probe_and_remember(names)

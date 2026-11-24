@@ -22,6 +22,7 @@ import av
 import av.audio.fifo
 import av.audio.frame
 import av.audio.stream
+import av.codec
 import av.container
 import av.error
 import av.video.codeccontext
@@ -39,6 +40,14 @@ from sashimono.engine.colorspace import (
     tag_bt709,
     tag_frame_bt709,
     to_bt709,
+)
+from sashimono.engine.encode.formats import (
+    CHAPTER_SUFFIXES,
+    DEFAULT_FORMAT,
+    VIDEO_WEB,
+    ExportFormat,
+    format_named,
+    format_of,
 )
 from sashimono.engine.encoders import (
     PRIORITY_AUTO,
@@ -77,13 +86,19 @@ __all__ = [
     "MEASURED_EXPORT_MS",
     "MEASURED_EXPORT_TOTAL_MS",
     "MEASURED_GPU_COLOR_MS",
+    "WEB_AUTOMATIC_CODECS",
+    "WEB_VIDEO_CODECS",
     "ExportError",
     "ExportSettings",
+    "automatic_codecs",
     "available_video_codecs",
     "available_video_codecs_now",
+    "available_web_codecs",
+    "available_web_codecs_now",
     "export_candidates",
     "export_chapters",
     "export_project",
+    "has_sound",
     "write_chapters",
 ]
 
@@ -127,6 +142,15 @@ MEASURED_DECODE_MS = (15.9, 11.2)
 #: （:attr:`ExportSettings.encoder_priority`）で替えられる
 VIDEO_CODEC_PREFERENCE = ("h264_nvenc", "h264_amf", "h264_qsv", "libx264")
 
+#: WebM（#527）で選べる映像コーデック WebM の入れ物は VP8・VP9・AV1 しか受けない
+#: VP9 を主にする（2026-11-24 利用者の決定） 再生できるソフトとブラウザが多い AV1 は速さ
+#: （libsvtav1 は 1080p で 1 コマ 40 ms ほど）と再生できる所の差が大きいので、選べるだけにする
+#: libaom-av1 は同梱の PyAV に入っていない
+WEB_VIDEO_CODECS = ("libvpx-vp9", "libsvtav1", "av1_nvenc")
+#: WebM でコーデックを名指ししないときに試す物 VP9 が開けなくても AV1 へは落とさない
+#: 落とすと、VP9 のつもりで配った WebM が AV1 で、古い再生ソフトで開けないことに気付けない
+WEB_AUTOMATIC_CODECS = ("libvpx-vp9",)
+
 _LAYOUTS = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}
 
 #: 色のタグを決めるコーデックのオプション名 :attr:`ExportSettings.options` には入れられない
@@ -153,7 +177,10 @@ class ExportSettings:
     video_codec: str | None = None
     #: 映像のビットレート（bps） ``None`` ならコーデックの既定に任せる
     video_bitrate: int | None = 12_000_000
-    audio_codec: str = "aac"
+    #: 音声のコーデック ``None`` なら形式（名前の拡張子 :class:`ExportFormat`）の物
+    #: 決め打ちの AAC にしないのは、WebM の入れ物が AAC を受けず、音のある作品だけ書けないため
+    audio_codec: str | None = None
+    #: 音声のビットレート（bps） 可逆の物（WAV・FLAC）には渡さない
     audio_bitrate: int = 192_000
     pixel_format: str = "yuv420p"
     #: 書き出すフレーム範囲 ``None`` なら全体
@@ -182,10 +209,70 @@ class ExportSettings:
     encoder_priority: str = PRIORITY_AUTO
 
 
-#: チャプターを埋める入れ物 mp4・mov は章の文字トラック、mkv は Chapters の要素で持つ
-#: ほかの入れ物（webm・avi など）は章を持てないか、プレーヤーが読まない 渡すと多重化に
-#: 断られて書き出しごと失敗しうるので、埋めない
-CHAPTER_SUFFIXES = frozenset({".mp4", ".mov", ".mkv"})
+#: 名前の拡張子が分からないときに候補を引く形式 今までどおり MP4 の候補
+_STANDARD = format_named(DEFAULT_FORMAT)
+
+#: 可逆の音声 ビットレートを渡しても量が決まらないので渡さない
+_LOSSLESS_AUDIO = frozenset({"pcm_s16le", "flac"})
+
+
+def _format(settings: ExportSettings) -> ExportFormat:
+    """書き出す形式 名前の拡張子で決まる 知らない拡張子は :class:`ExportError`
+
+    拡張子で決めるのは、FFmpeg も拡張子で入れ物を選ぶため 別に形式を持たせると、名前と
+    食い違ったときに入れ物と中身が合わないファイルになる 知らない拡張子を通すと、作品の
+    ファイル（.sme）や実行できるファイルの名前で書けてしまう
+    """
+    found = format_of(settings.path)
+    if found is None:
+        raise ExportError(f"書き出せない拡張子です: {settings.path.name}")
+    return found
+
+
+def _audio_codec(settings: ExportSettings, chosen: ExportFormat) -> str:
+    return settings.audio_codec or chosen.audio_codec
+
+
+def _audio_rate(codec: str, rate: int) -> int:
+    """``codec`` で書ける標本の速さ 作品の速さを受けなければ 48 kHz（無ければ受ける中の最大）
+
+    Opus は 48 kHz などしか受けない 44.1 kHz の作品（YMM4 から読んだ物など）をそのまま渡すと
+    エンコーダを開けずに書き出しが失敗する 速さを変えるのは PyAV のエンコーダの入口に任せる
+    """
+    try:
+        rates = av.codec.Codec(codec, "w").audio_rates
+    except (av.error.FFmpegError, ValueError):
+        return rate
+    if not rates or rate in rates:
+        return rate
+    return 48000 if 48000 in rates else max(rates)
+
+
+def has_sound(project: Project) -> bool:
+    """書き出したときに鳴る物があるか 音声の道を作るか・音声だけの書き出しを受けるかを決める
+
+    混合トラックは音を鳴らすクリップがあるときだけ数える 絵だけの混合トラックで音の
+    道を作ると、今まで無音の道を持たなかった書き出しに黙った音声が付く 無効にした
+    クリップはミキサが飛ばすので、同じく数えない
+    """
+    return any(
+        bool(track.clips)
+        if track.kind is TrackKind.AUDIO
+        else any(clip.enabled and project.plays_sound(track, clip) for clip in track.clips)
+        for track in project.timeline.active_sound_tracks()
+    )
+
+
+def automatic_codecs(chosen: ExportFormat) -> tuple[str, ...]:
+    """``chosen`` の形式でコーデックを名指ししないときに試す物（使えるかを確かめる前）
+
+    MP4 などの並びはモジュールの物をその時に引く（試験が並びを差し替える）
+    """
+    if chosen.audio_only:
+        return ()
+    if chosen.video == VIDEO_WEB:
+        return WEB_AUTOMATIC_CODECS
+    return VIDEO_CODEC_PREFERENCE
 
 
 def export_chapters(project: Project, frame_range: tuple[int, int], path: Path) -> list[Chapter]:
@@ -252,6 +339,24 @@ def available_video_codecs_now(priority: str = PRIORITY_AUTO) -> list[str] | Non
     return None if found is None else order_by_priority(found, priority)
 
 
+def available_web_codecs(priority: str = PRIORITY_AUTO) -> list[str]:
+    """WebM（#527）で使える映像コーデック 確かめ方は :func:`available_video_codecs` と同じ"""
+    return order_by_priority(usable_encoders(WEB_VIDEO_CODECS), priority)
+
+
+def available_web_codecs_now(priority: str = PRIORITY_AUTO) -> list[str] | None:
+    """:func:`available_web_codecs` と同じ ほかの確かめが走っている間は待たずに ``None``"""
+    found = usable_encoders_now(WEB_VIDEO_CODECS)
+    return None if found is None else order_by_priority(found, priority)
+
+
+def _automatic_candidates(chosen: ExportFormat, priority: str) -> list[str]:
+    """名指しが無いときに試す、確かめて書けた物を優先の順に"""
+    if chosen.video == VIDEO_WEB:
+        return order_by_priority(usable_encoders(WEB_AUTOMATIC_CODECS), priority)
+    return available_video_codecs(priority)
+
+
 class _EncoderError(ExportError):
     """エンコーダが使えなかった 書きかけを捨てて、別のコーデックで最初からやり直せる"""
 
@@ -285,17 +390,20 @@ def export_candidates(settings: ExportSettings) -> list[str]:
     自動の候補で書き出す 書き出しそのものを断るより、CPU で書けた方が編集を失わずに済む
     名指しが CPU の物か、ただ開けないだけの物は確かめずに渡す 開けない理由は
     書き出しの失敗としてそのまま伝わる
+    自動の候補は形式（名前の拡張子）で変わる WebM に H.264 の候補を渡すと入れ物に断られる
+    知らない拡張子は自動の候補を MP4 と同じにする（書き出しそのものは :func:`_format` が断る）
     """
+    chosen = format_of(settings.path) or _STANDARD
     named = settings.video_codec
     if not named:
-        return available_video_codecs(settings.encoder_priority)
+        return _automatic_candidates(chosen, settings.encoder_priority)
     if encoder_vendor(named) == PRIORITY_CPU:
         return [named]
     # 書けるかと理由は同じ時点で取る 別々に問うと、間に確かめ直しが割り込んで理由だけ消え、
     # 落ちた物をこのプロセスで開きにいく
     ok, trouble = verdict(named)
     if not ok and trouble is not None:
-        return available_video_codecs(settings.encoder_priority)
+        return _automatic_candidates(chosen, settings.encoder_priority)
     return [named]
 
 
@@ -309,8 +417,9 @@ def _probe_notice(settings: ExportSettings, used: str) -> str | None:
     named = settings.video_codec
     if named == used:
         return None
+    chosen = format_of(settings.path) or _STANDARD
     try:
-        ordered = order_by_priority(list(VIDEO_CODEC_PREFERENCE), settings.encoder_priority)
+        ordered = order_by_priority(list(automatic_codecs(chosen)), settings.encoder_priority)
     except ValueError:
         return None
     if named:
@@ -403,6 +512,10 @@ def export_project(
     total = end - start
     if total <= 0:
         raise ExportError("書き出す範囲が空")
+    chosen = _format(settings)
+    if chosen.audio_only:
+        # 映像を描かない GL も描く係も作らないので、長い作品でも音を混ぜる時間だけで済む
+        return _export_audio(project, settings, chosen, start, end, progress, should_cancel)
 
     # 指定が無ければ、開けた候補を前から試す 試しに開けても、実際の大きさでは
     # 断られることがある（NVENC の H.264 は幅 4096 を超える画を開けない）
@@ -541,15 +654,7 @@ def _encode(
 ) -> None:
     rate = project.rate
     width, height = project.settings.resolution
-    # 混合トラックは音を鳴らすクリップがあるときだけ数える 絵だけの混合トラックで音の
-    # 道を作ると、今まで無音の道を持たなかった書き出しに黙った音声が付く 無効にした
-    # クリップはミキサが飛ばすので、同じく数えない
-    has_audio = any(
-        bool(track.clips)
-        if track.kind is TrackKind.AUDIO
-        else any(clip.enabled and project.plays_sound(track, clip) for clip in track.clips)
-        for track in project.timeline.active_sound_tracks()
-    )
+    has_audio = has_sound(project)
 
     try:
         container = av.open(str(settings.path), mode="w")
@@ -581,11 +686,9 @@ def _encode(
         audio = None
         fifo = None
         if has_audio:
-            audio = cast(
-                "av.audio.stream.AudioStream",
-                container.add_stream(settings.audio_codec, rate=mixer.sample_rate),
+            audio = _add_audio(
+                container, _audio_codec(settings, _format(settings)), settings, mixer
             )
-            audio.bit_rate = settings.audio_bitrate
             fifo = av.audio.fifo.AudioFifo()
 
         if settings.chapters:
@@ -1026,6 +1129,88 @@ class _WritePipeline:
                     self._slots.release()
 
 
+def _add_audio(
+    container: av.container.OutputContainer,
+    codec: str,
+    settings: ExportSettings,
+    mixer: AudioMixer,
+) -> av.audio.stream.AudioStream:
+    """音声の道を作る 作れなければ :class:`ExportError`
+
+    映像のエンコーダの失敗（次の候補へ移れる）とは分ける 音のエンコーダが使えないのは
+    映像のコーデックを替えても直らないので、やり直すと同じ所でもう 1 度落ちるまで待たされる
+    """
+    try:
+        stream = cast(
+            "av.audio.stream.AudioStream",
+            container.add_stream(codec, rate=_audio_rate(codec, mixer.sample_rate)),
+        )
+    except (av.error.FFmpegError, ValueError) as exc:
+        raise ExportError(f"音声のエンコーダ {codec} を使えない ({exc})") from exc
+    if codec not in _LOSSLESS_AUDIO:
+        stream.bit_rate = settings.audio_bitrate
+    return stream
+
+
+#: 音声だけの書き出しで 1 度に混ぜるフレームの数の目安（秒） 1 コマずつ混ぜると、呼ぶたびの
+#: 手間（トラックとクリップをたどる）が音の長さより重くなる 長くすると中止と進み具合が遅れる
+_AUDIO_BLOCK_SECONDS = 1
+
+
+def _export_audio(
+    project: Project,
+    settings: ExportSettings,
+    chosen: ExportFormat,
+    start: int,
+    end: int,
+    progress: Callable[[float], None] | None,
+    should_cancel: Callable[[], bool] | None,
+) -> Path:
+    """音声だけを書き出す（#527） 描く係も GL も作らず、ミキサだけで書く
+
+    鳴る物が無ければ断る 無音のファイルを書き上げると、書き出せたと思って配ってしまう
+    音は映像付きの書き出しと同じミキサ・同じ出力段（:func:`_to_audio_frame` のクリッピング）を通る
+    別に組むと、音声だけ書き出した BGM と動画の音が違う
+    """
+    if not has_sound(project):
+        raise ExportError(
+            "鳴る物が無いので、音声だけの形式では書き出せない"
+            " 音のクリップを置くか、映像の形式を選ぶ"
+        )
+    codec = _audio_codec(settings, chosen)
+    total = end - start
+    # 混ぜる単位はフレームの区切りに合わせる 映像付きと同じ区切りで混ぜ、時刻を同じ式で出す
+    step = max(1, round(float(project.rate.fps) * _AUDIO_BLOCK_SECONDS))
+    settings.path.parent.mkdir(parents=True, exist_ok=True)
+    mixer = AudioMixer(project, smooth_history=settings.smooth_history)
+    try:
+        try:
+            container = av.open(str(settings.path), mode="w")
+        except (av.error.FFmpegError, OSError) as exc:
+            raise ExportError(f"出力ファイルを開けない: {settings.path} ({exc})") from exc
+        with container:
+            audio = _add_audio(container, codec, settings, mixer)
+            fifo = av.audio.fifo.AudioFifo()
+            cursor = 0
+            for first in range(start, end, step):
+                if should_cancel is not None and should_cancel():
+                    raise ExportError("書き出しを中止した")
+                count = min(step, end - first)
+                cursor = _write_audio(container, audio, fifo, mixer, first, cursor, count)
+                if progress is not None:
+                    progress((first + count - start) / total)
+            if should_cancel is not None and should_cancel():
+                raise ExportError("書き出しを中止した")
+            _flush_audio(container, audio, fifo)
+    except BaseException:
+        # 例外でもキャンセルでも、書きかけを残さない
+        settings.path.unlink(missing_ok=True)
+        raise
+    finally:
+        mixer.close()
+    return settings.path
+
+
 def _write_audio(
     container: av.container.OutputContainer,
     stream: av.audio.stream.AudioStream,
@@ -1033,13 +1218,14 @@ def _write_audio(
     mixer: AudioMixer,
     frame_number: int,
     cursor: int,
+    frames: int = 1,
 ) -> int:
-    """1 フレーム分の音声を FIFO へ流し、エンコーダが要求する粒度で切り出す
+    """``frames`` フレーム分の音声を FIFO へ流し、エンコーダが要求する粒度で切り出す
 
     AAC は 1024 サンプル単位でしか受け取らない 映像のフレーム境界とは
     一致しないので、FIFO を挟んで詰め替える 戻り値は次の書き込み位置
     """
-    block = mixer.render_frames(frame_number, 1)
+    block = mixer.render_frames(frame_number, frames)
     if len(block) == 0:
         return cursor
 

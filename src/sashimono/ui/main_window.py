@@ -3637,6 +3637,7 @@ class MainWindow(QMainWindow):
             encoder_priority=self._preferences.encoder_priority,
             bitrate=self._preferences.export_bitrate,
             separate_process=self._preferences.export_process,
+            export_format=self._preferences.export_format,
         )
         self._person_export = dialog
         try:
@@ -3648,6 +3649,11 @@ class MainWindow(QMainWindow):
             # 書き出さずに閉じても覚える 窓で選んだ時点で、本人の好みはそちらと分かる
             self._remember_preferences(
                 replace(self._preferences, export_chapters=dialog.embeds_chapters)
+            )
+        if dialog.chosen_format != self._preferences.export_format:
+            # 窓で最後に選んだ形式を覚える（#527） 章の埋め方と同じく、書き出さずに閉じても覚える
+            self._remember_preferences(
+                replace(self._preferences, export_format=dialog.chosen_format)
             )
         folder = dialog.started_folder
         if (
@@ -5531,6 +5537,7 @@ class MainWindow(QMainWindow):
                 gpu_color=self._preferences.export_gpu_color,
                 chapters=self._preferences.export_chapters,
                 encoder_priority=self._preferences.encoder_priority,
+                audio_kbps=request.audio_kbps,
             )
         except (KeyError, ValueError) as exc:
             raise ToolError(str(exc)) from exc

@@ -22,7 +22,14 @@ from sashimono.core.model import (
     Timeline,
     VideoStreamInfo,
 )
-from sashimono.engine.encode.exporter import ExportSettings
+from sashimono.engine.encode.exporter import WEB_VIDEO_CODECS, ExportSettings
+from sashimono.engine.encode.formats import (
+    AUDIO_KBPS_CHOICES,
+    DEFAULT_AUDIO_KBPS,
+    FORMATS,
+    VIDEO_WEB,
+    format_of,
+)
 
 __all__ = [
     "BITRATE_RANGE_MBPS",
@@ -212,10 +219,10 @@ def matched_bitrate_mbps(
     return min(high, max(low, MATCH_FLOOR_MBPS, wanted))
 
 
-#: 書き出せる入れ物（拡張子） 映像 H.264/H.265 と音声 AAC をそのまま入れられる物だけ
+#: 書き出せる入れ物（拡張子） 形式の表（:data:`~sashimono.engine.encode.formats.FORMATS`）の物だけ
 #: 拡張子で入れ物が決まる（FFmpeg が名前から選ぶ） 知らない拡張子を通すと、
 #: 作品のファイル（.sme）や実行できるファイルの名前で動画を書けてしまう
-CONTAINER_SUFFIXES = (".mp4", ".mov", ".mkv")
+CONTAINER_SUFFIXES = tuple(item.suffix for item in FORMATS)
 
 
 def export_target(whole: Project, scene_id: SceneId | None) -> Project:
@@ -262,6 +269,7 @@ def build_settings(
     gpu_color: bool,
     chapters: bool,
     encoder_priority: str,
+    audio_kbps: int = DEFAULT_AUDIO_KBPS,
 ) -> ExportSettings:
     """書き出しの設定を作る
 
@@ -272,10 +280,30 @@ def build_settings(
     動画に章が入るのを型で止めるため ``gpu_color``（色変換を GPU で行う #372）も同じ理由で
     既定を置かない 駆動との相性で切った人の書き出しが、AI からだけ GPU で変換されないように
     ``encoder_priority``（どの作り手のエンコーダを先に試すか #365）も同じ理由で既定を置かない
+
+    形式（#527）は ``path`` の拡張子で決まる 知らない拡張子は ``ValueError`` 音声だけの形式は
+    映像のコーデックを受けない（名指しされたら ``ValueError`` 映像を書かないのに選んだ物が
+    効いたと思わせない） ``audio_kbps`` は音質を選べる形式（MP3・M4A）だけが使う 窓で選ぶ物で
+    本人の設定ではないので既定を置く（窓の初めの値と同じ）
     """
     low, high = BITRATE_RANGE_MBPS
     if not low <= bitrate_mbps <= high:
         raise ValueError(f"ビットレートは {low}〜{high} Mbps です: {bitrate_mbps}")
+    chosen = format_of(path)
+    if chosen is None:
+        raise ValueError(
+            f"書き出す名前は {' / '.join(CONTAINER_SUFFIXES)} のどれかで終えてください: {path.name}"
+        )
+    if chosen.audio_only and codec:
+        raise ValueError(f"{chosen.label} は音声だけなので、映像のコーデックは選べません: {codec}")
+    if chosen.video == VIDEO_WEB and codec and codec not in WEB_VIDEO_CODECS:
+        # WebM の入れ物は H.264 を受けない 書き出しを始めてから断られるより先に言う
+        raise ValueError(f"WebM の映像は {' / '.join(WEB_VIDEO_CODECS)} のどれかです: {codec}")
+    if audio_kbps not in AUDIO_KBPS_CHOICES:
+        raise ValueError(
+            f"音質は {' / '.join(str(kbps) for kbps in AUDIO_KBPS_CHOICES)} kbps のどれかです:"
+            f" {audio_kbps}"
+        )
     return ExportSettings(
         path=path,
         video_codec=codec or None,
@@ -287,4 +315,6 @@ def build_settings(
         gpu_color=gpu_color,
         chapters=chapters,
         encoder_priority=encoder_priority,
+        # 映像の形式の音（AAC・Opus）は今までどおり 192 kbps 音質を選べるのは音声だけの形式
+        audio_bitrate=(audio_kbps if chosen.audio_quality else DEFAULT_AUDIO_KBPS) * 1000,
     )
