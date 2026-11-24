@@ -67,6 +67,9 @@ OWN_LIBRARY = {
     "emphasis_style",
     # 演出のジャンルと強さ（#478） 使う道具は sends にアプリの設定を書く
     "direction_taste",
+    # エクスプローラーの登録（#522） 登録したフォルダの場所は remembered_names からも返し、
+    # 使う道具（search_library）は sends にアプリの設定と名前と場所を書く
+    "material_library",
     "seam_style",
     # ナレーション（#335）のエンジンの場所と既定の声 使う道具は sends にアプリの設定を書く
     "narration_settings",
@@ -335,6 +338,8 @@ class TestEveryTextSourceGoesThroughThePort:
             "add_custom_object",
             # 互換性レポート（#352） 本人のアプリの記録を返す
             "get_compat_report",
+            # エクスプローラー（#522） 結果に本人の設定の使ってよい分類と BGM の可否が載る
+            "search_library",
             # 縦動画への作り替え（#334） 結果に本人の設定の大きさ・枠の動かし方・ならす長さが載る
             "reframe",
             # 絵の長い辺の上限（#344） 縮めた訳と断りの文に本人の設定の画素が載る

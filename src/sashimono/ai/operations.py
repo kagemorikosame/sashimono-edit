@@ -295,6 +295,14 @@ from sashimono.core.io.presets import Preset
 from sashimono.core.io.serialize import SUFFIX, json_text
 from sashimono.core.io.subtitles import SUBTITLE_SUFFIXES, subtitles_in_range
 from sashimono.core.jetcut import cut_targets, merge_ranges, plan_cuts
+from sashimono.core.material_library import (
+    CATEGORIES as LIBRARY_CATEGORIES,
+)
+from sashimono.core.material_library import (
+    CATEGORY_MUSIC,
+    MaterialLibrary,
+    match_files,
+)
 from sashimono.core.mixing import (
     DEFAULT_PEAK_CEILING_DB,
     DUCK_ATTACK_MS_RANGE,
@@ -2741,8 +2749,9 @@ def _get_direction_recipes(host: EditorHost, arguments: dict[str, Any]) -> objec
             "cue は find_highlights の signals と同じ名前で、その盛り上がりに action を付けます"
             " per_minute は 1 分あたりの上限、min_gap_seconds は同じ kind どうしをあける秒数"
             "（レシピをまたいで数えます） amount は寄るなら拡大率の %、揺らすなら幅の画素で、"
-            "emphasis の scale_percent・amplitude_px に渡します 効果音は本人が取り込んだ音の素材"
-            "から選び、無ければ付けずにそう伝えます 付けた後は measure_direction で数えます"
+            "emphasis の scale_percent・amplitude_px に渡します 効果音は search_library で本人が"
+            "登録したフォルダから選ぶか、本人が取り込んだ音の素材から選び、無ければ付けずに"
+            "そう伝えます 付けた後は measure_direction で数えます"
             " 強さとジャンルは本人の設定で、頼みの文で言われたときだけ引数で変えます"
         ),
     }
@@ -2813,8 +2822,15 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         raise ToolError("範囲（start_frame〜end_frame）が空です")
     sound = None
     raw_sound = arguments.get("sound_media_id")
+    raw_file = arguments.get("sound_file_id")
+    if raw_sound and raw_file:
+        raise ToolError("sound_media_id と sound_file_id はどちらか 1 つだけ渡してください")
     if raw_sound:
         sound = _require_media(project, str(raw_sound))
+    elif raw_file:
+        # 登録したフォルダの効果音（#522） 計画に出すだけで、取り込むのは人の〔付ける〕
+        sound, _ = _library_media(host, raw_file)
+    if sound is not None:
         problem = sound_problem(sound)
         if problem is not None:
             raise ToolError(problem)
@@ -2842,7 +2858,18 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         " 項目の続き（next_offset）は get_direction_plan に offset を渡して読みます"
     )
     if any(rule.recipe.action == "sound" for rule in book.rules) and sound is None:
-        note += " 効果音は sound_media_id に本人が取り込んだ短い音の素材を渡すと計画に入ります"
+        note += (
+            " 効果音は sound_file_id に search_library の効果音（category が sound_effect）の"
+            " file_id を、または sound_media_id に本人が取り込んだ短い音の素材を渡すと計画に"
+            "入ります どちらも無ければ付けずにそう伝えます"
+        )
+    elif sound is not None and raw_file:
+        note += (
+            # 名前はここに書かない この道具は名前と場所を送ると宣言していない（AI は
+            # search_library の返事で名前を読んでいる）
+            " 効果音は登録したフォルダから選んだ音です〔付ける〕で作品の素材へ取り込みます"
+            " 使った素材の名前とフォルダ（search_library の name と folder）を返事に書きます"
+        )
     return _proposal_result(view, {}, note)
 
 
@@ -3449,6 +3476,173 @@ def _search_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 短い語で何万行も当たり、詰めて何千本のクリップがある作品だと画面が止まる
     rows = _RowsOf(hits, lambda hit: _hit_row(project, hit))
     return _paged_after(head, rows, arguments, "hits", "" if hits else _NOTHING_FOUND)
+
+
+# --- 登録したフォルダの素材（エクスプローラー #520 #522） ---
+
+#: 1 回の search_library で新しく測るファイルの数 測るのは編集画面のスレッドで、1 本ごとに
+#: 頭の 1 分をデコードする（0.1〜0.3 秒） 数百本を一度に測ると画面が止まる 測った物は覚え、
+#: 次の呼び出しでは測らない
+LIBRARY_MEASURE_PER_CALL = 20
+
+#: 登録が無い・使ってよい分類が無いときの案内 付けずに理由を返す（#522 の決まり）
+_NO_LIBRARY = (
+    "AI が使ってよいフォルダが登録されていません 効果音や BGM は付けずに、そう伝えます"
+    " 本人がエクスプローラー（表示 → エクスプローラー）でフォルダを分類を付けて登録し、"
+    "表示 → 設定… の「エクスプローラー: AI に使わせる分類」で選ぶと使えます"
+)
+
+
+def _library_category(library: MaterialLibrary, arguments: dict[str, Any]) -> str | None:
+    """引数 ``category`` 本人が AI に使わせない分類は断る（黙って空を返すと、無いと誤る）"""
+    raw = arguments.get("category")
+    if raw is None:
+        return None
+    if raw not in LIBRARY_CATEGORIES:
+        raise ToolError(f"category は {'・'.join(LIBRARY_CATEGORIES)} のどれかです")
+    if raw not in library.ai_categories:
+        raise ToolError(
+            f"{LIBRARY_CATEGORIES[str(raw)]}の分類は、本人が AI に使わせない設定にしています"
+            " 使わずに、そう伝えます（選ぶのは本人 表示 → 設定… の"
+            "「エクスプローラー: AI に使わせる分類」）"
+        )
+    return str(raw)
+
+
+def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """登録したフォルダから、AI が使ってよい分類の素材を名前と長さで探す（#522）"""
+    library = host.material_library
+    category = _library_category(library, arguments)
+    query = arguments.get("query", "")
+    if not isinstance(query, str):
+        raise ToolError("query は文字で渡してください")
+    shortest = _optional_number(arguments, "min_seconds", 0.0)
+    longest = _optional_number(arguments, "max_seconds", 0.0)
+    head: dict[str, Any] = {
+        "categories": [
+            {"category": key, "name": LIBRARY_CATEGORIES[key]} for key in library.ai_categories
+        ],
+        # BGM を頼まれなくても付けてよいか（本人の設定 既定は頼まれたときだけ）
+        "auto_bgm": library.auto_bgm,
+    }
+    folders = [
+        folder for folder in library.ai_folders if category is None or folder.category == category
+    ]
+    if not folders:
+        return head | {"files_total": 0, "files": [], "note": _NO_LIBRARY}
+    scans = [scan for scan in library.scan_for_ai() if scan.folder in folders]
+    head["folders_missing"] = sum(1 for scan in scans if scan.missing)
+    matched = match_files((file for scan in scans for file in scan.files), query)
+    used = {os.path.normcase(str(media.path)): media.id for media in _project(host).media}
+    budget = LIBRARY_MEASURE_PER_CALL
+    rows: list[dict[str, Any]] = []
+    unmeasured = 0
+    for file in matched:
+        known = library.measured(file, allow_measure=False)
+        if known is None and budget > 0:
+            budget -= 1
+            known = library.measured(file, allow_measure=True)
+        if known is None:
+            unmeasured += 1
+            if shortest is not None or longest is not None:
+                # 長さの分からない物は、長さで絞る頼みには出さない（後で測れば出る）
+                continue
+        elif (shortest is not None and known.seconds < shortest) or (
+            longest is not None and known.seconds > longest
+        ):
+            continue
+        row: dict[str, Any] = {
+            "file_id": file.id,
+            "name": file.name,
+            "folder": file.subfolder,
+            "category": file.category,
+            "measured": known is not None,
+        }
+        if known is not None:
+            row["seconds"] = round(known.seconds, 2)
+            row["loudness_lufs"] = known.loudness
+            row["peak_dbfs"] = known.peak
+        media_id = used.get(os.path.normcase(str(file.path)))
+        if media_id is not None:
+            row["media_id"] = str(media_id)
+        rows.append(row)
+    # 測った物を書くのは窓（閉じるとき） 道具のコードはファイルを書かない（#327 の決まり）
+    head["files_total"] = len(rows)
+    head["not_measured"] = unmeasured
+    note = (
+        "file_id を place_sound・place_media の library_file_id か、propose_direction の"
+        " sound_file_id に渡すと、作品の素材へ取り込んで使います（取り消し 1 回で戻る）"
+        " 効果音は短い音（10 秒以下）、BGM は長い音から選びます 手がかりは名前・フォルダ・"
+        "長さ（seconds）・頭の 1 分の大きさ（loudness_lufs）だけで、曲の雰囲気は分かりません"
+        " 使った素材の名前とフォルダは返事に書きます"
+    )
+    if unmeasured:
+        note += (
+            f" {unmeasured} 個はまだ測っていません（measured が false 1 回に"
+            f" {LIBRARY_MEASURE_PER_CALL} 個ずつ測る） 呼び直すと続きを測ります"
+        )
+    if head["folders_missing"]:
+        note += " 見つからない登録のフォルダがあります（消えたか移った） 本人に伝えます"
+    if CATEGORY_MUSIC in library.ai_categories and not library.auto_bgm:
+        note += " BGM は頼まれたときだけ付けます（本人の設定）"
+    return _paged_after(head, rows, arguments, "files", note)
+
+
+def _library_media(host: EditorHost, raw: object) -> tuple[MediaItem, bool]:
+    """``library_file_id`` のファイルの素材と、作品の素材にまだ無いか（取り込みが要るか）
+
+    同じファイルを前に取り込んでいれば、その素材を使う もう 1 本素材を足すと、同じ音が
+    素材一覧に 2 つ並び、取り消しの後も片方だけが残る
+    """
+    if not isinstance(raw, str) or not raw:
+        raise ToolError("library_file_id は search_library の file_id を文字で渡してください")
+    file = host.material_library.find_for_ai(raw)
+    if file is None:
+        raise ToolError(
+            f"library_file_id のファイルが見つかりません: {raw}（本人が AI に使わせる分類の"
+            "フォルダの物だけを指せます search_library で探し直してください）"
+        )
+    key = os.path.normcase(str(file.path))
+    for media in host.document.project.media:
+        if os.path.normcase(str(media.path)) == key:
+            return media, False
+    try:
+        return host.probe(file.path), True
+    except ToolError:
+        # 開けない訳の文には場所が入る 名前と場所を送ると宣言していない道具（propose_direction）
+        # からも呼ぶので、場所を出さずに断る
+        raise ToolError(
+            f"登録したフォルダのファイルを開けません（{raw}） 壊れているか、読めない形式です"
+            " 別の file_id を選んでください"
+        ) from None
+
+
+def _media_or_library(host: EditorHost, arguments: dict[str, Any]) -> tuple[MediaItem, bool]:
+    """引数の素材 ``media_id`` か ``library_file_id`` のどちらか 2 つ目は取り込みが要るか"""
+    has_media = arguments.get("media_id") not in (None, "")
+    has_file = arguments.get("library_file_id") not in (None, "")
+    if has_media == has_file:
+        raise ToolError(
+            "media_id（作品の素材）か library_file_id（search_library の file_id）の"
+            "どちらか 1 つを渡してください"
+        )
+    if has_file:
+        return _library_media(host, arguments["library_file_id"])
+    return _require_media(_project(host), str(arguments["media_id"])), False
+
+
+def _library_note(
+    media: MediaItem, fresh_import: bool, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """登録したフォルダから置いたときに添える欄 使った素材の名前とフォルダを返事に書かせる #522"""
+    if arguments.get("library_file_id") in (None, ""):
+        return {}
+    return {
+        "media_id": str(media.id),
+        "imported": fresh_import,
+        "folder": media.path.parent.name,
+        "library_note": "使った素材の名前とフォルダ（folder）を返事に書きます",
+    }
 
 
 def _hit_row(project: Project, hit: Hit) -> dict[str, Any]:
@@ -5389,12 +5583,15 @@ def _media_spans(
 
 def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
-    media = _require_media(project, str(arguments.get("media_id", "")))
+    media, fresh_import = _media_or_library(host, arguments)
     at_frame = _placed_frame(arguments)
     # 区間は開き直した後の素材で確かめる 古い作品の素材は短いファイルに差し替わっていることがある
     fresh = _with_known_video_end(host, media)
     if "ranges" in arguments:
-        return _place_spans(host, fresh, _media_spans(project, fresh, arguments), at_frame)
+        spans = _place_spans(host, fresh, _media_spans(project, fresh, arguments), at_frame)
+        if fresh_import:
+            host.analyze(fresh)
+        return spans | _library_note(fresh, fresh_import, arguments)
     commands = insert_media(
         project,
         fresh,
@@ -5404,7 +5601,14 @@ def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not commands:
         raise ToolError(f"{media.name} は長さが無いので置けません")
     host.apply_commands(commands, f"配置: {media.name}")
-    return {"placed": media.name} | _small_placed(_project(host), commands)
+    if fresh_import:
+        # 取り込んだ素材は読み込みと同じく解析を頼む 頼まないと波形も絵の並びも出ない
+        host.analyze(fresh)
+    return (
+        {"placed": media.name}
+        | _library_note(fresh, fresh_import, arguments)
+        | _small_placed(_project(host), commands)
+    )
 
 
 def _place_spans(
@@ -5412,7 +5616,7 @@ def _place_spans(
     media: MediaItem,
     spans: list[tuple[Fraction, Fraction]],
     at_frame: int | None,
-) -> object:
+) -> dict[str, Any]:
     """素材の一部を順に並べて置く 取り消し 1 回で全部戻る 置いたクリップの ID を返す"""
     project = _project(host)
     commands = place_media_spans(
@@ -7843,7 +8047,7 @@ def _fixed_param(clip: Clip, kind: str, name: str, value: float) -> Clip:
 
 def _place_sound(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
-    media = _require_media(project, str(arguments.get("media_id", "")))
+    media, fresh_import = _media_or_library(host, arguments)
     if not media.has_audio:
         raise ToolError(f"{media.name} に音がありません")
     if media.has_video or media.is_still:
@@ -7919,14 +8123,26 @@ def _place_sound(host: EditorHost, arguments: dict[str, Any]) -> object:
                 clip = _fixed_param(clip, FADE_EFFECT_KIND, "fade_out", fade_out)
             commands.append(AddClip(command.track_id, clip))
     host.apply_commands(commands, f"音を置く: {media.name}")
+    if fresh_import:
+        host.analyze(media)
     added = [command for command in commands if isinstance(command, AddClip)]
-    return {
+    result: dict[str, Any] = {
         "placed": len(added),
         "clip_ids": [str(command.clip.id) for command in added],
         "track_ids": list(dict.fromkeys(str(command.track_id) for command in added)),
         "from_frame": at,
         "to_frame": max(command.clip.timeline_end for command in added),
     }
+    note = _library_note(media, fresh_import, arguments)
+    if note:
+        # BGM を敷いたら声と重なる所を下げる（#522 の目標 3） 頼まれた BGM でも、話している間
+        # ずっと同じ大きさで鳴ると声が聞き取りにくい
+        note["name"] = media.name
+        note["library_note"] = (
+            "使った素材の名前（name）とフォルダ（folder）を返事に書きます BGM なら duck_audio で"
+            "声と重なる所を下げます"
+        )
+    return result | note
 
 
 def _auto_color(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -11653,6 +11869,45 @@ OPERATIONS: tuple[Operation, ...] = (
         preview=from_result(),
     ),
     Operation(
+        name="search_library",
+        description=(
+            "本人がエクスプローラーに登録したフォルダから、AI が使ってよい分類（本人の設定 既定は"
+            "効果音 sound_effect と BGM music）の素材を名前・フォルダ・長さで探す（読むだけ）"
+            " 効果音や BGM を付けるときは、作品に音の素材が無くてもまずこれで探す"
+            " 返す file_id を place_sound・place_media の library_file_id か propose_direction の"
+            " sound_file_id に渡す 長さ（seconds）と頭の 1 分の大きさ（loudness_lufs）は測って"
+            "覚えた物（1 回に数十個ずつ測る） 雰囲気は分からないので名前とフォルダで選ぶ"
+            " 登録が無いか使ってよい分類で無ければ付けずにそう伝える auto_bgm が false なら"
+            " BGM は頼まれたときだけ付ける 一覧（files）は" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "category": {
+                    "type": "string",
+                    "enum": list(LIBRARY_CATEGORIES),
+                    "description": (
+                        "分類 "
+                        + "・".join(f"{k}（{v}）" for k, v in LIBRARY_CATEGORIES.items())
+                        + " 省くと AI が使ってよい分類すべて"
+                    ),
+                },
+                "query": _string(
+                    "名前で絞る語（空白で区切ると全部を含む物 下のフォルダの名前も見る）"
+                    " 例「拍手」「ドン 爆発」"
+                ),
+                "min_seconds": _number("この秒より短い物を外す（BGM を探すとき）"),
+                "max_seconds": _number("この秒より長い物を外す（効果音は 10 以下）"),
+                **_paging(),
+            }
+        ),
+        handler=_search_library,
+        # 返すのはファイルとフォルダの名前（名前と場所）と測った数と本人の設定（分類と BGM）
+        # 場所そのものは返さない（file_id で指させる）
+        sends=frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES}),
+        preview=from_result(),
+        name_keys=frozenset({"name", "folder"}),
+    ),
+    Operation(
         name="media_scene_sheet",
         description=(
             "素材（動画）の場面ごとの真ん中の絵を 1 枚に並べる 場面の説明を作るための絵で、"
@@ -12184,6 +12439,10 @@ OPERATIONS: tuple[Operation, ...] = (
                 "sound_media_id": _string(
                     "効果音に使う本人の素材（音だけ・短い） 省くと効果音は計画に入れない"
                 ),
+                "sound_file_id": _string(
+                    "効果音に使う登録したフォルダの音（search_library の file_id 音だけ・"
+                    "10 秒以下） 〔付ける〕で作品の素材へ取り込む sound_media_id とどちらか 1 つ"
+                ),
                 "strength": {
                     "type": "string",
                     "enum": list(DIRECTION_STRENGTHS),
@@ -12336,11 +12595,15 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "読み込み済みの素材をタイムラインへ置く ranges を渡すと素材の一部だけを、渡した順に"
             "隙間なく並べて置く 長い素材から何か所か取るときは全体を置いて分割せず ranges を使う"
-            " 取り消し 1 回で全部戻る"
+            " library_file_id（search_library の file_id）を渡すと、登録したフォルダの素材を"
+            "取り込んで置く 取り消し 1 回で全部戻る"
         ),
         schema=_schema(
             {
-                "media_id": _string("置く素材"),
+                "media_id": _string("置く素材 library_file_id とどちらか 1 つ"),
+                "library_file_id": _string(
+                    "登録したフォルダの素材（search_library の file_id） 作品の素材へ取り込んで置く"
+                ),
                 "at_frame": _integer("置く位置 省略すると末尾"),
                 "ranges": {
                     "type": "array",
@@ -12356,12 +12619,11 @@ OPERATIONS: tuple[Operation, ...] = (
                     },
                 },
             },
-            ["media_id"],
         ),
         handler=_place_media,
         sends=_WITH_FILES,
         preview=from_arguments(),
-        name_keys=frozenset({"placed"}),
+        name_keys=frozenset({"placed", "folder"}),
         writes=True,
     ),
     Operation(
@@ -14077,11 +14339,16 @@ OPERATIONS: tuple[Operation, ...] = (
             "空いたレイヤー）の空いた所へ置く until_frame を渡すと、そこまで素材を繰り返して"
             "敷き詰め（loop が true のとき）、最後の 1 本を until_frame で切る 音量とフェードは"
             "置いたクリップの音量・フェードの欄に入る 動画の素材は place_media で置く"
-            " 取り消し 1 回で戻る"
+            " library_file_id（search_library の file_id）を渡すと、登録したフォルダの音を"
+            "作品の素材へ取り込んで置く（取り込みも同じ取り消しの段） BGM を敷いたら duck_audio で"
+            "声と重なる所を下げる 取り消し 1 回で戻る"
         ),
         schema=_schema(
             {
-                "media_id": _string("置く素材（音だけの素材）"),
+                "media_id": _string("置く素材（音だけの素材） library_file_id とどちらか 1 つ"),
+                "library_file_id": _string(
+                    "登録したフォルダの音（search_library の file_id） 作品の素材へ取り込んで置く"
+                ),
                 "at_frame": _integer("置く位置 省くと再生位置"),
                 "track_id": _string("置きたいトラック 埋まっていればほかの空いたトラックへ"),
                 "until_frame": _integer("ここで終える（BGM を敷く範囲の終わり）"),
@@ -14090,12 +14357,12 @@ OPERATIONS: tuple[Operation, ...] = (
                 "fade_in_seconds": _number("頭のフェードイン 秒（0〜60）"),
                 "fade_out_seconds": _number("終わりのフェードアウト 秒（0〜60）"),
             },
-            ["media_id"],
         ),
         handler=_place_sound,
         writes=True,
         sends=_WITH_FILES,
         preview=from_arguments(),
+        name_keys=frozenset({"name", "folder"}),
     ),
     Operation(
         name="transcribe",

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from fractions import Fraction
 
-from sashimono.core.commands import AddClip, AddTrack, Command
+from sashimono.core.commands import AddClip, AddMedia, AddTrack, Command
 from sashimono.core.commands.history import Author, Document
 from sashimono.core.direction import (
     NARRATION_FOLDER,
@@ -101,6 +101,11 @@ class DirectionItem:
     media_id: MediaId | None = None
     #: 欄に出す時刻（分:秒） 欄はフレームの速さを知らないので、作るときに決めておく
     at: str = ""
+    #: 効果音の素材の名前 欄に出し、何の音を付けるかを〔付ける〕の前に見せる
+    sound_name: str = ""
+    #: エクスプローラーに登録したフォルダから選んだ効果音（#522） まだ作品の素材ではないので、
+    #: 〔付ける〕で素材へ入れてから置く 計画を出すだけでは作品を変えない（素材一覧にも出さない）
+    sound_media: MediaItem | None = None
 
     @property
     def action_name(self) -> str:
@@ -341,6 +346,14 @@ def build_items(
                 clip_id=clip_id,
                 media_id=media_id,
                 at=where,
+                sound_name=sound.name if sound is not None and media_id is not None else "",
+                sound_media=(
+                    sound
+                    if sound is not None
+                    and media_id is not None
+                    and project.find_media(sound.id) is None
+                    else None
+                ),
             )
         )
         if len(items) >= ITEMS_LIMIT:
@@ -441,7 +454,21 @@ def _commands(project: Project, item: DirectionItem) -> list[Command]:
 
 
 def _sound_commands(project: Project, item: DirectionItem) -> list[Command]:
-    """効果音を効果音のトラックへ置く 空いていなければ足したトラックへ置く"""
+    """効果音を効果音のトラックへ置く 空いていなければ足したトラックへ置く
+
+    登録したフォルダから選んだ音（:attr:`DirectionItem.sound_media`）は、まだ作品の素材で
+    なければ素材へ入れてから置く 入れるのも同じ取り消しの段なので、1 回で素材ごと戻る
+    """
+    added: list[Command] = []
+    sound = item.sound_media
+    if (
+        item.media_id is not None
+        and project.find_media(item.media_id) is None
+        and sound is not None
+        and sound.id == item.media_id
+    ):
+        added.append(AddMedia(sound))
+        project = added[0].apply(project)
     if item.media_id is None or project.find_media(item.media_id) is None:
         raise ValueError("効果音の素材が見つかりません（計画の後で外された）")
     # 計画を作った時の検査だけでは、その後に人が同じ区間へ置いた効果音を見落とす
@@ -473,6 +500,6 @@ def _sound_commands(project: Project, item: DirectionItem) -> list[Command]:
         # 消音・鍵・ソロの外のトラックへ置くと、付いたことになっても鳴らない（置けない）
         audible = track.id in sounding and not track.locked
         if track.kind is TrackKind.AUDIO and track.name == SOUND_TRACK_NAME and free and audible:
-            return [AddClip(track.id, clip)]
+            return [*added, AddClip(track.id, clip)]
     track = Track(kind=TrackKind.AUDIO, name=SOUND_TRACK_NAME, solo=solo)
-    return [AddTrack(track), AddClip(track.id, clip)]
+    return [*added, AddTrack(track), AddClip(track.id, clip)]

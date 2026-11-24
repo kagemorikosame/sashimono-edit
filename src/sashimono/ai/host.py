@@ -27,6 +27,7 @@ from sashimono.core.commands import Command, Document, ParamPath
 from sashimono.core.direction_recipes import DirectionTaste
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected
+from sashimono.core.material_library import MaterialLibrary
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import ClipId, MediaId, MediaItem, Project, SceneId, SegmentId
 from sashimono.core.reframe import ReframeStyle
@@ -582,6 +583,16 @@ class EditorHost(Protocol):
         （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.direction_taste`）
 
         どれだけ演出を付けるかは人と作品で違う 頼みの文で言われなければこれを使う
+        """
+        ...
+
+    @property
+    def material_library(self) -> MaterialLibrary:
+        """エクスプローラーに登録したフォルダと、AI が使ってよい分類・BGM を自動で付けてよいか
+        （#520 #522 本人の設定 :attr:`~sashimono.ui.workspace.Preferences.explorer_folders` など）
+        と、測った長さと大きさの控え
+
+        読むだけ 登録も分類の選び方も人だけが変える（アプリ自身の設定 #350 の決定）
         """
         ...
 

@@ -110,6 +110,7 @@ class Scan:
 PANEL_MODULES = (
     "sashimono.ui.inspector.panel",
     "sashimono.ui.media_pool",
+    "sashimono.ui.explorer",
     "sashimono.ui.subtitle.panel",
     "sashimono.ui.scene_bar",
     "sashimono.ui.transport",
@@ -524,6 +525,7 @@ def _scan_stage(window: MainWindow, stage: _Stage, folder: Path, scan: Scan) -> 
     walk_buttons(window._scene_bar, "シーンの帯", scan)
     walk_buttons(window._transport, "再生の操作", scan)
     walk_buttons(window._media_pool, "素材一覧", scan)
+    walk_buttons(window._explorer, "エクスプローラー", scan)
     walk_buttons(window._subtitles, "字幕パネル", scan)
 
     if stage.media is not None:
@@ -683,6 +685,7 @@ class TestEveryScreenOperationIsListed:
             "プレビューの右クリック",
             "素材一覧",
             "素材一覧の右クリック",
+            "エクスプローラー",
             "字幕パネル",
             "字幕パネルの右クリック",
             "設定パネル",

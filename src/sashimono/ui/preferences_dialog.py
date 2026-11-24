@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -46,6 +47,15 @@ from sashimono.core.emphasis import (
     EMPHASIS_ZOOM_PERCENT_RANGE,
 )
 from sashimono.core.io.recovery import TrimItem
+from sashimono.core.material_library import (
+    CATEGORIES as LIBRARY_CATEGORIES,
+)
+from sashimono.core.material_library import (
+    LibraryFolder,
+    add_folder,
+    remove_folder,
+    set_category,
+)
 from sashimono.core.mixing import (
     DUCK_ATTACK_MS_RANGE,
     DUCK_DEPTH_DB_RANGE,
@@ -149,6 +159,7 @@ from sashimono.ui.workspace import (
     DETAIL_MIN_WIDTHS,
     DOCK_TABS_BOTTOM,
     DOCK_TABS_TOP,
+    EXPLORER_PREVIEW_VOLUME_RANGE,
     INSERT_ALL_TRACKS,
     INSERT_TARGET_TRACKS,
     MEASURED_SWITCH,
@@ -1378,6 +1389,7 @@ class PreferencesDialog(QDialog):
         form.addRow("BGM が戻る速さ", self._duck_release)
         self._add_emphasis_rows(form, preferences)
         self._add_direction_rows(form, preferences)
+        self._add_explorer_rows(form, preferences)
         self._add_seam_rows(form, preferences)
         self._add_narration_rows(form, preferences)
         self._add_auto_fix_rows(form, preferences)
@@ -1703,6 +1715,12 @@ class PreferencesDialog(QDialog):
             emphasis_easing=str(self._emphasis_easing.currentData()),
             direction_genre=str(self._direction_genre.currentData()),
             direction_strength=str(self._direction_strength.currentData()),
+            explorer_folders=self._explorer_folder_values,
+            explorer_ai_categories=tuple(
+                key for key, box in self._explorer_ai_boxes.items() if box.isChecked()
+            ),
+            explorer_ai_bgm=self._explorer_ai_bgm.isChecked(),
+            explorer_preview_volume=self._explorer_volume.value(),
             seam_video=str(self._seam_video.currentData()),
             seam_crossfade_ms=self._seam_crossfade.value(),
             seam_zoom_percent=self._seam_zoom.value(),
@@ -1880,6 +1898,108 @@ class PreferencesDialog(QDialog):
             " 付けすぎた演出は 1 つずつ外す手間が要るので、迷ったら控えめから"
         )
         form.addRow("演出: 強さ", self._direction_strength)
+
+    def _add_explorer_rows(self, form: QFormLayout, preferences: Preferences) -> None:
+        """エクスプローラー（#520 #521 #522）の登録・AI に使わせる分類・BGM・試聴の音量
+
+        登録はエクスプローラーのパネルでもできる ここにも出すのは、AI に使わせる分類と
+        並べて見ながら決めたいため（どのフォルダが AI に見えるかが分かる）
+        """
+        from sashimono.ui.explorer import ask_category, ask_folder
+
+        self._explorer_folder_values: tuple[LibraryFolder, ...] = preferences.explorer_folders
+        self._explorer_list = QListWidget(self)
+        self._explorer_list.setToolTip(
+            "エクスプローラーに登録したフォルダと分類 分類はフォルダごとに 1 つ"
+            " 素材はアプリに入っておらず、ネットからも取らない 使う素材の権利は登録する人が確かめる"
+        )
+        self._explorer_list.setMaximumHeight(110)
+
+        def fill() -> None:
+            self._explorer_list.clear()
+            for folder in self._explorer_folder_values:
+                self._explorer_list.addItem(f"{folder.category_name}｜{folder.path}")
+
+        def chosen() -> LibraryFolder | None:
+            row = self._explorer_list.currentRow()
+            values = self._explorer_folder_values
+            return values[row] if 0 <= row < len(values) else None
+
+        def register(_checked: bool = False) -> None:
+            path = ask_folder(self)
+            category = ask_category(self) if path is not None else None
+            if path is None or category is None:
+                return
+            self._explorer_folder_values = add_folder(self._explorer_folder_values, path, category)
+            fill()
+
+        def remove(_checked: bool = False) -> None:
+            folder = chosen()
+            if folder is not None:
+                self._explorer_folder_values = remove_folder(
+                    self._explorer_folder_values, folder.path
+                )
+                fill()
+
+        def recategorize(_checked: bool = False) -> None:
+            folder = chosen()
+            category = ask_category(self, folder.category) if folder is not None else None
+            if folder is None or category is None:
+                return
+            self._explorer_folder_values = set_category(
+                self._explorer_folder_values, folder.path, category
+            )
+            fill()
+
+        fill()
+        buttons = QHBoxLayout()
+        for text, slot in (
+            ("フォルダを登録…", register),
+            ("外す", remove),
+            ("分類を変える…", recategorize),
+        ):
+            button = QPushButton(text, self)
+            button.clicked.connect(slot)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        box = QVBoxLayout()
+        box.addWidget(self._explorer_list)
+        box.addLayout(buttons)
+        form.addRow("エクスプローラー: 登録したフォルダ", box)
+
+        # AI に使わせる分類（2026-11-24 本人の決定 既定は効果音と BGM だけ）
+        self._explorer_ai_boxes: dict[str, QCheckBox] = {}
+        row = QHBoxLayout()
+        for key, name in LIBRARY_CATEGORIES.items():
+            check = QCheckBox(name, self)
+            check.setChecked(key in preferences.explorer_ai_categories)
+            check.setToolTip(
+                f"{name}の分類で登録したフォルダの素材を、AI アシスタントが探して使ってよい"
+                " 切ると AI はそのフォルダの名前も見ない"
+            )
+            self._explorer_ai_boxes[key] = check
+            row.addWidget(check)
+        row.addStretch(1)
+        form.addRow("エクスプローラー: AI に使わせる分類", row)
+
+        self._explorer_ai_bgm = QCheckBox("AI が頼まれなくても BGM を付ける", self)
+        self._explorer_ai_bgm.setChecked(preferences.explorer_ai_bgm)
+        self._explorer_ai_bgm.setToolTip(
+            "切っていると、AI は BGM を頼まれたときだけ付ける 入れると、編集を任されたときに"
+            "登録した BGM から選んで敷き、声と重なる所を下げる"
+            "（BGM の分類を AI に使わせるときだけ）"
+        )
+        form.addRow(self._explorer_ai_bgm)
+
+        self._explorer_volume = QSpinBox(self)
+        self._explorer_volume.setRange(*EXPLORER_PREVIEW_VOLUME_RANGE)
+        self._explorer_volume.setSuffix(" %")
+        self._explorer_volume.setValue(preferences.explorer_preview_volume)
+        self._explorer_volume.setToolTip(
+            "エクスプローラーで試聴する大きさ 100 % は作品の再生と同じ大きさ"
+            "（素材をそのまま鳴らす）"
+        )
+        form.addRow("エクスプローラー: 試聴の音量", self._explorer_volume)
 
     def _add_seam_rows(self, form: QFormLayout, preferences: Preferences) -> None:
         """ジャンプカットのつなぎ目（#332）の既定 溶かすか寄るか・どれだけの長さかは人と作品で違う

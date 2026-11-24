@@ -378,6 +378,7 @@ LEDGER: tuple[Entry, ...] = (
         "メニュー/表示/画面配置を初期に戻す", _LAYOUT, "layout.docks", "preferences.dock_tabs"
     ),
     read_only("メニュー/表示/ショートカットの設定…", _SHORTCUTS, "shortcuts"),
+    read_only("メニュー/表示/エクスプローラー", _LAYOUT, "layout.docks.explorer.visible"),
     read_only("メニュー/表示/設定…", _SETTINGS, "preferences"),
     missing(
         "メニュー/再生/再生 / 停止",
@@ -576,6 +577,39 @@ LEDGER: tuple[Entry, ...] = (
         "素材一覧の右クリック/プールから外す",
         "remove_media",
         note="使っていない素材だけ ファイルは消さない 取り消し 1 回で戻る",
+    ),
+    # --- エクスプローラー（#520 #521 #522） 登録したフォルダの素材 ---
+    # 登録と外しは本人の設定（どのフォルダを AI に見せるかも本人が決める #350 の決定）
+    read_only(
+        "エクスプローラー/登録…｜フォルダを分類（効果音・BGM・動画・画像など）を付けて登録する",
+        _SETTINGS,
+        "preferences.explorer_folders",
+    ),
+    read_only(
+        "エクスプローラー/外す｜選んだフォルダの登録を外す ファイルは消さない",
+        _SETTINGS,
+        "preferences.explorer_folders",
+    ),
+    same(
+        "エクスプローラー/読み直す｜フォルダの中を見直す 後から足したファイルを一覧へ出す",
+        "search_library",
+        note="search_library は呼ぶたびにフォルダを見直す 見るのは AI に使わせる分類のフォルダだけ",
+        safety=Safety.READ_ONLY,
+    ),
+    hidden(
+        "エクスプローラー/試聴｜選んだ音を鳴らす もう一度押すと止める",
+        "AI は音を聞けない 長さと頭の 1 分の大きさは search_library で読む"
+        " 決定の 5 つに当たらず未決",
+    ),
+    same(
+        "エクスプローラー/タイムラインへ｜選んだファイルを読み込んで再生位置へ置く"
+        " 取り消し 1 回で戻る",
+        "place_media",
+        "place_sound",
+        note=(
+            "library_file_id で取り込んで置く AI が使えるのは本人が AI に使わせると選んだ分類の"
+            "フォルダの物だけ（既定は効果音と BGM）"
+        ),
     ),
     # --- 字幕パネル ---
     same("字幕パネル/起こす…", "transcribe"),

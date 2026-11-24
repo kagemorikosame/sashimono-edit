@@ -166,6 +166,7 @@ from sashimono.core.io.atomic import Expected, expect_now, write_atomic_bytes
 from sashimono.core.io.library import Library
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
+from sashimono.core.material_library import LibraryFolder, MaterialLibrary, MeasureBook
 from sashimono.core.mixing import (
     DuckShape,
     gain_commands,
@@ -204,6 +205,7 @@ from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
+from sashimono.engine.audio.library_sound import SoundPreview, measure_library_file
 from sashimono.engine.audio.mixer import history_seconds
 from sashimono.engine.audio.speech import (
     SpeechError,
@@ -272,6 +274,7 @@ from sashimono.ui.backup_settings import (
 )
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.emphasis_dialog import ask_emphasis
+from sashimono.ui.explorer import ExplorerPanel
 from sashimono.ui.export_dialog import ExportDialog, credit_text
 from sashimono.ui.graph_editor import GraphEditor
 from sashimono.ui.idle_collect import IdleCollect
@@ -356,6 +359,9 @@ _PORTABLE = QKeySequence.SequenceFormat.PortableText
 #: 頭は黒からのフェードや、カメラを向ける前の揺れで、中身の分からない絵が多い
 #: 短い素材では最後の 1 枚に止まる（:meth:`Filmstrip.at`）
 POOL_THUMBNAIL_SECONDS = Fraction(1)
+
+#: エクスプローラーの素材を測った長さと大きさの控え（#522 キャッシュの置き場の中）
+EXPLORER_MEASURES = "explorer_measures.json"
 
 #: AviUtl のオブジェクトファイル
 EXO_FILTER = "AviUtl オブジェクト (*.exo *.exa *.exo2 *.exa2);;すべてのファイル (*)"
@@ -504,6 +510,8 @@ class MainWindow(QMainWindow):
     project_changed = Signal(object)
     #: 抑えた後の音量を見積もり終えた（#497） 裏のスレッドから送り、画面のスレッドで受ける
     _loudness_planned = Signal(object)
+    #: エクスプローラーの試聴が鳴らせなかった（#521） 試聴の裏のスレッドから送る
+    _explorer_sound_failed = Signal(str)
 
     def __init__(
         self,
@@ -772,6 +780,18 @@ class MainWindow(QMainWindow):
         self._timeline.set_snap(self._preferences.timeline_snap, self._preferences.snap_distance)
         self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(self._preferences))
         self._media_pool = MediaPoolWidget(project, self)
+        # 登録したフォルダの素材（#520 #521） 測った長さと大きさの控えは AI の道具（#522）と
+        # 一覧の行で同じ物を使う 測り直すと数百の効果音で数十秒待たせる
+        self._explorer_measures = MeasureBook(userdirs.cache_root() / EXPLORER_MEASURES)
+        self._sound_preview = SoundPreview()
+        self._explorer = ExplorerPanel(
+            self._preferences.explorer_folders,
+            self,
+            book=self._explorer_measures,
+            play=self._play_explorer_sound,
+            stop=self._sound_preview.stop,
+        )
+        self._explorer.set_preview_volume(self._preferences.explorer_preview_volume)
         self._inspector = InspectorPanel(self)
         # 設定パネルは選んだクリップを引くためにプロジェクトを持つ 起動直後にも渡す
         # （渡さないと、最初の編集まで何本も選んだときのまとめ当てが効かない）
@@ -871,6 +891,17 @@ class MainWindow(QMainWindow):
         # タブが裏にある間は字幕の一覧を作り直さない（選ぶたびに見えない表を組んでいた #455）
         subtitle_dock.visibilityChanged.connect(self._subtitles.set_shown)
         self._subtitle_dock = subtitle_dock
+
+        # エクスプローラー（#521）も素材を選ぶパネルなので、素材一覧と同じ所にタブで重ねる
+        explorer_dock = self._dock("エクスプローラー", "explorer")
+        explorer_dock.setWidget(self._explorer)
+        explorer_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, explorer_dock)
+        self.tabifyDockWidget(pool_dock, explorer_dock)
+        pool_dock.raise_()
+        self._explorer_dock = explorer_dock
 
         chat_dock = self._dock("AI アシスタント", "chat")
         chat_dock.setWidget(self._chat)
@@ -1172,6 +1203,7 @@ class MainWindow(QMainWindow):
             QKeySequence("Ctrl+G"),
             lambda: self._graph_dock.setVisible(not self._graph_dock.isVisible()),
         )
+        self._add(view_menu, "エクスプローラー", QKeySequence(), self.show_explorer)
         view_menu.addSeparator()
         self._add(
             view_menu,
@@ -1298,6 +1330,8 @@ class MainWindow(QMainWindow):
         scenes_before = self._scenes_on_import()
         screen_before = self._screen_on_import()
         self._preferences = preferences
+        self._explorer.set_folders(preferences.explorer_folders)
+        self._explorer.set_preview_volume(preferences.explorer_preview_volume)
         self._apply_scene_preferences(scenes_before)
         self._apply_screen_preferences(screen_before)
         try:
@@ -1590,6 +1624,10 @@ class MainWindow(QMainWindow):
         self._media_pool.transcribe_requested.connect(self._transcribe_media)
         self._media_pool.remove_requested.connect(self._remove_media)
         self._media_pool.search_requested.connect(self.show_media_search)
+        self._explorer.folders_changed.connect(self._on_explorer_folders)
+        self._explorer.place_requested.connect(self._place_explorer_files)
+        self._explorer.message.connect(lambda text: self.statusBar().showMessage(text, 5000))
+        self._explorer_sound_failed.connect(self._explorer_sound_stopped)
         self._timeline.status_message.connect(
             lambda message: self.statusBar().showMessage(message, 4000)
         )
@@ -2418,6 +2456,35 @@ class MainWindow(QMainWindow):
         """
         strip = self._analyzer.filmstrip(media)
         return strip.at(POOL_THUMBNAIL_SECONDS) if strip is not None else None
+
+    def _on_explorer_folders(self, folders: tuple[LibraryFolder, ...]) -> None:
+        """エクスプローラーで登録を変えた 設定に覚え、次に開いたときも同じ登録にする"""
+        self._remember_preferences(replace(self._preferences, explorer_folders=tuple(folders)))
+
+    def _place_explorer_files(self, paths: list[Path]) -> None:
+        """エクスプローラーの〔タイムラインへ〕 読み込んで再生位置へ置く
+
+        OS のエクスプローラーから落としたときと同じ読み込みを通す（取り消し 1 回で戻る）
+        """
+        self.import_media(list(paths), at=DropSpot(self._timeline.playhead, None))
+
+    def _play_explorer_sound(self, path: Path, volume: float) -> None:
+        """エクスプローラーの試聴 作品を再生していれば止める（2 つの音が重なると聞き分けられない）
+
+        作品の再生は止めるだけで、試聴の音は作品の時計を動かさない
+        """
+        if self._playback.is_playing:
+            self._playback.toggle()
+        self._sound_preview.play(path, volume, self._explorer_sound_failed.emit)
+
+    def _explorer_sound_stopped(self, message: str) -> None:
+        self._explorer.stop_listening()
+        self.statusBar().showMessage(message, 5000)
+
+    def show_explorer(self) -> None:
+        """エクスプローラーのパネルを前へ出す"""
+        self._explorer_dock.show()
+        self._explorer_dock.raise_()
 
     def _on_pool_view_changed(self, mode: str) -> None:
         """一覧の上のボタンで表示を切り替えた 好みの設定に書いて、次に開いたときも同じにする"""
@@ -4641,6 +4708,17 @@ class MainWindow(QMainWindow):
         return self._preferences.direction_taste
 
     @property
+    def material_library(self) -> MaterialLibrary:
+        preferences = self._preferences
+        return MaterialLibrary(
+            folders=preferences.explorer_folders,
+            ai_categories=preferences.explorer_ai_categories,
+            auto_bgm=preferences.explorer_ai_bgm,
+            book=self._explorer_measures,
+            measure=measure_library_file,
+        )
+
+    @property
     def seam_style(self) -> SeamStyle:
         return self._preferences.seam_style
 
@@ -5227,6 +5305,8 @@ class MainWindow(QMainWindow):
         names.update(self._package.remembered_names())
         if self._path is not None:
             names.add(str(self._path))
+        # エクスプローラーに登録したフォルダ（#520） 設定の写しと search_library に出る
+        names.update(folder.path for folder in self._preferences.explorer_folders)
         names.update(
             folder
             for folder in (
@@ -5680,6 +5760,8 @@ class MainWindow(QMainWindow):
         # 人の窓で作っている途中の声も、AI の書き出しと同じく止めて捨てる（#335） 残すと、
         # 閉じた後もイベントループが回る場面で、閉じた窓へ WAV を書いて声を置きに来る
         self._stop_narration()
+        self._sound_preview.stop()
+        self._explorer_measures.save()
         self._playback.close()
         if self._ai_renderer is not None:
             self._ai_renderer.close()

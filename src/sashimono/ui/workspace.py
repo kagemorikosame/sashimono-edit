@@ -65,6 +65,12 @@ from sashimono.core.emphasis import (
 )
 from sashimono.core.io.atomic import held_for_update, write_atomic
 from sashimono.core.io.serialize import ProjectFileError, style_guide_from_json
+from sashimono.core.material_library import (
+    DEFAULT_AI_CATEGORIES,
+    LibraryFolder,
+    parse_categories,
+    parse_folders,
+)
 from sashimono.core.mixing import (
     DEFAULT_DUCK_ATTACK_MS,
     DEFAULT_DUCK_DEPTH_DB,
@@ -142,6 +148,7 @@ __all__ = [
     "DOCK_TABS_BOTTOM",
     "DOCK_TABS_TOP",
     "DOCK_TAB_POSITIONS",
+    "EXPLORER_PREVIEW_VOLUME_RANGE",
     "LAYOUT_VERSION",
     "LIMIT_ACTIONS",
     "MAX_PREFETCH_MB",
@@ -316,6 +323,8 @@ AI_IMAGE_LIMITS = (0, 10_000)
 AI_MINUTE_LIMITS = (0, 1440)
 #: 持ち出し用パッケージの、使う範囲の前後の余裕（秒）の範囲 長すぎると範囲だけ入れる意味が無い
 PACKAGE_MARGINS = (0, 60)
+#: エクスプローラーの試聴の音量（%）の範囲 上げるのは割れるので 100 まで
+EXPLORER_PREVIEW_VOLUME_RANGE = (0, 100)
 #: 素材を読み込んだときに場面の一覧を裏で作るか（#321） :attr:`Preferences.scene_analysis` の値
 #: AI アシスタントが入っているときだけ・いつも・作らない（AI が頼んだときだけ読む）
 SCENES_WITH_AI = "with_ai"
@@ -862,6 +871,19 @@ class Preferences:
     direction_genre: str = DEFAULT_GENRE
     #: 強さ（:data:`~sashimono.core.direction_recipes.STRENGTHS`）
     direction_strength: str = DEFAULT_STRENGTH
+    #: エクスプローラー（#520 #521）に登録したフォルダと分類 既定は空（素材は同梱せず、
+    #: ネットからも取らない 2026-11-24 本人の決定） 分類はフォルダごとに 1 つ
+    #: エクスプローラーと `表示 → 設定…` の両方から変えられる
+    explorer_folders: tuple[LibraryFolder, ...] = ()
+    #: AI アシスタントが自動で使ってよい分類（#522） 既定は効果音と BGM だけ 動画と画像は
+    #: 作品の絵そのものを変えるので、使わせたい人だけが選ぶ（同じく本人の決定）
+    explorer_ai_categories: tuple[str, ...] = DEFAULT_AI_CATEGORIES
+    #: AI が頼まれなくても BGM を付けてよいか 既定は頼まれたときだけ（勝手に曲が鳴ると、
+    #: 曲の要らない作品で 1 本ずつ外す手間が要る 足りなければ頼めば付く）
+    explorer_ai_bgm: bool = False
+    #: エクスプローラーで試聴する音量（%） 100 は作品の再生と同じ大きさ（素材をそのまま鳴らす）
+    #: 大きな効果音を続けて聞くと耳が疲れるので、下げたい人が下げられるようにする
+    explorer_preview_volume: int = 100
     #: AI アシスタントがジャンプカットのつなぎ目を目立たなくする（#332）ときの既定
     #: 溶かすか寄るか・どれだけの長さかは人と作品で違う AI に値を言わなければこれを使う
     #: 既定は短いクロスフェードと 20 ms の音のフェード（絵の中身が欠けない側
@@ -1426,6 +1448,16 @@ class PreferenceStore:
             ),
             direction_strength=_choice(
                 data.get("direction_strength"), tuple(STRENGTHS), plain.direction_strength
+            ),
+            explorer_folders=parse_folders(data.get("explorer_folders")),
+            explorer_ai_categories=parse_categories(
+                data.get("explorer_ai_categories"), plain.explorer_ai_categories
+            ),
+            explorer_ai_bgm=_flag(data.get("explorer_ai_bgm"), plain.explorer_ai_bgm),
+            explorer_preview_volume=_within(
+                data.get("explorer_preview_volume"),
+                EXPLORER_PREVIEW_VOLUME_RANGE,
+                plain.explorer_preview_volume,
             ),
             seam_video=_choice(data.get("seam_video"), SEAM_VIDEOS, plain.seam_video),
             seam_crossfade_ms=_within(

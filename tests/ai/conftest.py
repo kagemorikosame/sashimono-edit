@@ -41,6 +41,7 @@ from sashimono.core.io.atomic import Expected, write_atomic_bytes
 from sashimono.core.io.library import Library
 from sashimono.core.io.serialize import ProjectFileError, load_project, save_project
 from sashimono.core.io.subtitles import save_subtitles
+from sashimono.core.material_library import MaterialLibrary
 from sashimono.core.mixing import DuckShape
 from sashimono.core.model import (
     ClipId,
@@ -155,6 +156,8 @@ class FakeHost:
         #: 強調の動き（#331）の本人の設定 既定は設定と同じ
         self.emphasis = EmphasisStyle()
         self.taste = DirectionTaste()
+        #: エクスプローラーの登録（#522） 既定は本人の設定と同じく何も登録していない
+        self.material = MaterialLibrary()
         #: ジャンプカットのつなぎ目（#332）の本人の設定 既定は設定と同じ
         self.seams = SeamStyle()
         #: ナレーション（#335）の本人の設定 エンジンの場所は誰も待ち受けていない番号へ向ける
@@ -510,6 +513,10 @@ class FakeHost:
     @property
     def direction_taste(self) -> DirectionTaste:
         return self.taste
+
+    @property
+    def material_library(self) -> MaterialLibrary:
+        return self.material
 
     @property
     def seam_style(self) -> SeamStyle:
