@@ -88,22 +88,49 @@ def _make_source(directory: Path, gap: int, seconds: int) -> Path | None:
     return path
 
 
-def _measure(path: Path, seconds: int, jumps: int) -> list[float]:
-    """ランダムな ``jumps`` か所へ飛んで 1 コマ出すまで（ミリ秒 小さい順）
+def _measure(path: Path, seconds: int, jumps: int) -> tuple[list[float], str | None]:
+    """ランダムな ``jumps`` か所へ飛んで 1 コマ出すまで（ミリ秒 小さい順）と、読めなかった理由
 
     乱数の種は固定する 素材ごとに飛ぶ先が違うと、比べた差が間隔の差なのか分からない
+    復号に失敗した（``decode_error`` が立った・絵が無い）回は数えずに止める デコーダは失敗すると
+    直前の絵を返すので、そのまま数えると読めていない時間を測れた時間として残す
     """
     rng = random.Random(0)
     times: list[float] = []
     with VideoDecoder(path) as decoder:
-        decoder.frame_at(Fraction(0))
+        if decoder.frame_at(Fraction(0)) is None or decoder.decode_error:
+            return [], decoder.decode_error or "頭の 1 コマを読めない"
         for _ in range(jumps):
             target = Fraction(rng.randrange(0, (seconds - 2) * RATE), RATE)
             start = time.perf_counter()
-            decoder.frame_at(target)
-            times.append((time.perf_counter() - start) * 1000)
+            shown = decoder.frame_at(target)
+            elapsed = (time.perf_counter() - start) * 1000
+            if shown is None or decoder.decode_error:
+                return [], decoder.decode_error or f"{float(target):.2f} 秒の絵が無い"
+            times.append(elapsed)
     times.sort()
-    return times
+    return times, None
+
+
+def _report(
+    record: BenchRecord,
+    name: str,
+    label: str,
+    found: Fraction | None,
+    path: Path,
+    args: argparse.Namespace,
+) -> None:
+    """1 行出して記録に足す 読めなければ項目を落ちた扱いにし、理由を記録に残す"""
+    times, error = _measure(path, args.seconds, args.jumps)
+    seen = f"{float(found):.1f}s" if found is not None else "?"
+    if error is not None:
+        print(f"{label:<24}{seen:>10}  読めなかった: {error}")
+        record.add(name, [], label=label)
+        record.fail(f"{label} を読めなかった: {error}")
+        return
+    median, high = _summary(times)
+    print(f"{label:<24}{seen:>10}{median:>9.1f}ms{high:>8.1f}ms")
+    record.add(name, times, label=label)
 
 
 def _summary(times: list[float]) -> tuple[float, float]:
@@ -155,11 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         longest = source
         # 線で止めずに読む 止めると 8 秒も 50 秒も「4 秒より長い」としか出ない
         found = keyframe_gap(source)
-        times = _measure(source, args.seconds, args.jumps)
-        median, high = _summary(times)
-        seen = f"{float(found):.1f}s" if found is not None else "?"
-        print(f"{f'元 {gap} 秒間隔':<24}{seen:>10}{median:>9.1f}ms{high:>8.1f}ms")
-        record.add(f"gop{gap}", times, label=f"元 {gap} 秒間隔")
+        _report(record, f"gop{gap}", f"元 {gap} 秒間隔", found, source, args)
 
     if longest is not None:
         proxy = create_proxy(longest, base / "proxy.mp4", height=PROXY_HEIGHT)
@@ -169,11 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             record.write(args.json)
             return 0
         found = keyframe_gap(proxy)
-        times = _measure(proxy, args.seconds, args.jumps)
-        median, high = _summary(times)
-        seen = f"{float(found):.1f}s" if found is not None else "?"
-        print(f"{f'控え {PROXY_HEIGHT}p':<24}{seen:>10}{median:>9.1f}ms{high:>8.1f}ms")
-        record.add(f"proxy{PROXY_HEIGHT}p", times, label=f"控え {PROXY_HEIGHT}p")
+        _report(record, f"proxy{PROXY_HEIGHT}p", f"控え {PROXY_HEIGHT}p", found, proxy, args)
     record.write(args.json)
     return 0
 

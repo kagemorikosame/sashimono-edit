@@ -166,6 +166,40 @@ class TestGenerate:
         with pytest.raises(tool.BomError, match="THIRD_PARTY_NOTICES"):
             tool.generate(_write(tmp_path, _zip(tool, drop=drop)))
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Sashimono/_internal/unlisted.dll",
+            "Sashimono/_internal/stranger/helper.dll",
+            "Sashimono/tool.exe",
+        ],
+    )
+    def test_a_binary_of_no_part_stops(self, tool: ModuleType, tmp_path: Path, name: str) -> None:
+        """表の置き場の外にある DLL を黙って通すと、部品の欠けた一覧を配る"""
+        with pytest.raises(tool.BomError, match="どの部品の物か決まっていない"):
+            tool.generate(_write(tmp_path, _zip(tool, extra={name: b"binary"})))
+
+    def test_python_runtime_dlls_belong_to_python(self, tool: ModuleType, tmp_path: Path) -> None:
+        """Python と一緒に入る DLL まで止めると、どの zip も一覧を作れない 中身は Python に数える"""
+        extra = {
+            "Sashimono/_internal/libssl-3.dll": b"ssl",
+            "Sashimono/_internal/VCRUNTIME140.dll": b"vc",
+            "Sashimono/_internal/_ssl.pyd": b"pyd",
+            "Sashimono/_internal/numpy/_core/multiarray.pyd": b"numpy",
+        }
+        found = _components(tool.generate(_write(tmp_path, _zip(tool, extra=extra))).data)
+        python = next(item for name, item in found.items() if name.startswith("Python"))
+        inner = python["components"]
+        assert isinstance(inner, list)
+        assert "_internal/libssl-3.dll" in {item["name"] for item in inner}
+
+    def test_two_folders_of_one_package_stop(self, tool: ModuleType, tmp_path: Path) -> None:
+        """表記だけ違う写しのフォルダを 2 つ載せると、同じ bom-ref が 2 つになる"""
+        version = _listed(tool)["numpy"]
+        extra = {f"Sashimono/licenses/NumPy-{version}/LICENSE.txt": b"numpy license"}
+        with pytest.raises(tool.BomError, match="重なる"):
+            tool.generate(_write(tmp_path, _zip(tool, extra=extra)))
+
     def test_a_license_text_that_is_not_an_spdx_expression_is_a_name(
         self, tool: ModuleType
     ) -> None:
@@ -187,6 +221,13 @@ class TestWrite:
         out.write_text("{}", encoding="utf-8")
         assert tool.main(["write", "--archive", str(archive), "--out", str(out)]) == 1
         assert not out.exists()
+
+    def test_the_zip_is_never_the_output(self, tool: ModuleType, tmp_path: Path) -> None:
+        """前の一覧を消す所で、同じ場所を渡された配る zip を消さない"""
+        archive = _write(tmp_path, _zip(tool))
+        with pytest.raises(SystemExit):
+            tool.main(["write", "--archive", str(archive), "--out", str(archive)])
+        assert archive.is_file()
 
     def test_it_writes_beside_the_zip(self, tool: ModuleType, tmp_path: Path) -> None:
         """書いた一覧が作り直した物と違うと、release.py の照らしで必ず止まる"""
@@ -223,3 +264,14 @@ class TestCompare:
         assert any(line.startswith("外した: av ") for line in lines)
         assert any(line.startswith("版が変わった: numpy ") for line in lines)
         assert tool.differences(before, before) == []
+
+    def test_swapped_dlls_are_a_change(self, tool: ModuleType, tmp_path: Path) -> None:
+        """2 つの DLL の中身が入れ替わっても、値だけを並べて比べると同じに見える"""
+        before = tool.generate(_write(tmp_path, _zip(tool), "before.zip")).data
+        after = json.loads(json.dumps(before))
+        ffmpeg = next(c for c in after["components"] if c["name"] == "FFmpeg")
+        first, second = ffmpeg["components"]
+        first["hashes"], second["hashes"] = second["hashes"], first["hashes"]
+        assert any(
+            "版が同じで中身が違う: FFmpeg" in line for line in tool.differences(before, after)
+        )

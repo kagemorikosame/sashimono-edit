@@ -29,8 +29,8 @@ r"""代表の測りを版ごとに残し、同じ機械の前の版と比べて�
 - 落ちた・欠けた・新しい 測りが落ちた回（終了コード・時間切れ・記録が読めない）は、飛ばした
   （ffmpeg や GPU が無い）のと分けて出す
 
-``compare`` は遅くなった項目があれば終了コード 1、比べる相手が無ければ 2 落ちた・揺れが
-大きいだけでは 0（揺れで毎回止まる確かめは、そのうち見られなくなる）
+``compare`` は遅くなった項目があれば終了コード 1、比べる相手が無い（記録が無い・機械が違う）
+ときは 2 落ちた・揺れが大きいだけでは 0（揺れで毎回止まる確かめは、そのうち見られなくなる）
 """
 
 from __future__ import annotations
@@ -297,14 +297,27 @@ def summarize(name: str, entry: dict[str, Any]) -> BenchSummary:
         (first.get("machine") or {}).get("gpu") if first else None,
         first.get("machine") if first else None,
     )
+    # 測れた回があっても、飛ばした回が 1 つでもあれば理由を残す（比べる側はその測りを比べない）
+    # 一部の回だけ飛ばした記録は、機械の様子が回の間で変わった印で、残りの回も信じきれない
     skipped = [run for run in runs if run.get("status") == SKIPPED]
-    if skipped and not measured:
+    if skipped:
         summary.skipped = str(skipped[0].get("reason") or "飛ばした")
     for run in runs:
         if run.get("status") == FAILED:
             summary.failures.append(f"{run.get('run')} 回目: {run.get('reason', '')}")
-    raw: dict[str, tuple[str, list[float], int]] = {}
+    # 最初の回と GPU・条件の違う回は標本に混ぜない 混ぜると別の機械や条件の値が 1 つの中央に
+    # まとまり、比べる側は最初の回の値しか見ないので気付けない 落ちた回として数える
+    usable = []
     for run in measured:
+        gpu = (run.get("machine") or {}).get("gpu")
+        if run.get("conditions") != summary.conditions or gpu != summary.gpu:
+            summary.failures.append(
+                f"{run.get('run')} 回目: GPU か条件が最初の回と違うので数えない"
+            )
+            continue
+        usable.append(run)
+    raw: dict[str, tuple[str, list[float], int]] = {}
+    for run in usable:
         for item in run.get("items", []):
             key = str(item.get("name"))
             label, values, failed = raw.get(key, (str(item.get("label") or key), [], 0))
@@ -435,7 +448,10 @@ def compare(base: dict[str, Any], target: dict[str, Any]) -> Comparison:
             continue
         for key in sorted(set(old.items) | set(now.items)):
             if key not in now.items:
-                result.verdicts.append(Verdict(name, key, old.items[key].label, MISSING))
+                # 落ちた回があるなら、そこまで届かずに測れなかっただけかもしれない 消えたと
+                # 言うのは、全部の回が測れたのに項目が無いときだけ
+                kind = FAILED_ITEM if now.failures else MISSING
+                result.verdicts.append(Verdict(name, key, old.items[key].label, kind))
                 continue
             if key not in old.items:
                 item = now.items[key]
@@ -443,6 +459,8 @@ def compare(base: dict[str, Any], target: dict[str, Any]) -> Comparison:
                 continue
             result.verdicts.append(judge(name, old.items[key], now.items[key]))
         for key, item in now.items.items():
+            if item.failed_runs:
+                result.notes.append(f"{name}/{key}: 測れなかった回 {item.failed_runs}")
             if item.outliers:
                 shown = "、".join(f"{value:.2f}" for value in item.outliers)
                 result.notes.append(f"{name}/{key}: 異常値として外した回 {shown} ms")
@@ -488,6 +506,8 @@ def describe(data: dict[str, Any]) -> str:
         for item in summary.items.values():
             state = "安定" if item.stable else "揺れが大きい"
             outliers = f" 異常値 {len(item.outliers)} 回" if item.outliers else ""
+            if item.failed_runs:
+                outliers += f" 測れなかった回 {item.failed_runs}"
             lines.append(
                 f"  {item.name} {item.label} 中央 {item.center:.2f} ms 幅 {item.spread:.0%}"
                 f"（{len(item.values)} 回）{state}{outliers}"
@@ -526,7 +546,8 @@ def pick(
 
     def named(label: str) -> dict[str, Any] | None:
         for path, found in reversed(records):
-            if path.stem == label or found.get("version") == label:
+            # 名前は記録の名前・ファイル名・版のどれでも引く（ファイル名は使えない字を _ にする）
+            if label in (found.get("label"), found.get("version"), path.stem):
                 chosen: dict[str, Any] = found
                 return chosen
         return None
@@ -625,7 +646,8 @@ def main(argv: list[str] | None = None, *, call: Execute = execute) -> int:
         return 2
     comparison = compare(base_data, target_data)
     print(report(comparison))
-    if not comparison.verdicts:
+    if not same_machine(base_data.get("machine"), target_data.get("machine")):
+        # 比べられる相手が無いのと同じ 落ちた・揺れが大きいだけ（判定の無い比べ）は 0 のまま
         return 2
     return 1 if comparison.regressions else 0
 

@@ -925,12 +925,12 @@ class Release:
         try:
             current = json.loads(self.bill(self.archive))
             previous = json.loads(self.previous_bill())
-        except (OSError, ValueError, sbom.BomError) as exc:
-            return [f"[--] 前に公開した版の部品の一覧を読めず、比べていない（{exc}）"]
-        if not isinstance(previous, dict):
-            return ["[--] 前に公開した版の部品の一覧を読めず、比べていない"]
-        before = previous.get("metadata", {}).get("component", {}).get("version", "?")
-        lines = sbom.differences(previous, current)
+            # 形の崩れた前の一覧（欄が null など）で落ちると、参考の表示のために公開まで進めない
+            # 中身を辿る所まで含めて、読めないのと同じに扱う
+            before = previous["metadata"]["component"]["version"]
+            lines = sbom.differences(previous, current)
+        except (OSError, ValueError, sbom.BomError, KeyError, TypeError, AttributeError) as exc:
+            return [f"[--] 前に公開した版の部品の一覧を読めず、比べていない（{exc!r}）"]
         return [f"{before} から: {line}" for line in lines] or [f"{before} から: 部品の違いは無い"]
 
     # --- 5. ソース -----------------------------------------------------------------

@@ -347,7 +347,11 @@ def main(argv: list[str] | None = None) -> int:
             # 受けないと、待つ上限に掛かったときにトレースバックで終わる
             except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                 print(f"素材を作れない（ffmpeg と libx264・aac を見てください）: {error}")
-                record.fail(f"素材を作れない: {error}")
+                if shutil.which("ffmpeg") is None:
+                    # ffmpeg の無い機械は測れない所で、落ちたのではない（bench_seek と同じ扱い）
+                    record.skip("ffmpeg が無い")
+                else:
+                    record.fail(f"素材を作れない: {error}")
                 record.write(arguments.json)
                 return 2
             started = time.perf_counter()

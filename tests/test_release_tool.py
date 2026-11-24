@@ -1597,6 +1597,24 @@ class TestBill:
         assert "部品      1.2.2 から: 版が変わった: 部品" in out
         assert world.published
 
+    @pytest.mark.parametrize(
+        "previous",
+        [b'{"metadata": null, "components": []}', b"[]", b'{"metadata": {}, "components": [1]}'],
+    )
+    def test_a_broken_previous_bill_does_not_stop(
+        self,
+        tool: ModuleType,
+        world: World,
+        capsys: pytest.CaptureFixture[str],
+        previous: bytes,
+    ) -> None:
+        """前の一覧は参考に見せるだけ 形が崩れていても、公開の確認まで進める"""
+        world.previous = previous
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 0
+        assert "前に公開した版の部品の一覧を読めず" in capsys.readouterr().out
+        assert world.published
+
     def test_an_unreadable_previous_bill_does_not_stop(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:

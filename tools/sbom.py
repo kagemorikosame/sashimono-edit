@@ -80,6 +80,12 @@ _INTERNAL = f"{_APP}/_internal/"
 #: 写しのフォルダが無いので、ここに中身があることで積んだと見る
 IMPORT_FOLDERS: dict[str, str] = {"pyopengl": "OpenGL"}
 
+#: Python 本体と一緒に入る DLL（``_internal`` の直下）
+#: 表の「Python と同梱の OpenSSL・libffi など」の分
+PYTHON_RUNTIME = ("python3*.dll", "libcrypto-*.dll", "libssl-*.dll", "libffi-*.dll", "sqlite3.dll")
+#: ``_internal`` の直下に置かれてよい DLL の型 これ以外の DLL が直下にあれば、出どころの分からない物
+ROOT_DLLS = (*PYTHON_RUNTIME, "vcruntime140*.dll", "msvcp140*.dll")
+
 #: 脆弱性の照合に使う名前（CPE の作り手と製品） NVD で名前が決まっていると確かめた物だけ
 #: 推測で書くと、照合で別の製品に当たるか、当たるはずの物を外す 部品の名前の頭の語で引く
 CPE_PRODUCTS: dict[str, tuple[str, str]] = {
@@ -306,6 +312,10 @@ def _python_packages(
             )
             continue
         key = canonical_name(row.name)
+        if key in used:
+            # 表記だけ違う写しのフォルダが 2 つあると、同じ部品が 2 度載り bom-ref が重なる
+            problems.append(f"licenses/{folder} は {row.name} の写しのフォルダと重なる")
+            continue
         used.add(key)
         found.append(_package(row, f"{_LICENSES}{folder}"))
     for key in sorted(build_package.WITHOUT_LICENSE_FILES):
@@ -403,12 +413,50 @@ def _parts(
         found = entry(row)
         patterns = list(row.patterns)
         if found.name.lower().startswith("python"):
-            patterns.append("python3*.dll")
+            patterns += list(PYTHON_RUNTIME)
         for name in inside:
             filename = PurePosixPath(name).name
             if any(fnmatch.fnmatch(filename.lower(), pattern.lower()) for pattern in patterns):
                 found.files[name[len(_APP) + 1 :]] = _digest(archive, name)
     return list(reached.values()), left
+
+
+def unclaimed(names: list[str], used: set[str], parts: list[Found]) -> list[str]:
+    """どの部品の物とも決まらない DLL・拡張・exe 一覧に載らないまま配る物を見つける
+
+    表の部品の置き場（av.libs・PySide6 など）と、積んだ Python の包みのフォルダの下は、その部品の
+    物と見る ``_internal`` の直下の DLL は Python 本体と実行時の部品の名前の型（:data:`ROOT_DLLS`）
+    だけを許す 直下の ``.pyd`` は標準ライブラリと包みの拡張で、Python が読む物
+    """
+    tops = set(build_package.NATIVE_FOLDERS)
+    for part in parts:
+        # 置き場の頭のフォルダ（``_internal/OpenGL/DLLS/`` なら OpenGL） 直下（Python）は数えない
+        if part.evidence.startswith(_INTERNAL):
+            top = part.evidence[len(_INTERNAL) :].split("/", 1)[0]
+            if top:
+                tops.add(top)
+    found: list[str] = []
+    for name in names:
+        suffix = PurePosixPath(name).suffix.lower()
+        if suffix not in (".dll", ".pyd", ".exe") or name == f"{_APP}/{_APP}.exe":
+            continue
+        if not name.startswith(_INTERNAL):
+            found.append(f"{name} がどの部品の物か決まっていない")
+            continue
+        inner = name[len(_INTERNAL) :]
+        if "/" not in inner:
+            if suffix == ".pyd" or any(
+                fnmatch.fnmatch(inner.lower(), pattern) for pattern in ROOT_DLLS
+            ):
+                continue
+            found.append(f"_internal/{inner} がどの部品の物か決まっていない")
+            continue
+        top = inner.split("/", 1)[0]
+        imported = {IMPORT_FOLDERS.get(key, key) for key in used}
+        if top in tops or top in imported or canonical_name(top) in used:
+            continue
+        found.append(f"_internal/{inner} がどの部品の物か決まっていない")
+    return found
 
 
 @dataclass
@@ -459,6 +507,7 @@ def generate(path: Path) -> Bom:
             build_package.version_text(python) if python else None,
             problems,
         )
+    problems += unclaimed(names, used, native)
     if problems:
         raise BomError(problems)
     left_out = [packages[key].name for key in sorted(set(packages) - used)] + left
@@ -539,7 +588,9 @@ def differences(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
         (old_version, old_files), (new_version, new_files) = before[name], after[name]
         if old_version != new_version:
             lines.append(f"版が変わった: {name} {old_version} → {new_version}")
-        elif sorted(old_files.values()) != sorted(new_files.values()):
+        elif old_files != new_files:
+            # 名前ごとに比べる 値だけを並べ替えて比べると、2 つの DLL の中身が
+            # 入れ替わっても同じに見える
             lines.append(f"版が同じで中身が違う: {name} {new_version}（DLL {len(new_files)} 個）")
     return lines
 
@@ -584,6 +635,9 @@ def main(argv: list[str] | None = None) -> int:
             ROOT / "dist" / f"{build_package.ARCHIVE_PREFIX}-{__version__}-windows-x64.zip"
         )
         out = args.out or archive.with_name(BOM_NAME)
+        if out.resolve() == archive.resolve():
+            # 下で前の一覧を消すので、同じ場所を渡されると配る zip を消してしまう
+            parser.error("--out に --archive と同じ場所は渡せない")
         # 前の一覧を先に消す 今回作れずに終わったとき、前の版の一覧が今の zip の隣に残って
         # 一緒に上げられると、誤った一覧を配ることになる
         out.unlink(missing_ok=True)

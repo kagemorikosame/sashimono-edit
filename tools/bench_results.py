@@ -173,4 +173,14 @@ def read_record(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path.name} は {SCHEMA} の記録ではない")
     if data.get("status") not in (OK, SKIPPED, FAILED) or not isinstance(data.get("items"), list):
         raise ValueError(f"{path.name} の中身が欠けている")
+    # 項目の形も見る 壊れた項目を通すと、比べる道具が数える所で落ち、残した記録ごと読めなくなる
+    for item in data["items"]:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise ValueError(f"{path.name} に読めない項目がある")
+        if item.get("status") == OK and not (
+            isinstance(item.get("median"), (int, float))
+            and isinstance(item.get("samples"), list)
+            and item["samples"]
+        ):
+            raise ValueError(f"{path.name} の {item['name']} に値が無い")
     return data

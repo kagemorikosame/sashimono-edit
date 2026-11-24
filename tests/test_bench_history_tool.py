@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import sys
@@ -103,6 +104,11 @@ def _runs(values: Sequence[float], name: str = "gop1", **options: Any) -> list[d
         {"run": index + 1, **_record({name: value}, **options)}
         for index, value in enumerate(values)
     ]
+
+
+def _args() -> argparse.Namespace:
+    """bench_seek の引数（素材の長さと飛ぶ数）"""
+    return argparse.Namespace(seconds=10, jumps=5)
 
 
 class TestStability:
@@ -217,6 +223,73 @@ class TestCompare:
         kinds = {v.name: v.kind for v in tool.compare(base, target).verdicts}
         assert kinds == {"gop1": tool.MISSING, "gop8": tool.NEW}
 
+    def test_an_item_unreached_after_a_failure_is_not_missing(self, tool: ModuleType) -> None:
+        """落ちて届かなかった項目を「欠けた」と言うと、測りの名前を消したのと取り違える"""
+        base = _history("0.2.6", "2026-11-01", {"seek": _runs([10.0] * 5)})
+        runs = _runs([10.0] * 3, name="gop8")
+        runs.append({"run": 4, **_record({}, status="failed")})
+        target = _history("0.2.7", "2026-11-24", {"seek": runs})
+        kinds = {v.name: v.kind for v in tool.compare(base, target).verdicts}
+        assert kinds["gop1"] == tool.FAILED_ITEM
+
+    def test_a_partly_skipped_bench_is_not_compared(self, tool: ModuleType) -> None:
+        """一部の回だけ飛ばした測りは、機械の様子が回の間で変わった印 残りの回でも比べない"""
+        base = _history("0.2.6", "2026-11-01", {"seek": _runs([10.0] * 5)})
+        runs = _runs([20.0] * 3)
+        runs.append({"run": 4, **_record({}, status="skipped")})
+        target = _history("0.2.7", "2026-11-24", {"seek": runs})
+        comparison = tool.compare(base, target)
+        assert comparison.verdicts == []
+        assert any("飛ばした" in note for note in comparison.notes)
+
+    def test_a_run_on_another_gpu_is_not_mixed_in(self, tool: ModuleType) -> None:
+        """回の間で GPU が変わった値を 1 つの中央に混ぜると、別の機械の値で判定する"""
+        runs = _runs([10.0] * 3, gpu="GPU A") + _runs([30.0] * 2, gpu="GPU B")
+        summary = tool.summarize("render", {"runs": runs})
+        assert summary.items["gop1"].values == [10.0, 10.0, 10.0]
+        assert any("GPU か条件が最初の回と違う" in failure for failure in summary.failures)
+
+    def test_failed_runs_of_an_item_are_reported(self, tool: ModuleType) -> None:
+        """成功した回だけで安定と出しても、測れなかった回は別に見えなければならない"""
+        runs = _runs([10.0] * 3)
+        failed = _record({"gop1": 1.0})
+        failed["items"][0]["status"] = "failed"
+        runs += [{"run": 4, **failed}, {"run": 5, **failed}]
+        base = _history("0.2.6", "2026-11-01", {"seek": _runs([10.0] * 5)})
+        target = _history("0.2.7", "2026-11-24", {"seek": runs})
+        assert "測れなかった回 2" in tool.report(tool.compare(base, target))
+        assert "測れなかった回 2" in tool.describe(target)
+
+    def test_only_failures_exit_zero(
+        self, tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """比べる相手があって落ちただけなら 0 揺れや失敗で毎回止まる確かめは見られなくなる"""
+        base = _history("0.2.6", "2026-11-01", {"seek": _runs([10.0] * 5)})
+        target = _history(
+            "0.2.7", "2026-11-24", {"seek": [{"run": 1, "status": "failed", "reason": "落ちた"}]}
+        )
+        files = []
+        for data in (base, target):
+            path = tmp_path / f"{data['version']}.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            files.append(str(path))
+        assert tool.main(["compare", *files]) == 0
+        assert "落ちた" in capsys.readouterr().out
+
+    def test_a_label_with_unusable_characters_is_found(
+        self, tool: ModuleType, tmp_path: Path
+    ) -> None:
+        """名前に使えない字はファイル名で _ になる
+
+        付けた名前で引けないと、残した記録を比べられない
+        """
+        data = _history("0.2.6", "2026-11-01", {"seek": _runs([10.0] * 5)})
+        data["label"] = "手元 測り"
+        path = tmp_path / "____.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        _, found = tool.pick(tool.history_files(tmp_path), None, "手元 測り")
+        assert found is not None and found["label"] == "手元 測り"
+
 
 class TestRun:
     def test_a_run_without_a_record_is_a_failure_with_the_error(
@@ -310,14 +383,93 @@ class TestRecord:
         with pytest.raises(ValueError, match="記録ではない"):
             results.read_record(path)
 
-    def test_the_machine_has_no_personal_names(self, results: ModuleType) -> None:
-        """記録は人へ渡すことがある 機械の名前や利用者の名前を入れない"""
+    def test_the_machine_has_no_personal_names(
+        self, results: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """記録は人へ渡すことがある 機械の名前や利用者の名前を読みに行かない
+
+        文字の部分一致で見ると、利用者の名前が CPU の名前の一部（Intel など）の機械で誤って落ちる
+        読む口そのものを、呼ばれたら落ちる物に替えて確かめる
+        """
         import getpass
         import platform
 
-        found = json.dumps(results.machine("GPU"), ensure_ascii=False)
-        assert platform.node() not in found
-        assert getpass.getuser() not in found
+        def refuse(*_args: object) -> str:
+            raise AssertionError("機械の名前か利用者の名前を読んだ")
+
+        monkeypatch.setattr(platform, "node", refuse)
+        monkeypatch.setattr(getpass, "getuser", refuse)
+        found = results.machine("GPU")
+        assert set(found) == {"cpu", "cores", "os", "os_build", "gpu", "python"}
+        assert found["gpu"] == "GPU"
+        assert found["cpu"] and found["cores"] > 0
+
+    def test_an_item_that_is_not_a_table_is_refused(
+        self, results: ModuleType, tmp_path: Path
+    ) -> None:
+        """壊れた項目を通すと、比べる道具が数える所で落ち、残した記録ごと読めなくなる"""
+        broken = {**_record({"gop1": 1.0}), "items": [None]}
+        path = tmp_path / "壊れた.json"
+        path.write_text(json.dumps(broken), encoding="utf-8")
+        with pytest.raises(ValueError, match="読めない項目"):
+            results.read_record(path)
+        empty = _record({"gop1": 1.0})
+        empty["items"][0]["samples"] = []
+        path.write_text(json.dumps(empty), encoding="utf-8")
+        with pytest.raises(ValueError, match="値が無い"):
+            results.read_record(path)
+
+    def test_a_decode_error_is_not_a_measured_time(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """デコーダは読めないと直前の絵を返す
+
+        その時間を測れた値として残すと、壊れた素材が速く見える
+        """
+        seek = _load("bench_seek")
+
+        class Broken:
+            decode_error: str | None = None
+
+            def __init__(self, _path: Path) -> None:
+                self.calls = 0
+
+            def __enter__(self) -> Broken:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def frame_at(self, _seconds: object) -> object:
+                self.calls += 1
+                if self.calls > 2:
+                    self.decode_error = "試験の復号の失敗"
+                return object()
+
+        monkeypatch.setattr(seek, "VideoDecoder", Broken)
+        times, error = seek._measure(tmp_path / "素材.mp4", 10, 5)
+        assert times == []
+        assert error == "試験の復号の失敗"
+        record = _load("bench_results").BenchRecord("seek", {})
+        seek._report(record, "gop1", "元 1 秒間隔", None, tmp_path / "素材.mp4", _args())
+        assert record.status == "failed"
+        assert record.items[0]["status"] == "failed"
+
+    def test_the_timeline_bench_records_a_skip_without_ffmpeg(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """実素材の測りも、ffmpeg の無い機械は飛ばしたと書く
+
+        落ちたと書くと、測りの失敗と見分けられない
+        """
+        monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+        timeline = _load("bench_timeline")
+        monkeypatch.setattr(timeline.shutil, "which", lambda _name: None)
+        path = tmp_path / "timeline.json"
+        assert timeline.main(["--media", "--clips", "4", "--json", str(path)]) == 2
+        data = _load("bench_results").read_record(path)
+        assert data["status"] == "skipped"
 
     def test_the_seek_bench_records_a_skip_without_ffmpeg(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

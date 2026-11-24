@@ -1840,7 +1840,7 @@ h264_nvenc）を `tools/bench_decode.py` で読ませた（2026-11-09 Core Ultra
 - 落ちた回（終了コード・時間切れ・記録が読めない）は、飛ばした回（ffmpeg や GPU が無い）と分けて
   理由と一緒に出す 合成の測りは予算を超えると終了コード 1 で終わるが、記録が読めれば測れた回と見る
 - `run` と `compare` は遅くなった項目があれば終了コード 1 落ちた・揺れが大きいだけでは 0
-  比べる相手が無ければ `compare` は 2
+  比べる相手が無い（記録が無い・機械が違う）ときは `compare` は 2
 - 版を出すときは、ほかに動いている物を止めてタグの commit で `run` を回し、前の版と比べる
   遅くなった項目が出たら、止めた中で測り直してから原因を探す 測りの道具はその commit の物を使うので
   （`--json` は 0.2.7 から）、記録は 0.2.7 から始まり、比べられるのは 0.2.8 から
@@ -5131,7 +5131,10 @@ gh release upload <タグ> dist\sources\sources-SHA256SUMS.txt dist\sources\sour
   （目録 `update.json` と同じ置き方）
 - 作るのは `tools/sbom.py` 読むのは配る zip だけで、zip の中の使用許諾の一覧（`THIRD_PARTY_NOTICES.txt`）
   の表から名前・版・使用許諾を引き、zip に入っている写しのフォルダと DLL に突き合わせる DLL が
-  どの部品の物かは `build_package.NATIVE_LICENSES`（組み立ての確かめと同じ表）
+  どの部品の物かは `build_package.NATIVE_LICENSES`（組み立ての確かめと同じ表） zip の中の DLL・拡張・
+  exe はどれも、表の部品の置き場か積んだ包みのフォルダの下になければ止める `_internal` の直下の DLL は
+  Python 本体と実行時の部品（`python3*` `libssl-*` `libcrypto-*` `libffi-*` `sqlite3` `VCRUNTIME140*`
+  `MSVCP140*`）だけを許す
 - Python の包みには purl、脆弱性の照合に使う名前が決まっている部品（Python・Qt・FFmpeg・zlib・
   libwebp・libvpx・libiconv・dav1d・Opus）には CPE を書く Python は表の「3.14」ではなく、zip の
   DLL から読んだ修正版まで書く 推測の CPE は書かない（照合で別の製品に当たる）
