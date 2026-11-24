@@ -20,9 +20,10 @@ __all__ = [
     "HOME_PLACEHOLDER",
     "SECRET_MARK",
     "marked_root_labels",
+    "mask_places",
+    "mask_record_text",
     "mask_report",
     "mask_secrets",
-    "mask_under_folders",
     "mask_user_folders",
     "root_key",
     "root_lines",
@@ -152,23 +153,24 @@ SECRET_MARK = "〔秘密〕"
 #: （API の鍵か、トークンか）が報告から読めるようにする
 #: 診断情報（#516）に混ざりうるのは、AI の部品や更新の係が上げたエラーの文に入った鍵と、
 #: 設定の窓で打ち込んだ値を含む例外の文 形の分からない秘密は、本人が窓で見て消す
-_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], int], ...] = (
+#: どの形も 1 番目の組が残す頭
+_SECRET_NAME = r"(?i:api[_\-]?key|access[_\-]?key|secret|token|password|passwd|pwd)"
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Anthropic・OpenAI の API の鍵 ``sk-ant-api03-…`` ``sk-proj-…``
-    (re.compile(r"(sk-)(?:ant-|proj-)?[A-Za-z0-9_\-]{16,}"), 1),
+    re.compile(r"(sk-)(?:ant-|proj-)?[A-Za-z0-9_\-]{16,}"),
     # GitHub のトークン ``ghp_…`` ``github_pat_…``
-    (re.compile(r"((?:gh[pousr]|github_pat)_)[A-Za-z0-9_]{16,}"), 1),
+    re.compile(r"((?:gh[pousr]|github_pat)_)[A-Za-z0-9_]{16,}"),
     # AWS の鍵の番号
-    (re.compile(r"(AKIA)[0-9A-Z]{16}"), 1),
+    re.compile(r"(AKIA)[0-9A-Z]{16}"),
     # ``Authorization: Bearer …`` ``Bearer …``
-    (re.compile(r"((?i:bearer)\s+)[A-Za-z0-9._~+/\-]+=*"), 1),
-    # ``api_key=…`` ``"token": "…"`` ``password: …`` など 名前と区切りを残して値を伏せる
-    (
-        re.compile(
-            r"((?i:api[_\-]?key|access[_\-]?key|secret|token|password|passwd|pwd)"
-            r"[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}]+"
-        ),
-        1,
-    ),
+    re.compile(r"((?i:bearer)\s+)[A-Za-z0-9._~+/\-]+=*"),
+    # 引用符で囲んだ値 ``"password": "two words"`` 閉じる引用符まで（中の ``\"`` は飛ばす）
+    # 空白で止めると、空白を含むパスワードの後ろが残る（PR #550 の CodeRabbit の指摘）
+    re.compile("(" + _SECRET_NAME + r"""["']?\s*[:=]\s*")(?:[^"\\\n]|\\.)*"""),
+    re.compile("(" + _SECRET_NAME + r"""["']?\s*[:=]\s*')(?:[^'\\\n]|\\.)*"""),
+    # 囲んでいない値 ``api_key=…`` ``password: …`` 空白・区切りの前まで
+    # 囲んだ値は上で印になっているので、ここでは引用符で始まる値を飛ばす
+    re.compile("(" + _SECRET_NAME + r"""["']?\s*[:=]\s*)(?!["'])[^\s"',;}]+"""),
 )
 
 
@@ -176,30 +178,76 @@ def mask_secrets(text: str) -> str:
     """API の鍵・トークン・パスワードを :data:`SECRET_MARK` に置き換える
 
     鍵は 1 つ漏れるだけで他人に使われ、伏せすぎても困るのは値が読めないことだけなので、
-    名前の分かる形は値を丸ごと伏せる
+    名前の分かる形は値を丸ごと伏せる 名前と区切り（``"password": "``）は残す
     """
-    for pattern, keep in _SECRET_PATTERNS:
-        text = pattern.sub(rf"\g<{keep}>{SECRET_MARK}", text)
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(rf"\g<1>{SECRET_MARK}", text)
     return text
 
 
-#: 置き場の印（:data:`HOME_PLACEHOLDER` など）の後に続く場所 区切りから、空白・引用符・
-#: 括弧・文の区切りの前まで
-#: 文の区切りの記号（読点・句点・全角のカンマと括弧）は ``ai/outbound.py`` と同じく番号で書く
-_UNDER_FOLDER = re.compile(
-    r"((?:%[A-Z_]+%|\$XDG_[A-Z_]+))[\\/][^\s\"'<>|*?\u3001\u3002\uff0c\uff08\uff09()]*"
-)
+#: 場所の頭 置き場の印（:data:`HOME_PLACEHOLDER` など 印は残す）・ドライブ名・UNC
+_PLACE_HEAD = r"(?:((?:%[A-Z_]+%|\$XDG_[A-Z_]+))[\\/]|(?<![A-Za-z0-9])[A-Za-z]:[\\/]|\\\\)"
+#: 場所の続き 空白は含める（空白を含む素材の名前の後ろを残さないため PR #550 の指摘）
+#: 改行・引用符・括弧・文の区切りの記号で終わる 記号は ``ai/outbound.py`` と同じく番号で書く
+_PLACE_TAIL = r"[^\r\n\"'<>|*?\u3001\u3002\uff0c\uff08\uff09()\u300c\u300d]*"
+_PLACE = re.compile(_PLACE_HEAD + _PLACE_TAIL)
 
 
-def mask_under_folders(text: str, mark: str) -> str:
-    r"""置き場の印の下の場所を、印だけ残して ``mark`` に置き換える
+def mask_places(text: str, mark: str) -> str:
+    r"""ファイルの場所を ``mark`` に置き換える 置き場の印（``%USERPROFILE%``）は残す
 
     :func:`mask_user_folders` は利用者名の入った置き場だけを伏せ、その下のフォルダと
-    ファイルの名前（``%USERPROFILE%\Videos\旅行.mp4``）は残す 互換性レポートでは探索先の
+    ファイルの名前（``%USERPROFILE%\Videos\旅行 1 日目.mp4``）は残す 互換性レポートでは探索先の
     中を読めるよう残すが、診断情報（#516）では素材の名前になるので伏せる
+    空白で止めない 形で場所を拾う伏せ方（``ai/outbound.py``）は空白で止まり、空白を含む名前の
+    後ろ（`` 1 日目.mp4``）が残る 場所の後ろに続く文まで伏せることがあるが、伏せすぎて困るのは
+    読めないことだけで、出た名前は取り戻せない 引用符で囲んだ場所は閉じる引用符で終わる
     印は残す どの置き場（設定・退避・ホーム）の話かは報告から読める
     """
-    return _UNDER_FOLDER.sub(lambda found: found.group(1) + "\\" + mark, text)
+
+    def one(found: re.Match[str]) -> str:
+        folder = found.group(1)
+        return f"{folder}\\{mark}" if folder else mark
+
+    return _PLACE.sub(one, text)
+
+
+#: 引用符と括弧で囲んだ文 例外の文は名前や本文をここに入れる
+#: （``'旅行.mp4'`` ``「社長のあいさつ」``）
+_QUOTED = re.compile(r"""'[^'\n]*'|"[^"\n]*"|\u300c[^\u300d\n]*\u300d""")
+#: 名前と拡張子の形の語 囲まずに書かれた素材の名前（``旅行.mp4 を読めない``）
+_FILE_NAME = re.compile(
+    r"(?<![\w.\\/])[^\s\"'<>|*?\\/:\u3001\u3002()\uff08\uff09]+\.[A-Za-z][A-Za-z0-9]{1,4}\b"
+)
+#: 名前の形でも伏せない拡張子 本体と部品のファイル（並びの中の場所や部品の名前）
+_PROGRAM_SUFFIXES = frozenset({"py", "pyd", "pyc", "dll", "exe", "so", "dylib", "qml"})
+
+
+def mask_record_text(text: str, mark: str) -> str:
+    """前の起動の記録（エラーや落ちた時の並び）の中の、名前と本文になりうる所を伏せる
+
+    今の作品から作る伏せる表には、前の起動で開いた素材の名前や字幕は入っていない 表を
+    起動をまたいで持つと、伏せたい物そのものを本人の置き場へ書き残すことになるので持たない
+    代わりに、例外の文が名前と本文を入れる形（引用符と括弧で囲んだ所・名前と拡張子の語）を
+    伏せる 並びの行（``File "…", line 3, in 名前``）と本体の部品の名前は残す
+    （PR #550 の CodeRabbit の指摘）
+    """
+    lines = []
+    for line in text.splitlines():
+        if line.lstrip().startswith('File "'):
+            lines.append(line)
+            continue
+        line = _QUOTED.sub(lambda found: found.group(0)[0] + mark + found.group(0)[-1], line)
+        line = _FILE_NAME.sub(
+            lambda found: (
+                found.group(0)
+                if found.group(0).rsplit(".", 1)[1].lower() in _PROGRAM_SUFFIXES
+                else mark
+            ),
+            line,
+        )
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def root_key(text: str) -> str:

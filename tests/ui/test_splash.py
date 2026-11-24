@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
 import sashimono.ui.main_window as main_window_module
@@ -122,6 +123,17 @@ class TestTheMessage:
         for step in (STEP_PARTS, STEP_PROJECT, STEP_WINDOW):
             splash.step(step)
         assert splash.message() == STILL_MESSAGE
+        splash.deleteLater()
+
+    def test_a_click_does_not_hide_it(self, qt_application: QApplication) -> None:
+        # 元の QSplashScreen は押されると隠れ、後の段で出し直さない 待ちかねて押した人ほど
+        # 起動しているかが分からなくなる（PR #550 の指摘）
+        splash = StartupSplash()
+        splash.show()
+        qt_application.processEvents()
+        QTest.mouseClick(splash, Qt.MouseButton.LeftButton)
+        assert splash.isVisible()
+        splash.close()
         splash.deleteLater()
 
     def test_it_does_not_stay_on_top(self, qt_application: QApplication) -> None:

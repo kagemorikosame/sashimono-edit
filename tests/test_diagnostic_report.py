@@ -6,6 +6,7 @@ r"""利用者が自分で確かめて送る診断情報（#516）
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -25,12 +26,22 @@ from sashimono.diagnostic_report import (
     suggested_name,
 )
 from sashimono.fault_log import FaultLog, LostSession
-from sashimono.ui.report_masking import HOME_PLACEHOLDER, SECRET_MARK, mask_secrets
+from sashimono.ui.report_masking import (
+    HOME_PLACEHOLDER,
+    SECRET_MARK,
+    mask_places,
+    mask_record_text,
+    mask_secrets,
+)
 from sashimono.ui.workspace import Preferences
 
 #: 空白を含む利用者名 形で場所を拾う伏せ方は空白で切れるので、名前の後ろが残りやすい
 HOME = r"C:\Users\Kage Mori"
 FOLDERS = [(HOME, HOME_PLACEHOLDER)]
+
+#: 並びの場所の削り方（``Path`` で部品に分ける）は Windows の区切りを前提にする 配る版は
+#: Windows だけなので、ほかの OS では Windows の形の入力を使う試験を飛ばす
+WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="Windows の場所の形を使う")
 
 TRACE = rf"""Traceback (most recent call last):
   File "{HOME}\Programs\Sashimono\_internal\sashimono\ui\main_window.py", line 12, in save
@@ -40,6 +51,7 @@ FileNotFoundError: [Errno 2] No such file or directory: '{HOME}\Videos\旅行 1 
 
 
 class TestMask:
+    @WINDOWS_ONLY
     def test_the_trace_keeps_where_it_failed(self) -> None:
         # 伏せすぎると、どのファイルの何行目で落ちたかが読めない
         masked = mask(TRACE, folders=FOLDERS)
@@ -50,8 +62,23 @@ class TestMask:
         # 利用者名は空白を含んでも残さない 置き場の下のファイルの名前も伏せる
         masked = mask(TRACE, folders=FOLDERS)
         assert "Kage" not in masked and "Mori" not in masked
-        assert "旅行" not in masked
+        assert "旅行" not in masked and "日目" not in masked
         assert f"{HOME_PLACEHOLDER}\\{PATH_MARK}" in masked
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            r"'%USERPROFILE%\Videos\社外秘 顧客名簿.csv' を読めない",
+            r"読めない: %USERPROFILE%\Videos\社外秘 顧客名簿.csv",
+            r"読めない: D:\動画\社外秘 顧客名簿.csv",
+            r"読めない: \\server\共有\社外秘 顧客名簿.csv",
+        ],
+    )
+    def test_a_name_with_a_space_is_hidden_to_the_end(self, text: str) -> None:
+        # 壊れると、空白の後ろ（顧客名簿.csv）が報告に残る（PR #550 の指摘）
+        masked = mask_places(text, PATH_MARK)
+        assert "顧客名簿" not in masked and "社外秘" not in masked
+        assert PATH_MARK in masked
 
     def test_material_names_and_subtitles_are_hidden(self, tmp_path: Path) -> None:
         # 素材の名前は場所の形でなくても（エラーの文の中の名前だけでも）伏せる
@@ -87,6 +114,8 @@ class TestMask:
             ('{"api_key": "abcd1234"}', '"api_key": "'),
             ("token=abcd1234&x=1", "token="),
             ("password: hunter2", "password: "),
+            ('{"password": "abcd1234 hunter2"}', '"password": "'),
+            ("password = 'abcd1234 \\' hunter2'", "password = '"),
         ],
     )
     def test_secrets_are_hidden(self, text: str, kept: str) -> None:
@@ -96,10 +125,39 @@ class TestMask:
         assert "abcd1234" not in masked and "hunter2" not in masked
         assert "abcdefghijklmnop" not in masked
 
+    @WINDOWS_ONLY
     def test_program_paths_only_touch_traces(self) -> None:
         # 並びの外の場所は削らない（伏せる側が伏せる） 削ると素材の名前だけが残る
         text = r'File "C:\x\sashimono\app.py", line 1' + "\n" + r"C:\x\旅行.mp4"
         assert program_paths(text) == 'File "sashimono/app.py", line 1' + "\n" + r"C:\x\旅行.mp4"
+
+
+class TestPastRecords:
+    def test_names_from_an_earlier_run_are_hidden_without_the_table(self) -> None:
+        # 壊れると、前の起動で開いた素材の名前と字幕が、今の作品の表に無いので報告に残る
+        record = (
+            "=== 2026-11-24T10:00:00 版 0.2.7\n"
+            "Traceback (most recent call last):\n"
+            '  File "sashimono/engine/decode/probe.py", line 3, in probe_media\n'
+            "OSError: 社員旅行の記録.mp4 を読めない\n"
+            "ValueError: 書体に無い字 「社長のあいさつ」 と 'secret plan.txt'\n"
+        )
+        masked = mask_record_text(record, TEXT_MARK)
+        assert "社員旅行" not in masked and "社長" not in masked and "secret plan" not in masked
+        # 並びの行・版・部品の名前は残す
+        assert '  File "sashimono/engine/decode/probe.py", line 3, in probe_media' in masked
+        assert "版 0.2.7" in masked
+        assert "OSError:" in masked
+
+    def test_gathered_records_are_masked(self, tmp_path: Path) -> None:
+        # 集めた所で伏せる 窓へ出る前に、表に無い名前が消えている
+        errors = tmp_path / "errors.log"
+        errors.write_text(
+            "=== 2026-11-24T10:00:00 版 0.2.7\nOSError: 社員旅行の記録.mp4 を読めない\n",
+            encoding="utf-8",
+        )
+        gathered = gather(FaultLog(tmp_path, catch_faults=False))
+        assert "社員旅行" not in "\n".join(gathered.errors)
 
 
 ENV = Environment(
@@ -179,6 +237,16 @@ class TestGather:
         gathered = gather(log)
         assert gathered.stalls == ""
         assert gathered.problems == ("画面の止まりの記録を読めなかった: OSError",)
+
+    def test_a_log_that_cannot_be_read_is_not_called_empty(self, tmp_path: Path) -> None:
+        # 壊れると、在るのに読めなかった記録が「なし」と出て、無かったのか読めなかったのか
+        # 分からない（PR #550 の指摘） 読めない物の代わりに、ファイルの名前の所をフォルダにする
+        (tmp_path / "errors.log").mkdir()
+        (tmp_path / "sessions").mkdir()
+        (tmp_path / "sessions" / "20261124-100000-1.log").mkdir()
+        gathered = gather(FaultLog(tmp_path, catch_faults=False))
+        assert "エラーの記録を読めなかった: errors.log" in gathered.problems
+        assert "落ちた起動の記録を読めなかった: 20261124-100000-1.log" in gathered.problems
 
     def test_stalls_are_counted_the_same_way_as_the_tool(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

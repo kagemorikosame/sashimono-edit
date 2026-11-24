@@ -86,11 +86,19 @@ class TestTheMenu:
         self, window: MainWindow, shown: list[DiagnosticDialog], tmp_path: Path
     ) -> None:
         # 送らない（保存しない）と決めたら、どこにも書かず、覚えた置き場も変えない
+        # 保存の窓が開く所（設定の置き場）と診断の記録の置き場の両方を、作る前と比べる
+        # （PR #550 の指摘 見ている所が保存先と別だと、誤って書いても通ってしまう）
+        folder = tmp_path / "報告"
+        folder.mkdir()
+        window._remember_preferences(replace(window._preferences, report_folder=str(folder)))
+        diagnostics = diagnostics_folder()
+        diagnostics.mkdir(parents=True, exist_ok=True)
+        before_files = {*folder.rglob("*"), *diagnostics.rglob("*.txt")}
         before = window._preferences
         window.create_diagnostics()
         assert shown[0].saved_path is None
         assert window._preferences == before
-        assert not list(tmp_path.glob("**/sashimono-診断情報-*.txt"))
+        assert {*folder.rglob("*"), *diagnostics.rglob("*.txt")} == before_files
 
     def test_saving_remembers_the_folder(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

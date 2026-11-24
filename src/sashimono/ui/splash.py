@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QImageReader, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QImageReader, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
 from sashimono import __version__
@@ -177,6 +177,15 @@ class StartupSplash(QSplashScreen):
         self._done = min(self._done + 1, self._steps)
         self._say(f"{message}（{self._done}/{self._steps}）")
         QApplication.processEvents()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt の命名規約
+        """押されても隠れない
+
+        元の ``QSplashScreen`` は押されると隠れ、後の :meth:`step` では出し直さない 待ちかねて
+        押した人ほど、残りの読み込みの間に起動しているかが分からなくなる（PR #550 の指摘）
+        閉じるのは編集画面を出したとき（``finish``）と失敗したとき（``close``）だけ
+        """
+        event.accept()
 
     def _say(self, text: str) -> None:
         self.showMessage(

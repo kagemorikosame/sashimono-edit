@@ -220,20 +220,30 @@ class FaultLog:
 
     # --- 読む（診断情報から） ---
 
-    def recent_errors(self, count: int = 5) -> list[str]:
-        """新しいエラーから ``count`` 件（古い順に並べ直して返す）"""
+    def recent_errors(self, count: int = 5, *, unread: list[Path] | None = None) -> list[str]:
+        """新しいエラーから ``count`` 件（古い順に並べ直して返す）
+
+        無いファイルは黙る（1 世代前は無いのが普通） 在るのに読めなかった物は ``unread`` へ足す
+        黙ると、診断情報に「なし」と出て、エラーが無かったのか読めなかったのかが分からない
+        """
         texts: list[str] = []
         for path in (self.errors_path.with_suffix(".log.1"), self.errors_path):
             try:
                 texts.append(path.read_text(encoding="utf-8", errors="replace"))
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except OSError:
+                if unread is not None:
+                    unread.append(path)
         # 頭の行（行の頭の ``=== 時刻``）で切る 並びの中の文に ``===`` が混ざっても切らない
         entries = [entry.strip() for entry in _ENTRY_HEAD.split("\n".join(texts)) if entry.strip()]
         return entries[-count:] if count > 0 else []
 
-    def lost_sessions(self) -> list[LostSession]:
-        """正しく終わらなかった起動 古い順 動いている起動（この起動を含む）は外す"""
+    def lost_sessions(self, *, unread: list[Path] | None = None) -> list[LostSession]:
+        """正しく終わらなかった起動 古い順 動いている起動（この起動を含む）は外す
+
+        読めなかった記録は ``unread`` へ足す（:meth:`recent_errors` と同じ訳）
+        """
         if not self.sessions.is_dir():
             return []
         found: list[LostSession] = []
@@ -242,7 +252,11 @@ class FaultLog:
                 continue
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                continue
             except OSError:
+                if unread is not None:
+                    unread.append(path)
                 continue
             head, _, rest = text.partition("\n")
             parts = head.split()

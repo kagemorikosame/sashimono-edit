@@ -26,17 +26,23 @@ import json
 import platform
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sashimono import __version__
-from sashimono.ai.outbound import PATH_MARK, hide_text, redact
+from sashimono.ai.outbound import PATH_MARK, TEXT_MARK, hide_text, redact
 from sashimono.fault_log import FaultLog, LostSession
 from sashimono.runtime import is_frozen
 from sashimono.stall_summary import default_paths, read, report, summarize
 from sashimono.stall_watch import program_place
-from sashimono.ui.report_masking import mask_report, mask_secrets, mask_under_folders
+from sashimono.ui.report_masking import (
+    mask_places,
+    mask_record_text,
+    mask_report,
+    mask_secrets,
+)
 
 __all__ = [
     "Environment",
@@ -107,21 +113,35 @@ def gather(log: FaultLog) -> Gathered:
     problems: list[str] = []
     stalls = ""
     try:
-        records = read(default_paths())
+        unread: list[Path] = []
+        records = read(default_paths(), unread=unread)
         if records:
             stalls = report(summarize(records), top=STALL_TOP)
+        # 読む側は無いファイルも読めなかった物に数える 1 世代前は無いのが普通なので、
+        # 在るのに読めなかった物だけを書く 名前だけを書く（場所は本人の置き場）
+        problems.extend(
+            f"画面の止まりの記録を読めなかった: {path.name}" for path in unread if path.exists()
+        )
     except (OSError, ValueError, KeyError, TypeError) as exc:
         problems.append(f"画面の止まりの記録を読めなかった: {type(exc).__name__}")
     errors: list[str] = []
+    unread_errors: list[Path] = []
     try:
-        errors = log.recent_errors(ERROR_COUNT)
+        errors = log.recent_errors(ERROR_COUNT, unread=unread_errors)
     except OSError as exc:
         problems.append(f"エラーの記録を読めなかった: {type(exc).__name__}")
+    problems.extend(f"エラーの記録を読めなかった: {path.name}" for path in unread_errors)
     lost: list[LostSession] = []
+    unread_sessions: list[Path] = []
     try:
-        lost = log.lost_sessions()[-LOST_COUNT:]
+        lost = log.lost_sessions(unread=unread_sessions)[-LOST_COUNT:]
     except OSError as exc:
         problems.append(f"落ちた起動の記録を読めなかった: {type(exc).__name__}")
+    problems.extend(f"落ちた起動の記録を読めなかった: {path.name}" for path in unread_sessions)
+    # 前の起動の記録は、今の作品から作る伏せる表に無い名前と本文を含みうる 例外の文が名前と
+    # 本文を入れる形（囲んだ文・名前と拡張子の語）を、集めた所で伏せる（PR #550 の指摘）
+    errors = [mask_record_text(entry, TEXT_MARK) for entry in errors]
+    lost = [replace(session, text=mask_record_text(session.text, TEXT_MARK)) for session in lost]
     return Gathered(stalls, tuple(errors), tuple(lost), tuple(problems))
 
 
@@ -234,14 +254,15 @@ def mask(
     2. 字幕と文字（長い順） 場所を伏せた後だと、文の中の場所の印と混ざる
     3. 本人の置き場を印にする 空白を含む利用者名（``C:\Users\Kage Mori``）は、形で場所を
        拾う伏せ方では空白の所で切れて名前の後ろが残るので、置き場の名前で先に伏せる
-    4. 置き場の印の下の場所（``%USERPROFILE%\Videos\旅行.mp4``）を伏せる
-    5. 素材の名前と場所の表、表に無い絶対の場所（``D:\動画\…``）
+    4. 場所（置き場の印の下 ``%USERPROFILE%\Videos\旅行 1 日目.mp4`` とドライブ名・UNC の場所）を
+       空白で止めずに伏せる 形で拾う伏せ方は空白で止まり、名前の後ろが残る
+    5. 素材の名前の表と、表に無い残りの絶対の場所
     6. 秘密（API の鍵・トークン）
     """
     text = program_paths(text)
     text = str(hide_text(text, sorted(set(texts), key=len, reverse=True), labels=False))
     text = mask_report(text, folders=folders)
-    text = mask_under_folders(text, PATH_MARK)
+    text = mask_places(text, PATH_MARK)
     text = str(redact(text, names))
     return mask_secrets(text)
 
