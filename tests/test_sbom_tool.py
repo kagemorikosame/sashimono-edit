@@ -308,6 +308,51 @@ class TestGenerate:
         assert isinstance(inner, list)
         assert {item["name"] for item in inner} == {"_internal/libssl-3.dll"}
 
+    def test_every_binary_gets_a_hash(self, tool: ModuleType, tmp_path: Path) -> None:
+        """ハッシュの載らない DLL があると、同じ版のまま組み直されたり差し替えられたりしても
+        一覧の比べで「違いは無い」と出る
+
+        名前の型の無い表の行（OpenBLAS など）は置き場の DLL を、表の部品に当たらない拡張は
+        出どころの包みを、本体と組み立てが作った物（exe）は一覧の頭を持ち主にする
+        """
+        listed = _listed(tool)
+        extra = {
+            "Sashimono/_internal/numpy.libs/libscipy_openblas64_-" + "4" * 32 + ".dll": b"blas",
+            "Sashimono/_internal/numpy/_core/multiarray.cp314-win_amd64.pyd": b"numpy",
+            "Sashimono/_internal/_ssl.pyd": b"ssl",
+        }
+        owners = {
+            "_internal/numpy.libs/libscipy_openblas64_-" + "4" * 32 + ".dll": "numpy",
+            "_internal/numpy/_core/multiarray.cp314-win_amd64.pyd": "numpy",
+            "_internal/_ssl.pyd": "python",
+        }
+        archive = _write(tmp_path, _zip(tool, extra=extra, owners=owners))
+        data = tool.generate(archive).data
+        found = _components(data)
+
+        def files(item: object) -> set[str]:
+            assert isinstance(item, dict)
+            inner = item.get("components", [])
+            assert isinstance(inner, list)
+            return {str(entry["name"]) for entry in inner}
+
+        assert files(found["OpenBLAS"]) == {
+            "_internal/numpy.libs/libscipy_openblas64_-" + "4" * 32 + ".dll"
+        }
+        assert "_internal/numpy/_core/multiarray.cp314-win_amd64.pyd" in files(found["numpy"])
+        assert "_internal/_ssl.pyd" in files(found["Python"])
+        assert files(data["metadata"]["component"]) == {"Sashimono.exe"}
+        hashed = set().union(*(files(item) for item in found.values()))
+        hashed |= files(data["metadata"]["component"])
+        with zipfile.ZipFile(archive) as opened:
+            binaries = {
+                name.removeprefix("Sashimono/")
+                for name in opened.namelist()
+                if name.lower().endswith((".dll", ".pyd", ".exe"))
+            }
+        assert binaries <= hashed
+        assert listed["numpy"] == found["numpy"]["version"]
+
     def test_parts_bundled_with_python_get_their_own_versions(
         self, tool: ModuleType, tmp_path: Path
     ) -> None:
@@ -412,3 +457,27 @@ class TestCompare:
         assert any(
             "版が同じで中身が違う: FFmpeg" in line for line in tool.differences(before, after)
         )
+
+    @pytest.mark.parametrize("hashes", [None, [], "sha", [None], [{"alg": "MD5"}]])
+    def test_a_list_with_broken_hashes_is_compared(
+        self, tool: ModuleType, tmp_path: Path, hashes: object
+    ) -> None:
+        """欄の欠けた一覧で落ちると、release.py の 4 で「違う」と言えず、8 では参考の比べのせいで
+        公開まで進めない ハッシュ無しとして比べ、ハッシュの付いた一覧とは違うと出す
+        """
+        before = tool.generate(_write(tmp_path, _zip(tool), "before.zip")).data
+        after = json.loads(json.dumps(before))
+        ffmpeg = next(c for c in after["components"] if c["name"] == "FFmpeg")
+        ffmpeg["components"][0]["hashes"] = hashes
+        assert any(
+            "版が同じで中身が違う: FFmpeg" in line for line in tool.differences(before, after)
+        )
+        shapes: list[object] = [
+            {"metadata": None},
+            {"components": [1, None]},
+            [],
+            {"components": "x"},
+        ]
+        for broken in shapes:
+            tool.differences(before, broken)
+            assert tool.zip_digest(broken) == ""

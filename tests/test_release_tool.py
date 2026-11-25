@@ -1606,9 +1606,6 @@ class TestBill:
             b'{"metadata": null, "components": []}',
             b"[]",
             b'{"metadata": {}, "components": [1]}',
-            # 版は読めるが、中のファイルのハッシュの並びが空
-            b'{"metadata": {"component": {"version": "1.2.2"}},'
-            b' "components": [{"name": "x", "components": [{"name": "a.dll", "hashes": []}]}]}',
         ],
     )
     def test_a_broken_previous_bill_does_not_stop(
@@ -1623,6 +1620,21 @@ class TestBill:
         world.answers = ["y", "y"]
         assert world.main(tool) == 0
         assert "前に公開した版の部品の一覧を読めず" in capsys.readouterr().out
+        assert world.published
+
+    def test_a_previous_bill_without_hashes_is_still_compared(
+        self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """版は読めてハッシュの欄だけが空の前の一覧を読めない扱いにすると、部品の出入りを見せずに
+        公開する ハッシュ無しとして比べ、止めずに進む
+        """
+        world.previous = (
+            b'{"metadata": {"component": {"version": "1.2.2"}},'
+            b' "components": [{"name": "x", "components": [{"name": "a.dll", "hashes": []}]}]}'
+        )
+        world.answers = ["y", "y"]
+        assert world.main(tool) == 0
+        assert "部品      1.2.2 から: 外した: x" in capsys.readouterr().out
         assert world.published
 
     def test_an_unreadable_previous_bill_does_not_stop(

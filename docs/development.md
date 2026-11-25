@@ -5228,7 +5228,14 @@ gh release upload <タグ> dist\sources\sources-SHA256SUMS.txt dist\sources\sour
   分けて載せる 脆弱性は部品ごとの版で決まるため Python の版は python3XX.dll から（表は「3.14」まで
   しか書かない）、ほかは各 DLL の版情報（ProductVersion）から読む 読めない部品（libffi）には版を
   付けない 表に版の書けない部品（VC++ の実行時の部品など）も、DLL の版情報がそろっていればその版にする
-- DLL ごとの SHA-256 と、zip そのものの SHA-256（一覧の頭 `metadata.component`）も書く
+- DLL ごとの SHA-256 と、zip そのものの SHA-256（一覧の頭 `metadata.component`）も書く zip の中の
+  DLL・拡張・exe は 1 つ残らずどこかの部品にハッシュを載せる 表の名前の型の無い行（OpenBLAS・PortAudio・
+  freeglut など）は置き場の DLL を、表の部品に当たらない拡張は出どころの包み（Python 本体の物は Python）を、
+  本体と組み立てが作った物（`Sashimono.exe`）は一覧の頭を持ち主にする 載らない DLL があると、同じ版のまま
+  組み直されたり差し替えられたりしても「違いは無い」と出る 0.2.2 では 197 個すべてに載った
+- 一覧を比べるとき、ハッシュの欄が無い・空・形が違う物は「ハッシュ無し」として比べる（落ちない）
+  release.py の 4 は作り直した一覧とそのまま比べるので、欄の欠けた下書きの一覧は「違う」と出て止まる
+  8 は参考に見せるだけなので止めず、ハッシュの付いた一覧とは中身が違うと出す
 - 同じ zip からは同じ一覧ができる（時刻を入れない 通し番号は zip の SHA-256 から決める）
 
 ```

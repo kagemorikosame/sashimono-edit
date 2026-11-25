@@ -500,14 +500,56 @@ def _parts(
             split += _python_parts(archive, record, inside, rows, row, python)
             continue
         found = entry(row)
+        taken = {path for part in reached.values() for path in part.files}
         for relative in inside:
             filename = PurePosixPath(relative).name.lower()
-            if any(fnmatch.fnmatch(filename, pattern.lower()) for pattern in row.patterns):
+            if row.patterns:
+                hit = any(fnmatch.fnmatch(filename, pattern.lower()) for pattern in row.patterns)
+            else:
+                # 名前の型の無い行（OpenBLAS・PortAudio・freeglut など）は、置き場の DLL と拡張を
+                # その部品の物と見る 型が無いからと外すと、ハッシュが載らず差し替えに気付けない
+                # ほかの部品へ当てた物（lupa の LuaJIT など）は取らない
+                hit = _is_binary(relative) and relative not in taken
+            if hit:
                 found.files[relative] = _digest(archive, f"{_APP}/{relative}")
     every = [*reached.values(), *split]
     for part in every:
         _version_from_files(archive, part)
     return every, left
+
+
+#: ハッシュを付けるファイル（実行されるもの） .pyc やデータはハッシュの比べに入れない
+_BINARIES = (".dll", ".pyd", ".exe")
+
+
+def _is_binary(relative: str) -> bool:
+    return PurePosixPath(relative).suffix.lower() in _BINARIES
+
+
+def place_leftovers(
+    archive: zipfile.ZipFile, record: Record, packages: list[Found], parts: list[Found]
+) -> dict[str, str]:
+    """どの部品にもハッシュの載っていない DLL・拡張・exe を、出どころの部品へ載せる
+
+    表の部品へ当たらない物（PySide6 の拡張・numpy の拡張・標準ライブラリの拡張など）を残すと、
+    中身の差し替えに気付けない 包みの物はその包みへ、Python 本体の物は Python へ載せ、本体
+    （sashimono）と組み立てが作った物（Sashimono.exe など）は戻り値で返して、一覧の頭に載せる
+    """
+    taken = {path for part in [*packages, *parts] for path in part.files}
+    by_key = {canonical_name(part.name): part for part in packages}
+    python = next((part for part in parts if part.name == "Python"), None)
+    own: dict[str, str] = {}
+    for relative, owner in sorted(record.files.items()):
+        if relative in taken or not _is_binary(relative):
+            continue
+        digest = _digest(archive, f"{_APP}/{relative}")
+        if owner in by_key:
+            by_key[owner].files[relative] = digest
+        elif owner == build_package.OWNER_PYTHON and python is not None:
+            python.files[relative] = digest
+        else:
+            own[relative] = digest
+    return own
 
 
 def _dll_version(archive: zipfile.ZipFile, relative: str) -> str | None:
@@ -623,6 +665,7 @@ def generate(path: Path) -> Bom:
             build_package.version_text(python) if python else None,
             problems,
         )
+        own_files = place_leftovers(archive, record, found, native) if not problems else {}
     if problems:
         raise BomError(problems)
     left_out = [packages[key].name for key in sorted(set(packages) - set(record.packages))] + left
@@ -647,6 +690,16 @@ def generate(path: Path) -> Bom:
                 # 本体のソースは MIT 配る zip は GPL の部品（x264・x265）を積むので全体を GPL で配る
                 "licenses": [{"expression": "MIT"}],
                 "hashes": [{"alg": "SHA-256", "content": zip_sha256}],
+                # 本体と組み立てが作った物（exe など）のハッシュ 部品の側と同じ形で持つ
+                "components": [
+                    {
+                        "type": "file",
+                        "bom-ref": f"{app_ref}#{name}",
+                        "name": name,
+                        "hashes": [{"alg": "SHA-256", "content": digest}],
+                    }
+                    for name, digest in own_files.items()
+                ],
                 "properties": [
                     {"name": "sashimono:archive", "value": path.name},
                     {"name": "sashimono:python-abi", "value": abi},
@@ -668,20 +721,40 @@ def generate(path: Path) -> Bom:
 # --- 照らす・比べる -----------------------------------------------------------------
 
 
+def _table(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _sha256(hashes: Any) -> str:
+    """ハッシュの並びから SHA-256 の値 無い・空・形が違うなら空
+
+    一覧はほかの人や前の版が書いた物も読む（release.py の 4 と 8） 欄が欠けた一覧で落ちると、
+    4 では「違う」と言えず、8 では参考に見せるだけの物のせいで公開まで進めない 空は
+    「ハッシュ無し」として比べる（ハッシュの付いた一覧とは違うと出る）
+    """
+    for entry in _list(hashes):
+        entry = _table(entry)
+        if entry.get("alg") == "SHA-256" and isinstance(entry.get("content"), str):
+            return str(entry["content"])
+    return ""
+
+
 def zip_digest(data: dict[str, Any]) -> str:
     """一覧の頭に書いた zip の SHA-256 無ければ空"""
-    for entry in data.get("metadata", {}).get("component", {}).get("hashes", []):
-        if entry.get("alg") == "SHA-256":
-            return str(entry.get("content", ""))
-    return ""
+    return _sha256(_table(_table(_table(data).get("metadata")).get("component")).get("hashes"))
 
 
 def _index(data: dict[str, Any]) -> dict[str, tuple[str, dict[str, str]]]:
     found: dict[str, tuple[str, dict[str, str]]] = {}
-    for item in data.get("components", []):
+    for item in _list(_table(data).get("components")):
+        item = _table(item)
         files = {
-            str(inner.get("name")): str(inner.get("hashes", [{}])[0].get("content", ""))
-            for inner in item.get("components", [])
+            str(_table(inner).get("name")): _sha256(_table(inner).get("hashes"))
+            for inner in _list(item.get("components"))
         }
         found[str(item.get("name"))] = (str(item.get("version", "")), files)
     return found
