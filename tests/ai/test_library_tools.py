@@ -331,6 +331,20 @@ class TestImport:
         )
         assert sum(m.path.name == "ドン.wav" for m in work.document.project.media) == 1
 
+    def test_a_path_and_an_id_for_the_same_file_are_read_once(
+        self, work: _LibraryHost, folders: dict[str, Path]
+    ) -> None:
+        # 壊れると、場所と印の両方で同じ音を渡すと素材一覧に 2 つ並ぶ
+        row = _file(work, "ドン.wav")
+        run(
+            work,
+            "import_media",
+            paths=[str(folders[CATEGORY_SOUND_EFFECT] / "ドン.wav")],
+            library_file_ids=[row["file_id"]],
+            pool_only=True,
+        )
+        assert sum(m.path.name == "ドン.wav" for m in work.document.project.media) == 1
+
 
 class TestFavorites:
     def test_favorites_only_stays_inside_the_allowed_categories(

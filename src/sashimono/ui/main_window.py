@@ -2598,7 +2598,9 @@ class MainWindow(QMainWindow):
     def _place_explorer_files(self, paths: list[Path]) -> None:
         """エクスプローラーの〔タイムラインへ〕 読み込んで再生位置へ置く
 
-        OS のエクスプローラーから落としたときと同じ読み込みを通す（取り消し 1 回で戻る）
+        OS のエクスプローラーから落としたときと同じ読み込みを通す 置いた物は取り消し 1 回で戻る
+        空の作品で最初の動画に作品の形を合わせたときは、合わせたのは別の段（:meth:`_match_project_to`
+        の決まり 置き方だけを戻したいことが多いため）
         """
         self.import_media(list(paths), at=DropSpot(self._timeline.playhead, None))
 
@@ -5499,6 +5501,13 @@ class MainWindow(QMainWindow):
             for dock in self.findChildren(QDockWidget)
         }
         preferences = asdict(self._preferences)
+        # AI に使わせない分類の登録したフォルダは、名前と場所を送ると決めた人の所でも載せない
+        # 本人が「AI に見せない」と選んだ物の場所まで外へ出さないため
+        preferences["explorer_folders"] = [
+            folder
+            for folder in preferences["explorer_folders"]
+            if folder["category"] in self._preferences.explorer_ai_categories
+        ]
         # 新しい作品の編集の方針（#343）は本人の文 アプリの設定は同意なしで送るので、ここに
         # 載せると字幕と文字を送らないと決めた人の文まで外へ出る 有る無しだけを残す
         # （作品の方針は get_style_guide が字幕と文字として同意を取って読む）

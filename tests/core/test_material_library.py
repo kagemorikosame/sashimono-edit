@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from sashimono.core import material_library
 from sashimono.core.material_library import (
     CATEGORY_IMAGE,
     CATEGORY_MUSIC,
@@ -123,7 +124,7 @@ class TestScan:
         scan = scan_folder(LibraryFolder(str(tmp_path / "無い"), CATEGORY_MUSIC))
         assert scan.missing and scan.files == ()
 
-    def test_thousands_of_files_are_quick(self, tmp_path: Path) -> None:
+    def test_scan_returns_all_4000_files_without_truncation(self, tmp_path: Path) -> None:
         # 市販の効果音集は数千のファイルを持つ 一覧を開くたびに止まると使えない
         for number in range(4000):
             (tmp_path / f"音{number:04}.wav").write_bytes(b"")
@@ -296,3 +297,50 @@ class TestReviewFixes:
         assert library.tried(file)
         assert library.measured(file, allow_measure=True) is None
         assert calls == [sound]
+
+    def test_huge_integers_in_the_cache_do_not_raise(self, tmp_path: Path) -> None:
+        # 壊れると、控えの桁違いの整数（10**400）を float にする所で例外になり一覧が止まる
+        sound = _touch(tmp_path / "SE" / "ドン.wav")
+        file = scan_folder(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT)).files[0]
+        path = tmp_path / "measures.json"
+        huge = "1" + "0" * 400
+        text = (
+            f'{{"version": 2, "files": {{"{file.id}": {{"size": {file.size},'
+            f' "mtime": {file.modified_ns}, "seconds": 1.0, "width": {huge}}}}}}}'
+        )
+        path.write_text(text, encoding="utf-8")
+        assert MeasureBook(path).get(file) is None
+
+    def test_a_failure_is_forgotten_after_a_while(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、一時だけ応えなかったドライブの素材を、挿し直しても測り直さない
+        sound = _touch(tmp_path / "SE" / "ドン.wav")
+        file = scan_folder(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT)).files[0]
+        book = MeasureBook(tmp_path / "measures.json")
+        book.put_failure(file)
+        assert book.failed(file)
+        book.save()
+        # 控えのファイルには書かない（起動し直せば測り直す）
+        assert not MeasureBook(tmp_path / "measures.json").failed(file)
+        monkeypatch.setattr(material_library, "FAILURE_SECONDS", 0)
+        assert not book.failed(file)
+
+    def test_a_link_into_another_registration_follows_that_registration(
+        self, tmp_path: Path
+    ) -> None:
+        # 壊れると、別の登録（AI に使わせない分類）を指すリンクを親の分類の素材として選ぶ
+        hidden = _touch(tmp_path / "SE" / "動画" / "隠し.wav")
+        link = tmp_path / "SE" / "リンク.wav"
+        try:
+            link.symlink_to(hidden)
+        except OSError:
+            pytest.skip("この機械ではリンクを作れない（Windows の開発者モードが要る）")
+        library = MaterialLibrary(
+            folders=(
+                LibraryFolder(str(tmp_path / "SE"), CATEGORY_SOUND_EFFECT),
+                LibraryFolder(str(tmp_path / "SE" / "動画"), CATEGORY_VIDEO),
+            )
+        )
+        names = [file.name for scan in library.scan_for_ai() for file in scan.files]
+        assert "リンク.wav" not in names

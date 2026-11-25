@@ -5423,9 +5423,14 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
         if not path.exists():
             raise ToolError(f"ファイルがありません: {path}")
         sources.append((host.probe(path), True))
-    # 同じ印を 2 度渡されても 1 つにする 未取り込みのファイルを 2 度開くと別の素材として
-    # 2 つ登録される（どちらも前の文書を見て「まだ無い」と決めるため）
-    sources.extend(_library_media(host, entry) for entry in dict.fromkeys(ids))
+    sources.extend(_library_media(host, entry) for entry in ids)
+    # 同じファイルは場所で 1 つにまとめる（同じ印の 2 度・場所と印の両方で渡した物）
+    # 未取り込みのファイルを 2 度開くと、どちらも前の文書を見て「まだ無い」と決め、
+    # 別の素材として 2 つ登録される
+    unique: dict[str, tuple[MediaItem, bool]] = {}
+    for media, fresh in sources:
+        unique.setdefault(os.path.normcase(Path(media.path).absolute()), (media, fresh))
+    sources = list(unique.values())
 
     project = _project(host)
     commands: list[Command] = []

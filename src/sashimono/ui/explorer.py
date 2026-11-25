@@ -20,9 +20,9 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import queue
 import threading
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -236,10 +236,13 @@ def _clock(seconds: float) -> str:
 
 
 class _Worker(QObject):
-    """裏のスレッドで測る・見本を作る 終わったら画面のスレッドへ知らせる
+    """裏のスレッドで測る・見本を作る・中身を読む 終わったら画面のスレッドへ知らせる
 
     知らせは ``finished``（仕事の名前, 結果） この物は画面のスレッドに住むので、裏の
     スレッドから送った知らせは Qt が画面のスレッドに積み直す 画面の部品はそこで触る
+
+    スレッドはデーモンにする ``ThreadPoolExecutor`` は終わるときに走っている仕事を待つので、
+    応答しないネットワークの登録先を見て回っている間に窓を閉じると、アプリが終わらない
     """
 
     finished = Signal(str, object)
@@ -247,44 +250,57 @@ class _Worker(QObject):
     def __init__(self, parent: QObject | None = None, *, workers: int = 2) -> None:
         super().__init__(parent)
         # 2 本だけ 測るのは頭の 1 分のデコードで重く、本数を増やすと作品の再生と取り合う
-        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="explorer")
-        #: 仕事の名前 → （登録の印, 仕事） 印は同じ名前の古い仕事が終わったときに、
-        #: 後から頼んだ新しい仕事の登録まで消さないため
-        self._pending: dict[str, tuple[object, Future[None]]] = {}
+        self._queue: queue.Queue[tuple[str, object, Callable[[], object]] | None] = queue.Queue()
+        #: 仕事の名前 → 登録の印 印は、同じ名前の古い仕事が終わったときに後から頼んだ新しい
+        #: 仕事の登録まで消さないためと、取り消した仕事を始めずに飛ばすため
+        self._pending: dict[str, object] = {}
         self._lock = threading.Lock()
         self._closed = False
+        self._threads = [
+            threading.Thread(target=self._run, name="explorer", daemon=True) for _ in range(workers)
+        ]
+        for thread in self._threads:
+            thread.start()
 
     def submit(self, key: str, job: Callable[[], object]) -> None:
         with self._lock:
             if self._closed or key in self._pending:
                 return
             token = object()
+            self._pending[key] = token
+        self._queue.put((key, token, job))
 
-            def run() -> None:
-                try:
-                    result = job()
-                except Exception:
-                    # 1 つの壊れた素材で裏の仕事を止めない その行の列と絵が空のまま残るだけ
-                    result = None
-                with self._lock:
-                    entry = self._pending.get(key)
-                    if entry is not None and entry[0] is token:
-                        del self._pending[key]
-                    if self._closed:
-                        return
-                self.finished.emit(key, result)
-
-            self._pending[key] = (token, self._pool.submit(run))
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            key, token, job = item
+            with self._lock:
+                if self._closed:
+                    return
+                if self._pending.get(key) is not token:
+                    # 取り消した（場所を移った）仕事は始めない
+                    continue
+            try:
+                result = job()
+            except Exception:
+                # 1 つの壊れた素材で裏の仕事を止めない その行の列と絵が空のまま残るだけ
+                result = None
+            with self._lock:
+                if self._pending.get(key) is token:
+                    del self._pending[key]
+                if self._closed:
+                    return
+            self.finished.emit(key, result)
 
     def forget(self) -> None:
         """待っている仕事を捨てる（別のフォルダを開いた）
 
-        まだ始まっていない仕事は取り消す 残すと、前の場所の数千の見本を作り終えるまで、
+        まだ始まっていない仕事は始めずに飛ばす 残すと、前の場所の数千の見本を作り終えるまで、
         新しく開いた場所の見本が待たされる 走っている物は終わるまで待たない
         """
         with self._lock:
-            for _token, future in self._pending.values():
-                future.cancel()
             self._pending.clear()
 
     @property
@@ -295,7 +311,9 @@ class _Worker(QObject):
     def close(self) -> None:
         with self._lock:
             self._closed = True
-        self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pending.clear()
+        for _ in self._threads:
+            self._queue.put(None)
 
 
 class _ThumbStore:
@@ -683,11 +701,20 @@ class _PreviewPane(QWidget):
             self.toggle()
 
     def stop(self) -> None:
+        """止める 調べている途中に頼まれた〔再生〕も取り消す（調べ終えたら出すだけにする）
+
+        取り消さないと、作品を鳴らし始めて下見を止めた後に、調べ終えた下見が鳴り出して
+        作品の再生を止めてしまう
+        """
+        self._play_when_open = False
         self._player.pause()
         self._show_state()
 
     def close_player(self) -> None:
         self._timer.stop()
+        self._play_when_open = False
+        # 調べている途中の結果も受け取らない 閉じた後に開いて鳴らさない
+        self._wanted = None
         self._player.close()
 
     # --- 中 ---
@@ -737,8 +764,10 @@ class _PreviewPane(QWidget):
         if player.playing:
             return
         frame = player.frame()
-        waiting = (info.has_video or info.is_still) and (
-            frame is None or frame[0] != self._shown_frame
+        # 止まっている間にシークした先の絵をまだ読んでいれば、届くまで描き直しを続ける
+        # （前の絵を出し終えたからといって止めると、後で届いた絵を出さない）
+        waiting = player.still_pending or (
+            (info.has_video or info.is_still) and (frame is None or frame[0] != self._shown_frame)
         )
         if not waiting:
             # 止まっていて絵も出し終えた（音だけの素材は絵を待たない） 何もしないのに
@@ -896,7 +925,7 @@ class ExplorerPanel(QWidget):
         self._size_slider.setValue(self._icon_size)
         self._size_slider.setMaximumWidth(120)
         self._size_slider.setToolTip("アイコンの大きさ")
-        self._size_slider.valueChanged.connect(self._resize_icons)
+        self._size_slider.valueChanged.connect(self._on_size_slider)
         self._size_slider.sliderReleased.connect(
             lambda: self.icon_size_changed.emit(self._icon_size)
         )
@@ -1075,10 +1104,15 @@ class ExplorerPanel(QWidget):
         """
         if not folder or not reachable_dir(Path(folder))[0]:
             return False
-        self._pending_select = [Path(file)] if file else []
+        wanted = [Path(file)] if file else []
+        self._pending_select = wanted
         if not self.open_folder(folder):
             self._pending_select = []
             return False
+        if not self.listing and self._pending_select:
+            # もう開いていた場所（木の選びが変わらず、読み直しが起きない） その場で選ぶ
+            self._pending_select = []
+            self.select_files(wanted)
         return True
 
     def set_preview_volume(self, percent: int) -> None:
@@ -1190,6 +1224,9 @@ class ExplorerPanel(QWidget):
         place.triggered.connect(lambda _checked=False: self.place_requested.emit(chosen))
         pool = menu.addAction("素材一覧へ読み込む")
         pool.triggered.connect(lambda _checked=False: self.import_requested.emit(chosen))
+        # 別の場所を読んでいる間は前の一覧の物を置かない（場所の表示はもう新しい場所）
+        place.setEnabled(not self.listing)
+        pool.setEnabled(not self.listing)
         menu.addSeparator()
         reveal = menu.addAction("エクスプローラーで開く")
         reveal.triggered.connect(lambda _checked=False: self._reveal(chosen))
@@ -1441,6 +1478,10 @@ class ExplorerPanel(QWidget):
             deep = bool(query) if favorite_place else (bool(query) or node is None or not node[0])
             job = partial(_listing, pairs, deep, query, kind)
         self._lister.forget()
+        # 読み終えるまで前の一覧を触れなくする 場所の表示はもう新しい場所なので、残った前の
+        # 一覧の物を置くと、見ている場所と違う素材が置かれる 選びは残し、読み終えたら戻す
+        self._views.setEnabled(False)
+        self._place_button.setEnabled(False)
         self._lister.submit(f"list:{number}", job)
 
     @property
@@ -1453,6 +1494,7 @@ class ExplorerPanel(QWidget):
             # 読んでいる間に別の場所を開いたか、絞り込みを変えた 古い結果は並べない
             return
         self._listed_number = self._listing_number
+        self._views.setEnabled(True)
         if not isinstance(result, tuple):
             self._fill_rows([])
             self._status.setText("この場所を読めません")
@@ -1563,14 +1605,19 @@ class ExplorerPanel(QWidget):
             cells = self._row_of(file_key)
             if cells is not None:
                 self._fill_measure(cells, measure)
-        elif kind == "still" and isinstance(result, np.ndarray):
-            self._icons[_stamp(file)] = thumbnail_icon(result)
+        elif kind in ("still", "peaks") and isinstance(result, tuple):
+            asked, data = result
+            # 測った値と同じく、頼んだときのファイルと今の行のファイルが同じときだけ使う
+            # 作っている間に差し替わった物の絵を、新しいファイルの物として覚えない
+            if asked != file or not isinstance(data, np.ndarray):
+                return
+            if kind == "still":
+                self._icons[_stamp(file)] = thumbnail_icon(data)
+            else:
+                self._peaks[_stamp(file)] = data
+                self._icons[_stamp(file)] = _peaks_icon(data)
+                self._preview.set_peaks(file.path, data)
             self._set_icon(file)
-        elif kind == "peaks" and isinstance(result, np.ndarray):
-            self._peaks[_stamp(file)] = result
-            self._icons[_stamp(file)] = _peaks_icon(result)
-            self._set_icon(file)
-            self._preview.set_peaks(file.path, result)
 
     def _set_icon(self, file: LibraryFile) -> None:
         cells = self._row_of(file.id)
@@ -1591,29 +1638,22 @@ class ExplorerPanel(QWidget):
         if kind == KIND_SOUND:
             cached = store.load(file, "peaks")
             if cached is not None:
-                self._on_worker(f"peaks:{file.id}", cached)
+                self._on_worker(f"peaks:{file.id}", (file, cached))
                 return
 
-            def peaks(target: LibraryFile = file) -> np.ndarray | None:
-                made = sound_peaks(target.path, _PEAK_COLUMNS)
-                if made is not None:
-                    store.save(target, "peaks", made)
-                return made
+            def peaks(target: LibraryFile = file) -> object:
+                return _kept(store, target, "peaks", sound_peaks(target.path, _PEAK_COLUMNS))
 
             self._worker.submit(f"peaks:{file.id}", peaks)
             return
         cached = store.load(file, "still")
         if cached is not None:
-            self._on_worker(f"still:{file.id}", cached)
+            self._on_worker(f"still:{file.id}", (file, cached))
             return
 
-        def still(target: LibraryFile = file) -> np.ndarray | None:
+        def still(target: LibraryFile = file) -> object:
             tile = still_of(target.path)
-            if tile is None:
-                return None
-            small = _small_tile(tile)
-            store.save(target, "still", small)
-            return small
+            return _kept(store, target, "still", None if tile is None else _small_tile(tile))
 
         self._worker.submit(f"still:{file.id}", still)
 
@@ -1632,6 +1672,14 @@ class ExplorerPanel(QWidget):
         self._resize_icons(self._icon_size)
         if icons:
             self._request_icons()
+
+    def _on_size_slider(self, size: int) -> None:
+        """スライダーを動かした ドラッグの途中は覚えず（離したときに 1 回） キーで変えたときは
+        その場で覚える（キーでは離す知らせが来ない）
+        """
+        self._resize_icons(size)
+        if not self._size_slider.isSliderDown():
+            self.icon_size_changed.emit(size)
 
     def _resize_icons(self, size: int) -> None:
         self._icon_size = size
@@ -1658,7 +1706,7 @@ class ExplorerPanel(QWidget):
     def _on_selection(self) -> None:
         self._emit_location()
         files = self.selected_files()
-        self._place_button.setEnabled(bool(files))
+        self._place_button.setEnabled(bool(files) and not self.listing)
         if len(files) != 1:
             if not files:
                 self._preview.show_file(None)
@@ -1673,6 +1721,8 @@ class ExplorerPanel(QWidget):
 
     def _on_double_click(self, index: QModelIndex) -> None:
         del index
+        if self.listing:
+            return
         if self._double_click == DOUBLE_CLICK_TIMELINE:
             self._place_selected()
             return
@@ -1681,7 +1731,7 @@ class ExplorerPanel(QWidget):
 
     def _place_selected(self) -> None:
         files = self.selected_files()
-        if files:
+        if files and not self.listing:
             self.place_requested.emit(files)
 
     def _show_menu(self, view: QAbstractItemView, position: QPoint) -> None:
@@ -1749,13 +1799,7 @@ def _measured(job: Callable[[Path], Measure | None], file: LibraryFile) -> Calla
 
     def run() -> object:
         measure = job(file.path)
-        try:
-            stat = file.path.stat()
-        except OSError:
-            return None
-        if (stat.st_size, stat.st_mtime_ns) != (file.size, file.modified_ns):
-            return None
-        return (file, measure)
+        return (file, measure) if _unchanged(file) else None
 
     return run
 
@@ -1782,6 +1826,9 @@ def _listing(
                 notes.append(f"{directory.name} が見つかりません（消えたか移った）")
             if scan.truncated:
                 notes.append(f"{folder.label} はファイルが多いので頭の {len(scan.files)} 個だけ")
+            if scan.error:
+                # 下のフォルダの 1 つが読めなかった 読めた分は出し、全部ではないと知らせる
+                notes.append(f"{folder.label}: {scan.error}")
             files.extend(
                 LibraryFile(file.path, folder, file.size, file.modified_ns) for file in scan.files
             )
@@ -1830,3 +1877,22 @@ def _favorite_listing(
 def _stamp(file: LibraryFile) -> str:
     """見本の絵と波形を覚える名前 同じ場所でも中身を差し替えたら別の名前になる"""
     return f"{file.id}-{file.size}-{file.modified_ns}"
+
+
+def _unchanged(file: LibraryFile) -> bool:
+    """作っている（測っている）間にファイルが差し替わっていないか（大きさと更新時刻）"""
+    try:
+        stat = file.path.stat()
+    except OSError:
+        return False
+    return (stat.st_size, stat.st_mtime_ns) == (file.size, file.modified_ns)
+
+
+def _kept(
+    store: _ThumbStore, file: LibraryFile, kind: str, data: np.ndarray | None
+) -> tuple[LibraryFile, np.ndarray] | None:
+    """作った見本を頼んだときのファイルと組にする 差し替わっていれば覚えずに捨てる"""
+    if data is None or not _unchanged(file):
+        return None
+    store.save(file, kind, data)
+    return (file, data)

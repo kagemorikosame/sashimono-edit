@@ -164,8 +164,11 @@ class TestTheTreeAndTheContents:
         # 壊れると、長さと大きさの列が空のままか、文字の順（95 秒が 3 秒の前）に並ぶ
         panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
         _settle(panel)
+        # 測る仕事は 2 本で並ぶので、どちらが先に届くかは決まらない 両方を待つ
         wait_until(
-            lambda: panel.cell(sounds / "長い.wav", _LENGTH) != "", "長さの列", step=_process
+            lambda: all(panel.cell(sounds / name, _LENGTH) for name in ("長い.wav", "ドン.wav")),
+            "長さの列",
+            step=_process,
         )
         assert panel.cell(sounds / "ドン.wav", _LENGTH) == "0.8 秒"
         assert panel.cell(sounds / "長い.wav", _LENGTH) == "1:35"
@@ -400,9 +403,14 @@ class TestTheWindow:
             assert str(sounds) in window.remembered_names()
             preferences = window.app_settings()["preferences"]
             assert isinstance(preferences, dict)
-            assert preferences["explorer_folders"] == (
+            assert preferences["explorer_folders"] == [
                 {"path": str(sounds), "category": CATEGORY_SOUND_EFFECT},
-            )
+            ]
+            # AI に使わせない分類のフォルダは、設定の写しにも載せない
+            window._explorer.register(str(sounds.parent), "video")
+            listed = window.app_settings()["preferences"]
+            assert isinstance(listed, dict)
+            assert [f["category"] for f in listed["explorer_folders"]] == [CATEGORY_SOUND_EFFECT]
             window._apply_preferences(
                 Preferences(explorer_ai_categories=(CATEGORY_MUSIC,), explorer_view=VIEW_ICONS)
             )
@@ -574,3 +582,51 @@ class TestLastPlace:
         _settle(panel)
         assert not panel.restore_location(str(tmp_path / "無い"), "")
         assert panel.restore_location(str(sounds / "爆発"), "")
+
+
+class TestWhileReading:
+    def test_the_old_list_cannot_be_placed_while_reading(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、応答の遅い場所を開いている間に〔タイムラインへ〕で前の場所の物が置かれる
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        panel.select_file(sounds / "ドン.wav")
+        _settle(panel)
+        placed: list[list[Path]] = []
+        panel.place_requested.connect(placed.append)
+        panel._lister.forget()
+        panel._show_files()
+        assert panel.listing
+        panel._place_selected()
+        assert placed == []
+        assert not panel._place_button.isEnabled()
+        _settle(panel)
+        panel._place_selected()
+        assert placed == [[sounds / "ドン.wav"]]
+
+    def test_restoring_an_open_folder_selects_at_once(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、もう開いていた場所の前回のファイルが選ばれず、次の読み直しまで残る
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        assert panel.restore_location(str(sounds), str(sounds / "長い.wav"))
+        _settle(panel)
+        assert panel.selected_files() == [sounds / "長い.wav"]
+
+    def test_stopping_cancels_a_play_asked_while_opening(
+        self, panel: ExplorerPanel, tmp_path: Path
+    ) -> None:
+        # 壊れると、作品を鳴らし始めて下見を止めた後に、調べ終えた下見が鳴り出す
+        root = tmp_path / "音"
+        path = write_tone(_touch(root / "a.wav"), tone(2.0, -12.0))
+        panel.register(str(root), CATEGORY_MUSIC)
+        _settle(panel)
+        panel._preview.show_file(None)
+        panel._preview.show_file(path)
+        panel.preview.play()
+        panel.preview.stop()
+        _settle(panel)
+        assert panel.preview.player.path == path
+        assert not panel.preview.player.playing

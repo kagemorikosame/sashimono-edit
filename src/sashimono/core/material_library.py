@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -204,6 +205,15 @@ def reachable_dir(path: Path) -> tuple[bool, str]:
         return False, f"見られません: {exc.strerror or exc}"
 
 
+def _linked_inside(path: Path, root: Path, others: Sequence[Path]) -> bool:
+    """リンクの実体が ``root`` の中で、別に登録したフォルダ（``others``）の中でないか
+
+    別の登録の中を指すリンクを親の分類で拾うと、その登録を AI に使わせない設定にしていても、
+    親の分類の素材として選ばれる 別の登録の物は、その登録自身を見て回るときだけ扱う
+    """
+    return _inside(path, root) and not any(_inside(path, other) for other in others)
+
+
 def _inside(path: Path, root: Path) -> bool:
     """``path`` の実体が ``root`` の中か（リンクを解いて比べる）"""
     try:
@@ -230,6 +240,7 @@ def scan_folder(
     if not present:
         return FolderScan(folder, missing=True, error=problem)
     skipped = {_folder_key(entry) for entry in skip}
+    others = [Path(entry) for entry in skip]
     suffixes = _SUFFIXES.get(folder.category, _SUFFIXES[CATEGORY_OTHER])
     found: list[LibraryFile] = []
     pending = [root]
@@ -254,7 +265,7 @@ def scan_folder(
                     continue
                 if not entry.is_file():
                     continue
-                if entry.is_symlink() and not _inside(Path(entry.path), root):
+                if entry.is_symlink() and not _linked_inside(Path(entry.path), root, others):
                     continue
                 stat = entry.stat()
             except OSError:
@@ -502,6 +513,9 @@ class MeasureBook:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _entries: dict[str, dict[str, object]] | None = field(default=None, repr=False)
     _dirty: bool = field(default=False, repr=False)
+    #: 測れなかったファイル 印 → （大きさ, 更新時刻, 覚えた時計） 控えのファイルには書かない
+    #: ドライブが一時だけ応えなかった物まで書くと、挿し直して起動し直しても測り直さない
+    _failures: dict[str, tuple[int, int, float]] = field(default_factory=dict, repr=False)
 
     def get(self, file: LibraryFile) -> Measure | None:
         with self._lock:
@@ -511,27 +525,23 @@ class MeasureBook:
         return _measure_from(row)
 
     def failed(self, file: LibraryFile) -> bool:
-        """前に測れなかったファイルか（変わっていなければ測り直さない）"""
+        """少し前に測れなかったファイルか（変わっておらず :data:`FAILURE_SECONDS` の内）"""
         with self._lock:
-            row = self._load().get(file.id)
-        return (
-            row is not None
-            and bool(row.get("failed"))
-            and row.get("size") == file.size
-            and row.get("mtime") == file.modified_ns
+            known = self._failures.get(file.id)
+        if known is None:
+            return False
+        size, mtime, at = known
+        return (size, mtime) == (file.size, file.modified_ns) and (
+            time.monotonic() - at < FAILURE_SECONDS
         )
 
     def put_failure(self, file: LibraryFile) -> None:
-        """測れなかったことを覚える 覚えないと、読めないファイルが頭に並んだときに、呼び直す
-        たびに同じ物で測る数を使い切り、後ろの読めるファイルがいつまでも測られない
+        """測れなかったことをしばらく覚える 覚えないと、読めないファイルが頭に並んだときに、
+        呼び直すたびに同じ物で測る数を使い切り、後ろの読めるファイルがいつまでも測られない
+        控えのファイルには書かず、時間が経てば測り直す（一時だけ読めなかった物を戻すため）
         """
         with self._lock:
-            self._load()[file.id] = {
-                "size": file.size,
-                "mtime": file.modified_ns,
-                "failed": True,
-            }
-            self._dirty = True
+            self._failures[file.id] = (file.size, file.modified_ns, time.monotonic())
 
     def put(self, file: LibraryFile, measure: Measure) -> None:
         row: dict[str, object] = {
@@ -585,6 +595,10 @@ class MeasureBook:
         return entries
 
 
+#: 測れなかったファイルを測り直さない間（秒） 呼び直すたびに同じ物で測る数を使い切らず、
+#: ドライブを挿し直した後などは、しばらくすれば測り直す
+FAILURE_SECONDS = 600
+
 #: 控えから読む数の上限 これを越える値（手で書き換えた 1e999 など）の行は測り直す
 _LIMIT = 1e9
 
@@ -620,6 +634,9 @@ def _measure_from(row: dict[str, object]) -> Measure | None:
 def _number(value: object) -> float | None:
     """有限で上限より小さい数 そうでなければ ``None``"""
     if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if isinstance(value, int) and abs(value) > _LIMIT:
+        # 桁違いの整数は float にすると OverflowError を投げる 変える前に断る
         return None
     number = float(value)
     if number != number or abs(number) > _LIMIT:
