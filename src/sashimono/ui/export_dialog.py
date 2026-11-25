@@ -34,22 +34,35 @@ from sashimono.core.commands import export_range
 from sashimono.core.model import Project, Scene, SceneId
 from sashimono.core.timebase import format_timecode
 from sashimono.engine.encode import (
+    AUDIO_KBPS_CHOICES,
     BITRATE_RANGE_MBPS,
+    DEFAULT_AUDIO_KBPS,
+    DEFAULT_FORMAT,
     DEFAULT_PIPELINE_DEPTH,
+    FORMATS,
     RANGE_ALL,
     RANGE_WORK_AREA,
+    WEB_AUTOMATIC_CODECS,
     BitrateChoice,
     ExportError,
+    ExportFormat,
     ExportSettings,
     available_video_codecs,
     available_video_codecs_now,
+    available_web_codecs,
+    available_web_codecs_now,
     build_settings,
     chosen_range,
     export_target,
+    format_named,
+    format_of,
+    has_sound,
+    with_format_suffix,
 )
 
 # 試験が差し替える名前は前のまま（書き出しの偽物を ``run_export`` へ当てる）
 from sashimono.engine.encode.export_job import export_anywhere as run_export
+from sashimono.engine.encode.formats import VIDEO_WEB
 from sashimono.engine.encoders import PRIORITY_AUTO
 from sashimono.engine.render import DEFAULT_DECODE_THREADS
 from sashimono.ui.system_clipboard import clipboard
@@ -84,6 +97,8 @@ CODEC_LABELS = {
     "h264_qsv": "H.264 (Intel GPU)",
     "libx264": "H.264 (CPU)",
     "libx265": "H.265 (CPU)",
+    "libvpx-vp9": "VP9 (CPU)",
+    "libsvtav1": "AV1 (CPU)",
 }
 
 #: 「自動」の項目に持たせる値 ``None`` は「コーデックが 1 つも無く書き出せない」項目が
@@ -92,6 +107,9 @@ AUTO_CODEC = ""
 
 #: ほかの確かめが走っている間、「コーデック」の欄に出す文（#464）
 CHECKING_CODECS = "使えるエンコーダを確かめています…"
+
+#: 音声だけの形式で鳴る物が無いときに出す断り（#527） 押せるままだと、押してから断られる
+NO_SOUND = "鳴る物が無いので、音声だけの形式では書き出せない 音のクリップを置くか、映像の形式を選ぶ"
 
 _log = logging.getLogger(__name__)
 
@@ -146,8 +164,8 @@ class ExportDialog(QDialog):
 
     #: 素材に合わせたビットレートが出た（頼んだ印、Mbps） 読むのはスレッドの外
     _bitrate_found = Signal(object, int)
-    #: 裏で確かめ終えた候補を、窓のスレッドで並べる
-    _codecs_found = Signal(object)
+    #: 裏で確かめ終えた候補を、窓のスレッドで並べる（頼んだときの印, 候補）
+    _codecs_found = Signal(object, object)
 
     def __init__(
         self,
@@ -164,8 +182,12 @@ class ExportDialog(QDialog):
         encoder_priority: str = PRIORITY_AUTO,
         bitrate: BitrateChoice | None = None,
         separate_process: bool = False,
+        export_format: str = DEFAULT_FORMAT,
     ) -> None:
         """``project`` はメインを持つプロジェクト全体
+
+        ``export_format`` は前にこの窓で選んだ形式（#527 ``Preferences.export_format``）
+        知らない名前なら MP4 呼んだ側は :attr:`chosen_format` を覚えて次に渡す
 
         ``bitrate`` はビットレートの欄の初めの値の決め方（本人の設定 #414） 省くと前からの決め打ち
         ``separate_process`` は別のプロセスで書き出すか（本人の設定 ``export_process`` #453）
@@ -197,7 +219,6 @@ class ExportDialog(QDialog):
         self._smooth_history = smooth_history
         #: 色変換を GPU で行うか（#372） 機械の駆動との相性で決まる物なので、ここも本人の設定から
         self._gpu_color = gpu_color
-        self._encoder_priority = encoder_priority
         self._separate_process = separate_process
         self._thread: QThread | None = None
         self._worker: _ExportWorker | None = None
@@ -207,9 +228,28 @@ class ExportDialog(QDialog):
         #: 覚えて、AI アシスタントが書ける場所に入れる（#350） 始めなければ ``None``
         self.started_folder: Path | None = None
 
-        default_name = f"{project.name}.mp4"
+        try:
+            chosen = format_named(export_format)
+        except ValueError:
+            # 新しい版で足した形式を古い版で開いた 何も選ばれていない窓にしない
+            chosen = format_named(DEFAULT_FORMAT)
+        #: 今の形式 名前の拡張子・コーデックの並び・出す欄がこれに従う
+        self._chosen_format = chosen
+        #: 形式の欄 窓に出す順は形式の表のまま（映像を先に、音声だけを後ろに）
+        self._format = QComboBox(self)
+        for item in FORMATS:
+            self._format.addItem(item.label, item.key)
+        self._format.setCurrentIndex(self._format.findData(chosen.key))
+        self._format.setToolTip(
+            "書き出す入れ物 音声だけの形式は映像を描かずに音だけを書くので、映像付きより速い"
+        )
+
+        default_name = f"{project.name}{chosen.suffix}"
         start = folder if folder is not None else Path.home() / "Videos"
         self._path = QLineEdit(str(start / default_name), self)
+        # 名前を打ち替えて拡張子を変えたら形式も合わせる 窓の形式のまま書き出すと、
+        # 打った拡張子が黙って付け替わる setText（窓の側の書き換え）では動かない
+        self._path.textEdited.connect(self._on_path_edited)
         browse = QPushButton("参照…", self)
         browse.clicked.connect(self._choose_path)
         path_row = QHBoxLayout()
@@ -218,17 +258,19 @@ class ExportDialog(QDialog):
 
         self._codec = QComboBox(self)
         self._codecs_ready = False
+        #: 最後に候補を頼んだ印（:meth:`_load_codecs`）
+        self._codec_request: object = object()
+        self._encoder_priority = encoder_priority
         self._codecs_found.connect(self._on_codecs_found)
-        # 「自動」に出す名前と書き出し側が実際に選ぶ物をそろえるため、同じ優先で並べる
-        # ほかの確かめ（設定画面の確かめ直し・起動の後の確かめ）が走っている間は待たない
-        # 待つと、固まった駆動を待ち切るまで（候補ごとに 15 秒）窓が開かない（#464）
-        codecs = available_video_codecs_now(encoder_priority)
-        if codecs is None:
-            self._codec.addItem(CHECKING_CODECS, None)
-            self._codec.setEnabled(False)
-            self._wait_for_codecs(encoder_priority)
-        else:
-            self._fill_codecs(codecs)
+        self._load_codecs()
+
+        #: 音声だけの形式の音質（MP3・M4A） 窓の中で選ぶ物で、本人の設定には覚えない
+        #: 既定は知らない人が困らない 192 kbps
+        self._audio_quality = QComboBox(self)
+        for kbps in AUDIO_KBPS_CHOICES:
+            self._audio_quality.addItem(f"{kbps} kbps", kbps)
+        self._audio_quality.setCurrentIndex(self._audio_quality.findData(DEFAULT_AUDIO_KBPS))
+        self._audio_quality.setToolTip("高いほど音が細かく、ファイルが大きい 迷ったら 192 kbps")
 
         self._bitrate = QSpinBox(self)
         self._bitrate.setRange(*BITRATE_RANGE_MBPS)
@@ -268,12 +310,17 @@ class ExportDialog(QDialog):
         self._summary = QLabel(self)
         self._range = QComboBox(self)
         self._empty = QLabel("タイムラインが空なので書き出せない", self)
+        self._silent = QLabel(NO_SOUND, self)
+        self._silent.setWordWrap(True)
 
         form = QFormLayout()
+        self._form = form
         form.addRow("出力先", path_row)
+        form.addRow("形式", self._format)
         form.addRow("書き出す物", self._scene)
         form.addRow("コーデック", self._codec)
         form.addRow("ビットレート", self._bitrate)
+        form.addRow("音質", self._audio_quality)
         form.addRow("内容", self._summary)
         form.addRow("書き出す範囲", self._range)
         form.addRow("", self._chapters)
@@ -302,6 +349,7 @@ class ExportDialog(QDialog):
             credit_row.addWidget(copy)
             form.addRow("表記", credit_row)
         form.addRow("", self._empty)
+        form.addRow("", self._silent)
 
         self._progress = QProgressBar(self)
         self._progress.setRange(0, 1000)
@@ -324,7 +372,9 @@ class ExportDialog(QDialog):
         layout.addWidget(self._buttons)
 
         self._scene.currentIndexChanged.connect(self._on_scene_changed)
+        self._format.currentIndexChanged.connect(self._on_format_changed)
         self._on_scene_changed()
+        self._show_format_rows()
 
     def _set_bitrate(self, value: int) -> None:
         """窓の側でビットレートの欄を書き換える
@@ -350,13 +400,50 @@ class ExportDialog(QDialog):
         """使えるエンコーダを裏で確かめていて、「コーデック」の欄がまだ埋まっていない"""
         return self._codec.count() == 1 and self._codec.itemText(0) == CHECKING_CODECS
 
+    def _load_codecs(self) -> None:
+        """今の形式で選べる候補を「コーデック」の欄へ並べる 確かめが要れば裏で待つ
+
+        「自動」に出す名前と書き出し側が実際に選ぶ物をそろえるため、同じ優先で並べる
+        ほかの確かめ（設定画面の確かめ直し・起動の後の確かめ）が走っている間は待たない
+        待つと、固まった駆動を待ち切るまで（候補ごとに 15 秒）窓が開かない（#464）
+        音声だけの形式は映像のコーデックを使わないので並べない（欄ごと隠す）
+        """
+        chosen = self._chosen_format
+        # 頼むたびに印を変える 前に頼んだ確かめが後から届いても、今の欄を作り直さない
+        # 作り直すと、待つ間に本人が選んだコーデックが黙って「自動」へ戻る（PR #547 の指摘）
+        self._codec_request = object()
+        if chosen.audio_only:
+            self._codec.clear()
+            self._codecs_ready = False
+            return
+        if chosen.video == VIDEO_WEB:
+            codecs = available_web_codecs_now(self._encoder_priority)
+        else:
+            codecs = available_video_codecs_now(self._encoder_priority)
+        if codecs is None:
+            self._codec.clear()
+            self._codec.addItem(CHECKING_CODECS, None)
+            self._codec.setEnabled(False)
+            self._codecs_ready = False
+            self._wait_for_codecs(self._codec_request, self._encoder_priority)
+        else:
+            self._fill_codecs(codecs)
+
     def _fill_codecs(self, codecs: list[str]) -> None:
         """確かめた候補を「コーデック」の欄へ並べる"""
         self._codec.clear()
-        if codecs:
+        # 「自動」は書き出し側が名指し無しで試す物だけから作る WebM の自動は VP9 だけで、
+        # AV1 は選べるだけ 先頭の AV1 を自動と出すと、VP9 が使えない機械で自動のまま押して
+        # 失敗する（PR #547 の指摘） 自動の候補が無ければ自動を出さず、名指しだけを並べる
+        automatic = (
+            [name for name in codecs if name in WEB_AUTOMATIC_CODECS]
+            if self._chosen_format.video == VIDEO_WEB
+            else codecs
+        )
+        if automatic:
             # 既定は名指しせず書き出し側に選ばせる 先頭を名指しで渡すと、試しには開けても
             # 作品の大きさで断られたとき（NVENC は幅 4096 まで）に次の候補へ落ちられない
-            first = CODEC_LABELS.get(codecs[0], codecs[0])
+            first = CODEC_LABELS.get(automatic[0], automatic[0])
             self._codec.addItem(f"自動（{first}、使えなければ次の候補）", AUTO_CODEC)
         for name in codecs:
             self._codec.addItem(CODEC_LABELS.get(name, name), name)
@@ -365,31 +452,100 @@ class ExportDialog(QDialog):
         self._codec.setEnabled(bool(codecs))
         self._codecs_ready = bool(codecs)
 
-    def _wait_for_codecs(self, encoder_priority: str) -> None:
-        """走っている確かめが終わるのを裏で待ち、終わったら候補を並べる"""
+    def _wait_for_codecs(self, request: object, encoder_priority: str) -> None:
+        """走っている確かめが終わるのを裏で待ち、終わったら候補を並べる
+
+        ``request`` は頼んだときの印 待つ間に形式を替えたら、届いた候補を捨てる
+        """
+        video = self._chosen_format.video
 
         def work() -> None:
             try:
-                codecs = available_video_codecs(encoder_priority)
+                if video == VIDEO_WEB:
+                    codecs = available_web_codecs(encoder_priority)
+                else:
+                    codecs = available_video_codecs(encoder_priority)
             except Exception:
                 # 拾わないと「確かめています」のまま残り、書き出しを押せない理由が分からない
                 _log.exception("書き出しの窓でエンコーダを確かめられなかった")
                 codecs = []
             try:
-                self._codecs_found.emit(codecs)
+                self._codecs_found.emit(request, codecs)
             except RuntimeError:
                 # 先に窓を閉じた 届け先が無い
                 return
 
         threading.Thread(target=work, name="sashimono-export-codecs", daemon=True).start()
 
-    def _on_codecs_found(self, codecs: list[str]) -> None:
-        """確かめ終えた候補を並べ、書き出しを押せるかを直す"""
+    def _on_codecs_found(self, request: object, codecs: list[str]) -> None:
+        """確かめ終えた候補を並べ、書き出しを押せるかを直す
+
+        今の印でない結果は捨てる 待つ間に別の作り方の形式へ替えていたら、並べると WebM の欄に
+        H.264 が出る 同じ作り方へ戻した後の古い結果を並べると、本人の選びが「自動」へ戻る
+        """
+        if request is not self._codec_request:
+            return
         self._fill_codecs(codecs)
-        if self._thread is None:
-            self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
-                self._codecs_ready and self._project.duration > 0
-            )
+        self._refresh_ok()
+
+    def _refresh_ok(self) -> None:
+        """〔書き出し〕を押せるかを直す 押せない理由は欄と断りの文に出ている
+
+        押せるままにすると、押しても何も起きず理由が分からない 書き出している間は触らない
+        """
+        if self._thread is not None:
+            return
+        chosen = self._chosen_format
+        empty = self._project.duration <= 0
+        silent = chosen.audio_only and not has_sound(self._project)
+        self._silent.setVisible(silent and not empty)
+        ready = chosen.audio_only or self._codecs_ready
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+            ready and not empty and not silent
+        )
+
+    @property
+    def chosen_format(self) -> str:
+        """今の形式の名前（#527） 呼んだ側が覚え、次に開く窓の初めの形式にする"""
+        return self._chosen_format.key
+
+    def select_format(self, key: str) -> None:
+        """形式を選ぶ 知らない名前なら何もしない"""
+        index = self._format.findData(key)
+        if index >= 0:
+            self._format.setCurrentIndex(index)
+
+    def _on_format_changed(self) -> None:
+        """形式に合わせて、名前の拡張子・コーデックの並び・出す欄・押せるかを直す"""
+        chosen = format_named(str(self._format.currentData()))
+        before = self._chosen_format
+        self._chosen_format = chosen
+        path = Path(self._path.text())
+        if path.suffix.lower() != chosen.suffix:
+            # 打った名前の拡張子が今の形式と同じなら書き換えない 打っている途中のカーソルが飛ぶ
+            self._path.setText(str(with_format_suffix(path, chosen)))
+        if chosen.video != before.video:
+            self._load_codecs()
+        self._show_format_rows()
+        self._refresh_ok()
+
+    def _show_format_rows(self) -> None:
+        """形式で使わない欄を隠す 音声だけなら映像のコーデックとビットレート、音質は MP3 と M4A だけ
+
+        出したままにすると、効かない欄を替えて書き出し、変わらない理由を探すことになる
+        章を埋められない形式では、章の欄を押せなくする（値は本人の設定なので残す）
+        """
+        chosen = self._chosen_format
+        self._form.setRowVisible(self._codec, not chosen.audio_only)
+        self._form.setRowVisible(self._bitrate, not chosen.audio_only)
+        self._form.setRowVisible(self._audio_quality, chosen.audio_quality)
+        self._chapters.setEnabled(chosen.chapters)
+
+    def _on_path_edited(self, text: str) -> None:
+        """打った名前の拡張子が知っている形式なら、形式の欄をそれに合わせる"""
+        found = format_of(Path(text))
+        if found is not None and found.key != self._chosen_format.key:
+            self.select_format(found.key)
 
     def _match_bitrate(self, project: Project) -> None:
         """書き出す物の素材に合わせたビットレートを、スレッドの外で求める（#414）
@@ -476,22 +632,19 @@ class ExportDialog(QDialog):
         path = Path(self._path.text())
         if path.name == before:
             self._path.setText(str(path.with_name(self._default_name(scene))))
-        empty = project.duration <= 0
-        self._empty.setVisible(empty)
-        # 押せるままにすると、押しても何も起きず理由が分からない 理由はコーデックの欄と
-        # 空の断りに出ている
-        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
-            self._codecs_ready and not empty
-        )
+        self._empty.setVisible(project.duration <= 0)
+        # シーンを替えると鳴る物の有る無しも変わる（音声だけの形式の断り）
+        self._refresh_ok()
 
     def _default_name(self, scene: Scene | None) -> str:
         """出力先の既定の名前 シーンならシーンの名前を後ろに付ける（メインと上書きし合わない）"""
+        suffix = self._chosen_format.suffix
         if scene is None:
-            return f"{self._whole.name}.mp4"
+            return f"{self._whole.name}{suffix}"
         # シーンの名前は自由に付けられる ファイル名に使えない文字を残すと、書き出しを
         # 押してから開けないと断られる
         safe = "".join("_" if c in '\\/:*?"<>|' else c for c in scene.name)
-        return f"{self._whole.name}_{safe}.mp4"
+        return f"{self._whole.name}_{safe}{suffix}"
 
     def _fill_range(self, project: Project) -> None:
         """全体か、タイムラインで指定した範囲か
@@ -533,21 +686,40 @@ class ExportDialog(QDialog):
         return None
 
     def _choose_path(self) -> None:
+        """書き出し先をファイルの窓で選ぶ 選んだ名前の拡張子が知っている形式なら形式も合わせる
+
+        絞り込みは今の形式を先にして、ほかの形式も並べる 1 つだけだと、別の形式を書けることが
+        窓から分からない
+        """
+        chosen = self._chosen_format
+        others = [item for item in FORMATS if item is not chosen]
+        filters = ";;".join(_filter(item) for item in [chosen, *others])
         name, _ = QFileDialog.getSaveFileName(
-            self, "書き出し先", self._path.text(), "MP4 (*.mp4);;すべてのファイル (*)"
+            self, "書き出し先", self._path.text(), f"{filters};;すべてのファイル (*)"
         )
         if name:
-            self._path.setText(name)
+            found = format_of(Path(name))
+            if found is not None:
+                self.select_format(found.key)
+            self._path.setText(str(with_format_suffix(Path(name), self._chosen_format)))
+
+    def _output_path(self) -> Path:
+        """書き出す名前 拡張子は今の形式に合わせる（知らない拡張子なら後ろへ足す）"""
+        return with_format_suffix(Path(self._path.text()), self._chosen_format)
 
     def _settings(self) -> ExportSettings | None:
         """画面の選択から書き出しの設定を作る 使えるコーデックが無ければ ``None``"""
-        codec = self._codec.currentData()
-        if codec is None:
-            return None
+        chosen = self._chosen_format
+        if chosen.audio_only:
+            codec: object = AUTO_CODEC
+        else:
+            codec = self._codec.currentData()
+            if codec is None:
+                return None
         # AI の書き出しと同じ作り方で組む（#327） 画面だけ別に組むと、同じ範囲・画質を
         # 頼んでも、AI が書き出した物だけ先読みの深さや範囲が違う
         return build_settings(
-            Path(self._path.text()),
+            self._output_path(),
             codec=str(codec) or None,
             bitrate_mbps=self._bitrate.value(),
             frame_range=self._frame_range(),
@@ -557,14 +729,22 @@ class ExportDialog(QDialog):
             gpu_color=self._gpu_color,
             chapters=self._chapters.isChecked(),
             encoder_priority=self._encoder_priority,
+            audio_kbps=int(self._audio_quality.currentData()),
         )
 
     def _start(self) -> None:
         if self._thread is not None:
             return
-        settings = self._settings()
+        try:
+            settings = self._settings()
+        except ValueError as exc:
+            # 名前が空・範囲が消えたなど 押しても黙って何も起きないより、理由を出す
+            QMessageBox.warning(self, "書き出し", str(exc))
+            return
         if settings is None:
             return
+        # 書き出す名前を欄にも出す 拡張子を形式に合わせて付け替えたことが見える
+        self._path.setText(str(settings.path))
         self.started_folder = settings.path.parent
 
         self._progress.setVisible(True)
@@ -636,7 +816,7 @@ class ExportDialog(QDialog):
             self._thread = None
         self._worker = None
         self._progress.setVisible(False)
-        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(True)
+        self._refresh_ok()
         self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("閉じる")
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt の命名規約
@@ -673,3 +853,8 @@ class ExportDialog(QDialog):
         cancel = self._buttons.button(QDialogButtonBox.StandardButton.Cancel)
         cancel.setText("止めています…")
         cancel.setEnabled(False)
+
+
+def _filter(item: ExportFormat) -> str:
+    """ファイルの窓の絞り込みの 1 つ"""
+    return f"{item.label} (*{item.suffix})"
