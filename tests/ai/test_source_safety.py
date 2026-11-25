@@ -138,6 +138,10 @@ UNDOABLE_TOOLS = frozenset(
         "remove_scene",
         # 素材一覧から外すだけ（使っていれば断る） ファイルは消さない
         "remove_media",
+        # 素材に置き方の既定を覚える・消す（#524） 作品の中だけ ファイルにも本人の置き場にも触らない
+        "set_media_defaults",
+        # このコマで止める（#525） 割って後ろの絵を止めるだけ ファイルは作らない
+        "freeze_frame",
         "set_work_area",
         "add_filter",
         "add_group_control",
@@ -190,6 +194,8 @@ FILE_WRITING_TOOLS = frozenset(
         "save_snapshot",
         # ナレーション（#335） 作品のフォルダの narration へ新しい名前の WAV を書く
         "generate_narration",
+        # 静止画を素材にする（#525） 作品のフォルダの stills へ新しい名前の PNG を書く
+        "snapshot_to_media",
         # 持ち出し用パッケージ（#423） 書き出し先のフォルダを持ったまま書く（ui/main_window.py
         # の _start_package_export が pinned に通す）
         "export_package",
@@ -212,6 +218,8 @@ _HOST_WRITERS = {
     "_save_snapshot": {"write_snapshot"},
     # ナレーション（#335） 声を作り終えてから書く所 AI の道具と人の窓が同じ関数を通る
     "write_and_place_narration": {"make_narration_folder", "write_narration"},
+    # 静止画を素材にする（#525） AI の道具と人のメニューが同じ関数を通る
+    "write_and_import_still": {"make_still_folder", "write_snapshot"},
 }
 #: 上のうち、道具の本体（Operation.approved）ではなく、本体と人の窓が分け合う書く所
 #: 値は呼んでよい道具の本体と、人の窓の関数（どちらも許した中身を渡す）
@@ -221,6 +229,13 @@ _SHARED_WRITERS = {
         frozenset({"_generate_narration", "_place_when_made"}),
         # 人の窓〔ナレーションを作る…〕 窓の OK で採った確かめの中身を渡す
         frozenset({"_check_narration"}),
+    ),
+    "write_and_import_still": (
+        # AI の道具 確かめた後の本体
+        frozenset({"_snapshot_to_media"}),
+        # 人のメニュー〔静止画を素材にする〕〔静止画をタイムラインへ置く〕 書く先の身元は
+        # メニューを押した所で採る
+        frozenset({"still_to_media"}),
     ),
 }
 

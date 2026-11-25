@@ -416,6 +416,30 @@ def _remove_media(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     return host, "remove_media", {"media_id": ids["media"]}
 
 
+def _media_defaults(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # 素材を置いたクリップから既定を覚える（#524） 消すのも同じ命令を通る
+    host = _text_host(material)
+    return host, "set_media_defaults", {"clip_id": _ids(host)["video"]}
+
+
+def _freeze(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # 置いた動画のクリップを途中で止める（#525）
+    host = _text_host(material)
+    video = _ids(host)["video"]
+    return host, "freeze_frame", {"clip_id": video, "frame": 10}
+
+
+def _still_to_media(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
+    # 保存した作品で静止画を素材にして置く（#525） 読み込みと置く命令を 1 段で通す
+    host = _text_host(material)
+    folder = material.tmp_path / "静止画の作品"
+    folder.mkdir()
+    host.saved_at = folder / "作品.sme"
+    host.write_project(host.saved_at, adopt=False, expect=expect_now(host.saved_at))
+    host.probe_result = MediaItem(path=folder / "仮.png")
+    return host, "snapshot_to_media", {"place": True}
+
+
 def _split_subtitle(material: Material) -> tuple[FakeHost, str, dict[str, Any]]:
     # 1 枚目の字幕は 1〜3 秒 その内側で割る
     host = _text_host(material)
@@ -519,6 +543,9 @@ EXAMPLES: dict[str, Example] = {
     "rename_scene": _scene("rename_scene", name="場面 2"),
     "remove_scene": _scene("remove_scene"),
     "remove_media": _remove_media,
+    "set_media_defaults": _media_defaults,
+    "freeze_frame": _freeze,
+    "snapshot_to_media": _still_to_media,
     "remove_effect": _with_effects("remove_effect"),
     "move_effect": _with_effects("move_effect", index=1),
     "set_effect_enabled": _with_effects("set_effect_enabled", enabled=False),
