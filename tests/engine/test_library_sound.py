@@ -34,8 +34,13 @@ class _Sink:
         self._gate = gate
         #: 真なら最初の 1 回からこれが立つまで書かせない（最初の読み込みが遅い機械の代わり）
         self._hold_first = hold_first
+        #: 書き始めた回数ごとの知らせ（1 回目・2 回目） 2 回目に入ったなら、1 回目の分は
+        #: プレーヤーの書いた所（``_written``）に入っている
+        self.first = threading.Event()
+        self.second = threading.Event()
 
     def write(self, samples: np.ndarray) -> None:
+        (self.second if self.first.is_set() else self.first).set()
         if self._gate is not None and (self.samples > 0 or self._hold_first):
             self._gate.wait()
         self.samples += len(samples)
@@ -115,7 +120,8 @@ class TestPreviewPlayer:
         player.set_volume(0.5)
         player.play()
         assert player.playing
-        wait_until(lambda: bool(sinks) and sinks[0].samples > 0, "下見の音")
+        # 2 回目の書き込みに入るまで待つ（1 回目の分がプレーヤーの書いた所に入ってから止める）
+        wait_until(lambda: bool(sinks) and sinks[0].second.is_set(), "下見の音")
         # 出口へ書いた所（最初の 1 ブロック 約 0.04 秒）の内で止める 書いた所より先では
         # 止めた所から再開しない作り（:meth:`PreviewPlayer.pause`）
         clock.now = 0.02
@@ -372,8 +378,11 @@ class TestPreviewPlayer:
         try:
             player.open(path)
             player.play()
-            wait_until(lambda: bool(sinks), "出口")
+            # 最初の書き込みに入った（時計は動き始めている）のを待ち、そこで書き込みを止めておく
+            wait_until(lambda: bool(sinks) and sinks[0].first.is_set(), "最初の書き込み")
             clock.now = 5.0
+            # 表示の位置は末尾まで進む（再開の位置を書いた所で抑えなければ、ここから再開する）
+            assert player.position == pytest.approx(0.05, abs=0.01)
             player.pause()
             assert player.position == pytest.approx(0.0)
         finally:

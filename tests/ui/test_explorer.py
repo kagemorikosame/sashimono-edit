@@ -11,6 +11,7 @@ import json
 import os
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -1093,3 +1094,54 @@ class TestSelfReviewFive:
         finally:
             release.set()
             worker.close()
+
+
+class TestSeventhReview:
+    def test_an_old_measure_does_not_replace_the_new_version(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、測っている間に差し替えて読み直したとき、遅れて届いた古い版の長さで新しい版の
+        # 測った値を置き換え、次に開くと測り直す
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        target = sounds / "ドン.wav"
+        current = next(f for f in panel._files.values() if f.path == target)
+        old = replace(current, size=current.size + 1)
+        new_measure = Measure(seconds=2.0, has_audio=True, has_video=False)
+        panel._book.put(current, new_measure)
+        panel._on_worker(
+            explorer_module._job_key("measure", old),
+            (old, Measure(seconds=9.0, has_audio=True, has_video=False)),
+        )
+        assert panel._book.get(current) == new_measure
+        assert panel._book.get(old) is None
+
+    def test_a_result_is_used_after_only_the_category_changed(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、測っている間に分類を付け直すと、同じファイルなのに結果を捨て、長さが出ない
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        wait_until(lambda: not panel._worker.busy, "測り終わり", step=_process)
+        _process()
+        target = sounds / "ドン.wav"
+        current = next(f for f in panel._files.values() if f.path == target)
+        before = replace(current, folder=LibraryFolder(current.folder.path, CATEGORY_MUSIC))
+        measure = Measure(seconds=4.5, has_audio=True, has_video=False)
+        panel._on_worker(explorer_module._job_key("measure", before), (before, measure))
+        cells = panel._row_of(current.id)
+        assert cells is not None
+        assert cells[explorer_module._LENGTH].text() == "4.5 秒"
+
+    def test_a_cached_picture_of_the_wrong_shape_is_made_again(self, tmp_path: Path) -> None:
+        # 壊れると、形の合わない見本の控え（2 次元の波形など）を画面のスレッドで絵にしようとして
+        # 知らせの受け口が落ちる
+        store = explorer_module._ThumbStore(tmp_path)
+        folder = LibraryFolder(str(tmp_path), CATEGORY_SOUND_EFFECT)
+        file = LibraryFile(path=tmp_path / "ドン.wav", folder=folder, size=1, modified_ns=1)
+        store.save(file, "peaks", np.zeros((4, 4), dtype=np.float32))
+        store.save(file, "still", np.zeros((4, 4), dtype=np.float32))
+        assert store.load(file, "peaks") is None
+        assert store.load(file, "still") is None
+        store.save(file, "peaks", np.zeros(8, dtype=np.float32))
+        assert store.load(file, "peaks") is not None

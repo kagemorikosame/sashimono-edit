@@ -708,7 +708,9 @@ def _read_book(path: Path | None) -> dict[str, dict[str, object]]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # 深く入れ子にした配列は json が RecursionError を投げる 壊れた控えと同じく空にする
+        # （投げると、一覧を読む裏の仕事ごと落ちて「この場所を読めません」と出る）
         return {}
     if not isinstance(data, dict) or data.get("version") != _BOOK_VERSION:
         return {}

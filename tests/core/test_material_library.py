@@ -530,19 +530,44 @@ def test_reading_the_book_ahead_does_not_hold_up_saving_or_measuring(
         return original(path)
 
     monkeypatch.setattr(material_library, "_read_book", slow)
-    worker = threading.Thread(target=book.preload)
-    worker.start()
+    file = (
+        MaterialLibrary(folders=(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT),))
+        .scan_for_ai()[0]
+        .files[0]
+    )
+    measure = Measure(seconds=0.8, has_audio=True, has_video=False)
+    # 保存と測った値を入れるのも別のスレッドで行い、先読みを止めたまま終わるかを期限付きで見る
+    # 試験のスレッドで呼ぶと、錠の回帰で試験ごと止まり、失敗として返らない
+    ahead = threading.Thread(target=book.preload, daemon=True)
+    saving = threading.Thread(target=book.save, daemon=True)
+    putting = threading.Thread(target=book.put, args=(file, measure), daemon=True)
+    ahead.start()
     try:
         assert reading.wait(5)
-        book.save()  # 何も測っていないので、先読みを待たずに戻る
-        file = (
-            MaterialLibrary(folders=(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT),))
-            .scan_for_ai()[0]
-            .files[0]
-        )
-        measure = Measure(seconds=0.8, has_audio=True, has_video=False)
-        book.put(file, measure)
+        saving.start()
+        saving.join(5)
+        assert not saving.is_alive(), "保存が先読みを待った"
+        putting.start()
+        putting.join(5)
+        assert not putting.is_alive(), "測った値を入れるのが先読みを待った"
     finally:
         gate.set()
-        worker.join(5)
+        ahead.join(5)
+        saving.join(5) if saving.ident is not None else None
+        putting.join(5) if putting.ident is not None else None
     assert book.get(file) == measure
+
+
+def test_a_book_nested_too_deep_is_read_as_empty(tmp_path: Path) -> None:
+    # 壊れると、深く入れ子にした控えで json が RecursionError を投げ、一覧を読む裏の仕事ごと落ちる
+    store = tmp_path / "measures.json"
+    store.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    sound = _touch(tmp_path / "SE" / "ドン.wav")
+    file = (
+        MaterialLibrary(folders=(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT),))
+        .scan_for_ai()[0]
+        .files[0]
+    )
+    book = MeasureBook(path=store)
+    book.preload()
+    assert book.get(file) is None

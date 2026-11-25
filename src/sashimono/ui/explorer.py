@@ -346,9 +346,12 @@ class _ThumbStore:
             return None
         try:
             loaded: np.ndarray = np.load(path, allow_pickle=False)
-            return loaded
-        except (OSError, ValueError):
+        except (OSError, ValueError, EOFError):
+            # 途中で切れたファイルは EOFError になる 壊れた控えは作り直す
             return None
+        # 形の合わない控え（手で置いた物・前の版の物）は使わない 画面のスレッドで絵にする所で
+        # 型の例外になり、知らせの受け口ごと落ちる
+        return loaded if _usable(loaded, kind) else None
 
     def save(self, file: LibraryFile, kind: str, data: np.ndarray) -> None:
         path = self._path(file, kind)
@@ -362,6 +365,15 @@ class _ThumbStore:
         except OSError:
             # 書けなくても作り直せば済む 見本の絵の置き場が無いだけで画面を止めない
             return
+
+
+def _usable(data: np.ndarray, kind: str) -> bool:
+    """控えから読んだ配列が、その種類の絵にできる形か"""
+    if data.size == 0:
+        return False
+    if kind == "peaks":
+        return data.ndim == 1 and np.issubdtype(data.dtype, np.floating)
+    return data.ndim == 3 and data.shape[2] in (3, 4) and data.dtype == np.uint8
 
 
 def _small_tile(tile: np.ndarray) -> np.ndarray:
@@ -1845,23 +1857,31 @@ class ExplorerPanel(QWidget):
             asked, measure = result
             if not isinstance(asked, LibraryFile):
                 return
-            # 測った物は、別の場所を開いた後に届いても控えに入れる（次に開いたときに測り直さない）
-            # 控えは頼んだときの版（大きさと更新時刻）で引くので、差し替えた後の版には使わない
+            # 今の行に同じファイルの別の版があれば（測っている間に差し替えて読み直した）、古い版の
+            # 結果は控えにも入れない 入れると、先に届いた新しい版の測った値を置き換える
+            # 別の場所を開いた後に届いた物（今の行に無い）は控えに入れる
+            # （次に開いたときに測り直さない）
+            if file is not None and _version(file) != _version(asked):
+                return
             if isinstance(measure, Measure):
                 self._book.put(asked, measure)
             else:
                 self._book.put_failure(asked)
-            # 行に出すのは、今の行のファイルが頼んだときと同じ版のときだけ
-            if file is None or asked != file or not isinstance(measure, Measure):
+            if file is None or not isinstance(measure, Measure):
                 return
             cells = self._row_of(file_key)
             if cells is not None:
                 self._fill_measure(cells, measure)
         elif file is not None and kind in ("still", "peaks") and isinstance(result, tuple):
             asked, data = result
-            # 測った値と同じく、頼んだときのファイルと今の行のファイルが同じときだけ使う
-            # 作っている間に差し替わった物の絵を、新しいファイルの物として覚えない
-            if asked != file or not isinstance(data, np.ndarray):
+            # 測った値と同じく、頼んだときのファイルと今の行のファイルが同じ版のときだけ使う
+            # 作っている間に差し替わった物の絵を、新しいファイルの物として覚えない 比べるのは
+            # 仕事の名前と同じ版（印・大きさ・更新時刻） 分類を付け直しただけの行には使う
+            if (
+                not isinstance(asked, LibraryFile)
+                or _version(asked) != _version(file)
+                or not isinstance(data, np.ndarray)
+            ):
                 return
             if kind == "still":
                 self._icons[_stamp(file)] = thumbnail_icon(data)
@@ -2173,9 +2193,19 @@ def _favorite_listing(
     return matched, "  ".join(notes)
 
 
+def _version(file: LibraryFile) -> tuple[str, int, int]:
+    """ファイルの版（印・大きさ・更新時刻） 裏の仕事の名前と、届いた結果を使うかの比べに使う
+
+    登録の分類（``folder``）は入れない 分類を付け直しただけでは同じファイルなので、走っている
+    仕事の結果をそのまま使う 入れると、仕事の名前は同じなのに結果だけ捨てて、長さが出ない
+    """
+    return file.id, file.size, file.modified_ns
+
+
 def _job_key(kind: str, file: LibraryFile) -> str:
     """裏の仕事の名前 種類と印と版（大きさと更新時刻） 版が違えば別の仕事として受け付ける"""
-    return f"{kind}:{file.id}|{file.size}-{file.modified_ns}"
+    _id, size, modified = _version(file)
+    return f"{kind}:{file.id}|{size}-{modified}"
 
 
 def _stamp(file: LibraryFile) -> str:
