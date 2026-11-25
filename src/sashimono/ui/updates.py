@@ -116,18 +116,24 @@ class UpdateController(QObject):
         confirm_close: Callable[[], bool] | None = None,
         close_window: Callable[[], bool] | None = None,
         rescan_scripts: Callable[[], None] | None = None,
+        waits: Callable[[], list[str]] | None = None,
     ) -> None:
         """``frozen_layout`` が真で ``layout`` が無ければ、配布版の置き場を自分で求める
 
         ``confirm_close`` は閉じてよいか（保存していない変更を尋ね、保存も済ませる）
         ``close_window`` は尋ねずに閉じる 既定は窓の ``close``（尋ねる窓ならそこで尋ねる）
         ``rescan_scripts`` は exe の隣のスクリプトを移した後に、スクリプトを読み直す
+        ``waits`` は再起動を断らずに終わりを待つ作業（AI の部品の自動更新 #528） 終わったら
+        :meth:`resume_waiting` を呼んでもらう
         """
         super().__init__(window)
         self._rescan_scripts = rescan_scripts
         self._window = window
         self._preferences = preferences
         self._blockers = blockers
+        self._waits: Callable[[], list[str]] = waits if waits is not None else list
+        #: 裏の作業の終わりを待っている入れ替え（``apply`` か ``rollback``） 待っていなければ None
+        self._waiting: str | None = None
         self._arguments = arguments
         self._transport = transport
         self._keys = tuple(keys) if keys is not None else trusted_keys()
@@ -203,6 +209,11 @@ class UpdateController(QObject):
 
     def can_roll_back(self) -> bool:
         return self._layout is not None and self._layout.has_previous()
+
+    @property
+    def waiting(self) -> bool:
+        """裏の作業の終わりを待ってから入れ替えるところか"""
+        return self._waiting is not None
 
     # --- 起動したとき ---
 
@@ -387,6 +398,9 @@ class UpdateController(QObject):
         前に必ず走る）が元の場所へ戻す
         """
         self._stopping.set()
+        # 閉じた後に部品の更新の終わりが届いても入れ替えへ進まない 入れ替えを待つ版は置き場に
+        # 残っているので、次の起動でまた入れるかを尋ねる
+        self._waiting = None
         deadline = time.monotonic() + timeout
         for thread in self._threads:
             thread.join(max(0.0, deadline - time.monotonic()))
@@ -640,6 +654,9 @@ class UpdateController(QObject):
             lines.extend(escape(part) for part in note.split("\n"))
         lines.append("入れるには再起動が要ります 保存していない変更があれば、閉じる前に尋ねます")
         answer = self._choose("新しい版", "<br>".join(lines))
+        if answer != ANSWER_NOW:
+            # 待っている間にもう一度選び直した 本人の新しい答えに従い、待っていた分はやめる
+            self._stop_waiting()
         if answer == ANSWER_NOW:
             self.restart_now()
         elif answer == ANSWER_NEXT_START:
@@ -682,13 +699,34 @@ class UpdateController(QObject):
             + escape("戻した後は、この版を自動では入れません（手で確かめれば入れられます）"),
             confirm_only=True,
         )
-        if answer != ANSWER_NOW or not self._restart("rollback"):
+        if answer != ANSWER_NOW:
+            self._stop_waiting()
             return False
-        # 戻すと決まってから覚える 取り消したのに、今の版が「飛ばす版」に残らないように
-        state = self._store.load()
-        if __version__ not in state.skipped:
-            self._store.save(replace(state, skipped=(*state.skipped, __version__)))
-        return True
+        return self._restart("rollback")
+
+    def resume_waiting(self) -> None:
+        """裏の作業（AI の部品の自動更新）が終わった 待っていた入れ替えへ進む
+
+        失敗して終わったときも進む 部品は前の版が残っているので、アプリの入れ替えを止める
+        理由にならない 止めると、何も知らせずにいつまでも待つ
+
+        〔入れる前に尋ねる〕（``update_confirm``）が入っていれば、進む前にもう一度尋ねる
+        選んでから数十秒たち、本人は編集の続きをしているかもしれない 尋ねずに窓を閉じると、
+        手を動かしている最中に画面が消える 切っている人は尋ねられたくない側なので、そのまま進む
+        """
+        mode = self._waiting
+        if mode is None:
+            return
+        if self._waits():
+            return  # 別の裏の作業が続いている 次の終わりの知らせを待つ
+        self._stop_waiting()
+        if mode == "apply" and self.ready_version() is None:
+            # 待っている間に片付いた（ベータを切った・ほかの窓が入れた）
+            self._refresh_button()
+            return
+        if self._preferences().update_confirm and not self._ask_resume(mode):
+            return
+        self._restart(mode)
 
     def _restart(self, mode: str) -> bool:
         """保存の確認が済んでから入れ替え係を起こし、窓を閉じて終わる
@@ -702,11 +740,16 @@ class UpdateController(QObject):
             # exe の隣のスクリプトを移している最中に入れ替えると、写す側（carry_user_files）と
             # 移す側が同じファイルを同時に触る 入れ替え係もフォルダを付け替えられない
             blockers.append("exe の隣のスクリプトを %APPDATA% へ移しています")
+        waits = self._waits()
         if blockers:
+            # 待てる作業も並べる 断る理由を言うなら、動いている物をすべて見せる
             self._inform(
                 "今は再起動できません",
-                "次の作業が終わってからもう一度選んでください\n" + "\n".join(blockers),
+                "次の作業が終わってからもう一度選んでください\n" + "\n".join([*blockers, *waits]),
             )
+            return False
+        if waits:
+            self._wait_for(mode, waits)
             return False
         if self._busy_elsewhere():
             return False
@@ -749,11 +792,41 @@ class UpdateController(QObject):
             self._inform("入れ替えを止めました", stopped.explain())
             return False
         if self._launch_swap(mode):
+            if mode == "rollback":
+                # 戻すと決まってから覚える 取り消したのに、今の版が「飛ばす版」に残らないように
+                # 戻した版を、次の確かめですぐ入れ直さない
+                state = self._store.load()
+                if __version__ not in state.skipped:
+                    self._store.save(replace(state, skipped=(*state.skipped, __version__)))
             return True
         # 入れ替え係を起こせなかった・閉じられなかった 引き継ぎが置いた「入れ替え係を待っている」
         # 印を外す（残すと、移しが印の切れるまで止まる）
         clear_swap_pending(userdirs.config_root(), token)
         return False
+
+    def _wait_for(self, mode: str, waits: list[str]) -> None:
+        """裏の作業の終わりを待ってから入れ替える 待っていることを、窓を塞がずに知らせる
+
+        断ってもう一度選ばせると、本人は何も頼んでいないのに何を待てばよいか分からない（#528）
+        ステータスバーにも残し、待っている間に見返せるようにする
+        """
+        self._waiting = mode
+        target = "新しい版へ入れ替え" if mode == "apply" else "前の版へ戻し"
+        # 待った後にもう一度尋ねる設定なら、そう言っておく 「入れ替えます」とだけ言って尋ねると
+        # 言ったことと違い、尋ねずに入れ替えると言わずに画面が消える
+        then = (
+            f"終わったら、再起動して{target}てよいかを尋ねます"
+            if self._preferences().update_confirm
+            else f"終わったら再起動して{target}ます"
+        )
+        self._notify("終わったら入れ替えます", "\n".join([*waits, then]))
+        self._say(" ".join([*waits, then]), 0)
+
+    def _stop_waiting(self) -> None:
+        if self._waiting is None:
+            return
+        self._waiting = None
+        self._window.statusBar().clearMessage()
 
     def _launch_swap(self, mode: str) -> bool:
         """入れ替え係を起こし、走り出したら窓を閉じて終わる 起こせなければ知らせて偽"""
@@ -859,6 +932,21 @@ class UpdateController(QObject):
     def _inform(self, title: str, text: str) -> None:
         """本人に読ませる 試験では差し替える"""
         QMessageBox.information(self._window, title, text)
+
+    def _ask_resume(self, mode: str) -> bool:
+        """待っていた作業が終わった 今すぐ再起動してよいかを尋ねる 試験では差し替える
+
+        既定の答えは〔やめる〕 編集の手を動かしている最中に Enter が当たっても閉じない
+        """
+        goal = "新しい版を入れます" if mode == "apply" else "前の版に戻します"
+        box = QMessageBox(self._window)
+        box.setWindowTitle("再起動して入れ替える")
+        box.setText(f"AI の部品の更新が終わりました\n再起動して{goal}")
+        now = box.addButton("今すぐ再起動する", QMessageBox.ButtonRole.AcceptRole)
+        later = box.addButton("やめる", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(later)
+        box.exec()
+        return box.clickedButton() is now
 
     def _choose(self, title: str, html: str, *, confirm_only: bool = False) -> str:
         """どうするかを尋ねる 試験では差し替える"""

@@ -5479,6 +5479,12 @@ YUV と RGB の行き来は全部 PyAV（swscale）に任せ、自前の行列�
 - 新しい版は窓を出したところで印のファイルを書く（`app.py` の `mark_started`） 書かずに落ちたら
   入れ替え係が数え、2 回続けば `Sashimono.failed` へよけて前の版を起こす 戻した版は次から飛ばす
 - 編集・書き出し・AI の作業・字幕起こしの途中では再起動しない（`MainWindow.update_blockers`）
+  AI の側は会話・環境の導入・部品の自動更新を分けて見る（`ChatPanel.responding` `setting_up`
+  `updating_parts`） 前の 2 つは理由を言い分けて断る 部品の自動更新は本人が頼んだ物ではなく
+  数十秒で終わるので断らず（`MainWindow.update_waits`）、終わりの知らせ（`ChatPanel.parts_settled`
+  失敗も含む）で入れ替えへ進む（`UpdateController.resume_waiting` #528） 〔入れる前に尋ねる〕が
+  入っていれば進む前にもう一度尋ねる（待つ間に編集を続けている人の画面を急に消さない）
+  待つ間に会話を始めたら今の文言で断り、選び直したら待つのをやめ、窓を閉じたら進まない
   保存していない変更は、入れ替え係を起こす**前に**尋ねる 取り消されたら起こさない
   （先に起こすと、迷っている間に入れ替え係が待つのを諦めて今の版を起こし、本体が 2 つ動く）
 - Release の workflow は組み立て（依存を入れる 書く権限なし `persist-credentials: false`）と

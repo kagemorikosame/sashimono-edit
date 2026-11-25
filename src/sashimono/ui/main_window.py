@@ -984,7 +984,9 @@ class MainWindow(QMainWindow):
             confirm_close=self._confirm_discard,
             close_window=self._close_for_update,
             rescan_scripts=self.rescan_scripts,
+            waits=self.update_waits,
         )
+        self._chat.parts_settled.connect(self._updates.resume_waiting)
         self.statusBar().addPermanentWidget(self._updates.button)
 
     def _dock(self, title: str, name: str) -> QDockWidget:
@@ -4201,8 +4203,10 @@ class MainWindow(QMainWindow):
     def update_blockers(self) -> list[str]:
         """更新のために再起動してはいけない作業 書き出しは窓を占めるので、ここまで来ない"""
         found = []
-        if self._chat.working:
-            found.append("AI アシスタントが作業しています（環境の導入を含む）")
+        if self._chat.responding:
+            found.append("AI アシスタントが作業しています")
+        if self._chat.setting_up:
+            found.append("AI 連携の環境を入れています")
         if self._subtitles.transcribing:
             found.append("字幕を起こしています")
         if self._assistant_export.running:
@@ -4214,6 +4218,17 @@ class MainWindow(QMainWindow):
             # 人の窓〔ナレーションを作る…〕で声を作っている途中（#335） 再起動すると作った声を捨てる
             found.append("ナレーションの声を作っています")
         return found
+
+    def update_waits(self) -> list[str]:
+        """更新のための再起動を、断らずに終わりを待ってから進めてよい作業（#528）
+
+        AI の部品の自動更新は本人が頼んだ物ではなく、裏で数十秒で終わる 断ると、何も
+        していないつもりの人に何を待てばよいか分からない窓を出す 終わると
+        ``ChatPanel.parts_settled`` が出て、入れ替えの続きへ進む
+        """
+        if self._chat.updating_parts:
+            return ["AI の部品を裏で新しくしています（数十秒で終わります）"]
+        return []
 
     def _close_for_update(self) -> bool:
         """更新のために閉じる 保存の確認は入れ替え係を起こす前に済ませてあるので尋ねない
