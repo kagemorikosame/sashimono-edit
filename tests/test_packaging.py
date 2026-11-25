@@ -1193,6 +1193,47 @@ class TestOnlyRecordedFilesGoIn:
         assert found == ["_internal/leftover.dll"]
 
 
+class TestTheBundleRecord:
+    """積んだファイルごとの出どころの記録（部品の一覧 tools/sbom.py の元 #517）"""
+
+    def test_each_placed_file_has_its_owner(self, builder: ModuleType, tmp_path: Path) -> None:
+        """出どころを組み立ての記録から書く zip の中身から推すと、当てはめに漏れが出る
+
+        外した部品（記録にあるがフォルダに無い物）はファイルに書かない 包みは写しを集めるのと
+        同じく exe の中の書庫（PYZ）の物も数える 数え方が違うと写しのフォルダと食い違う
+        """
+        import sys
+
+        distribution = _distribution(tmp_path / "venv", ["LICENSE"], ["LICENSE"])
+        record = tmp_path / "record"
+        record.mkdir()
+        python = Path(sys.base_prefix) / "python314.dll"
+        gone = tmp_path / "venv" / "sample" / "gone.dll"
+        module = tmp_path / "venv" / "sample" / "__init__.py"
+        entries = [
+            ("Sashimono.exe", str(record / "Sashimono.exe"), "EXECUTABLE"),
+            ("python314.dll", str(python), "BINARY"),
+            ("sample\\gone.dll", str(gone), "BINARY"),
+        ]
+        (record / "COLLECT-00.toc").write_text(repr((entries,)), encoding="utf-8")
+        pyz = (str(record / "PYZ-00.pyz"), [("sample", str(module), "PYMODULE")])
+        (record / "PYZ-00.toc").write_text(repr(pyz), encoding="utf-8")
+        bundle = tmp_path / "Sashimono"
+        (bundle / "_internal").mkdir(parents=True)
+        (bundle / "Sashimono.exe").write_bytes(b"MZ")
+        (bundle / "_internal" / "python314.dll").write_bytes(b"MZ")
+        owners = {builder._key(gone): distribution, builder._key(module): distribution}
+        data = builder.bundle_record(bundle, record, owners=owners)
+        assert data["files"] == {"Sashimono.exe": "build", "_internal/python314.dll": "python"}
+        packages = data["packages"]
+        assert isinstance(packages, dict)
+        assert packages["sample"] == {"name": "sample", "version": "1.0"}
+        path = builder.write_bundle_record(bundle, data)
+        assert path.name == builder.BUNDLED_FILES_NAME
+        # 置いた記録は zip に入れてよい物（組み立ての記録に無いと言って止めない）
+        assert builder.untracked_files(bundle, record) == []
+
+
 class TestTheUnpackedCopiesAreTheSame:
     def test_a_broken_copy_is_found(self, builder: ModuleType, tmp_path: Path) -> None:
         """展開した zip の写しが、組み立てたときの物と同じか

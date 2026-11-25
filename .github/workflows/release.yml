@@ -57,7 +57,18 @@ jobs:
           zips=(package/SashimonoEdit-*-windows-x64.zip)
           if [ "${#zips[@]}" -ne 1 ]; then echo "組み立てた zip が 1 つでない"; exit 1; fi
           zip="${zips[0]}"
-          echo "SHA-256: $(sha256sum "$zip" | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
+          digest=$(sha256sum "$zip" | cut -d' ' -f1)
+          echo "SHA-256: $digest" >> "$GITHUB_STEP_SUMMARY"
+          # 部品の一覧（SBOM #517）は zip と同じ組み立てで作った物だけを上げる 頭に書いた zip の
+          # SHA-256 が違えば別の zip の一覧なので、zip ごと上げずに止める（誤った一覧を配らない）
+          bom=package/SashimonoEdit-windows-x64.cdx.json
+          if [ ! -f "$bom" ]; then echo "::error::部品の一覧（SBOM）が無い"; exit 1; fi
+          listed=$(jq -r '.metadata.component.hashes[] | select(.alg == "SHA-256") | .content' "$bom")
+          if [ "$listed" != "$digest" ]; then
+            echo "::error::部品の一覧の zip の SHA-256 が組み立てた zip と違う"
+            exit 1
+          fi
+          echo "SBOM SHA-256: $(sha256sum "$bom" | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
           if info=$(gh release view "$TAG" --json isDraft,assets 2>/dev/null); then
             # 公開済みのリリースの zip を差し替えない 組み立て直した zip は SHA-256 が変わり、
             # 署名済みの update.json と食い違って、全員の自動更新が照合で止まる
@@ -122,4 +133,4 @@ jobs:
             gh release create "$TAG" --draft --verify-tag --title "Sashimono Edit $TAG" \
               --notes-file "$notes" "${pre[@]}"
           fi
-          gh release upload "$TAG" "$zip" --clobber
+          gh release upload "$TAG" "$zip" "$bom" --clobber
