@@ -101,7 +101,10 @@ __all__ = [
     "export_chapters",
     "export_project",
     "has_sound",
+    "place_export",
+    "scratch_beside",
     "write_chapters",
+    "write_export",
 ]
 
 #: 合成の先へ何枚ぶん進めてよいか（0 で直列）
@@ -529,45 +532,71 @@ def export_project(
     :class:`ExportError` を投げる 中途半端なファイルを残すと、書き出せたのか
     どうかが分からなくなる
 
-    書き出し先の隣の仮のファイルへ書き、書き上げてから名前を付け替える（PR #547 の指摘）
-    書き出し先へ直に書くと、開いた所で前のファイルが空になり、中止や失敗で消すと前に書き出した
-    物まで失う 仮のファイルは拡張子を残す（入れ物と章を拡張子で決めている）
-    同じフォルダに置くのは、付け替えをドライブを跨がない名前の付け替えで済ませるため
+    書き出し先の隣の仮のファイル（:func:`scratch_beside`）へ書き（:func:`write_export`）、
+    書き上げてから名前を付け替える（:func:`place_export` PR #547 の指摘） 書き出し先へ直に
+    書くと、開いた所で前のファイルが空になり、中止や失敗で消すと前に書き出した物まで失う
+    別のプロセスの書き出し（``export_job``）も同じ 3 つを使う 親が仮の名前を決めて子に
+    :func:`write_export` で書かせ、子が落ちても親が知っている仮のファイルを消せる
+    子の中でもう 1 つ仮のファイルを作ると、子が落ちたときに親の知らない書きかけが残る
     """
     target = settings.path
     # 知らない拡張子は仮のファイルを作る前に断る 仮の名前で断ると、どの名前が悪いのか分からない
     _format(settings)
     target.parent.mkdir(parents=True, exist_ok=True)
-    scratch = target.with_name(f".{target.stem}.{uuid.uuid4().hex[:8]}.writing{target.suffix}")
+    scratch = scratch_beside(target)
     try:
-        _export_to(
+        write_export(
             project,
             replace(settings, path=scratch),
             progress=progress,
             should_cancel=should_cancel,
             notice=notice,
         )
-        try:
-            scratch.replace(target)
-        except OSError as exc:
-            raise ExportError(f"書き出したファイルを置き換えられない: {target} ({exc})") from exc
+        place_export(scratch, target, should_cancel)
     except BaseException:
         scratch.unlink(missing_ok=True)
         raise
     return target
 
 
-def _export_to(
+def scratch_beside(target: Path) -> Path:
+    """書き出しの仮のファイル 書き出し先と同じフォルダに、同じ拡張子で置く
+
+    同じフォルダに置くのは、置き換えをドライブを跨がない名前の付け替えで済ませるため
+    拡張子を残すのは、入れ物の形とチャプターを埋めるかを拡張子で決めているため
+    名前に毎回違う印を入れ、同じフォルダの別の書き出しの仮のファイルと取り合わない
+    """
+    return target.with_name(f".{target.stem}.{uuid.uuid4().hex[:8]}.writing{target.suffix}")
+
+
+def place_export(scratch: Path, target: Path, should_cancel: Callable[[], bool] | None) -> None:
+    """書き上げた仮のファイルを書き出し先の名前へ付け替える 付け替える直前にも中止を見る
+
+    書き出しの終わりの吐き出し（エンコーダに溜まった分）の間に押された中止を見ないと、
+    中止したのに前のファイルが新しい物に置き換わり「書き出しました」とも出ない（PR #547 の指摘）
+    中止や付け替えられないときは :class:`ExportError` 仮のファイルを消すのは呼んだ側
+    """
+    if should_cancel is not None and should_cancel():
+        raise ExportError("書き出しを中止した")
+    try:
+        scratch.replace(target)
+    except OSError as exc:
+        raise ExportError(f"書き出したファイルを置き換えられない: {target} ({exc})") from exc
+
+
+def write_export(
     project: Project,
     settings: ExportSettings,
     *,
-    progress: Callable[[float], None] | None,
-    should_cancel: Callable[[], bool] | None,
-    notice: Callable[[str], None] | None,
+    progress: Callable[[float], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    notice: Callable[[str], None] | None = None,
 ) -> Path:
-    """:func:`export_project` の中身 ``settings.path`` は仮のファイル
+    """``settings.path`` へ直に書き出す 普通は :func:`export_project` を使う
 
-    中止や失敗のときは書きかけ（仮のファイル）を消してから投げる
+    ``settings.path`` は呼んだ側が用意した仮のファイル（:func:`scratch_beside`）
+    中止や失敗のときは書きかけを消してから投げる 書き上げた物の付け替えは呼んだ側
+    （:func:`place_export`）
 
     コーデックを名指ししない書き出しで、候補のエンコーダが開けなかったり途中で書けなく
     なったりしたら、次の候補で最初から書き出し直す 書き上げたら、何で書いたかを ``notice``

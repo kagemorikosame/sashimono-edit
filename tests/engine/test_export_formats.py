@@ -356,6 +356,25 @@ class TestAudioOnly:
         assert target.read_bytes() == b"before"
         assert sorted(item.name for item in tmp_path.iterdir()) == [name]
 
+    def test_a_cancel_after_the_last_frame_keeps_the_previous_file(
+        self, project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """壊れると、吐き出しの間に押した中止を見ずに、前のファイルを新しい物へ置き換える"""
+        target = tmp_path / "out.wav"
+        target.write_bytes(b"before")
+        cancelled: list[bool] = []
+
+        def written(_project: Project, settings: ExportSettings, **_kwargs: object) -> Path:
+            settings.path.write_bytes(b"after")
+            cancelled.append(True)  # 書き終えた直後に中止が押された
+            return settings.path
+
+        monkeypatch.setattr(exporter, "write_export", written)
+        with pytest.raises(ExportError, match="中止"):
+            export_project(project, _settings(target), should_cancel=lambda: bool(cancelled))
+        assert target.read_bytes() == b"before"
+        assert sorted(item.name for item in tmp_path.iterdir()) == ["out.wav"]
+
     def test_cancel_leaves_no_file(self, project: Project, tmp_path: Path) -> None:
         """壊れると、中止した書きかけの音のファイルが残り、書けたのかが分からない"""
         target = tmp_path / "out.wav"

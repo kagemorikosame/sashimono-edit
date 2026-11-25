@@ -10930,6 +10930,15 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
             "始めてください"
         )
     path = _write_target(host, raw)
+    # 書く先はリンクを辿った後の場所 形式も辿った後の名前で決まる（書き出しの係はそちらで書く）
+    # 名前とリンク先で形式が違えば断る 名前の形式で確かめて箱に出し、リンク先へ別の形式で
+    # 書くと、許した物と書いた物が食い違う（PR #547 の指摘）
+    resolved = format_of(path)
+    if resolved is None or resolved.key != chosen.key:
+        raise ToolError(
+            f"書き出す名前（{Path(str(raw).strip()).suffix}）とリンク先（{path.suffix}）で"
+            "形式が違います リンクではない名前を渡してください"
+        )
     whole = host.document.project
     raw_scene = arguments.get("scene_id")
     scene_id = SceneId(str(raw_scene)) if raw_scene else None

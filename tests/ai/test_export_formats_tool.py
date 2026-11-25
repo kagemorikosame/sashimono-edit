@@ -121,6 +121,27 @@ def test_webm_auto_without_vp9_is_refused(saved: FakeHost, monkeypatch: pytest.M
     assert saved.exports == []
 
 
+@WINDOWS_WRITES
+@pytest.mark.usefixtures("sounding")
+def test_a_link_to_another_format_is_refused(
+    saved: FakeHost, codecs: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、MP3 の名前で確かめを出し、リンク先の MP4 へ書く（許した物と書いた物が違う）
+
+    ファイルへのリンクは Windows では権限が要るので、リンクを辿った後の場所を返す所を差し替える
+    """
+    del codecs
+    assert saved.saved_at is not None
+    video = saved.saved_at.parent / "本編.mp4"
+    link = saved.saved_at.parent / "音.mp3"
+    monkeypatch.setattr(operations, "_write_target", lambda _host, _raw: video)
+    bridge = allow_sending(EditorBridge(saved, auto_approve=True))
+    seen, box = _run(bridge, EXPORT, {"path": str(link)})
+    assert seen == []
+    assert "リンク先" in str(box.get("error"))
+    assert saved.exports == []
+
+
 def test_a_project_without_sound_is_refused_for_audio_only(
     saved: FakeHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:

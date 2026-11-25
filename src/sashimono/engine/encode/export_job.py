@@ -18,7 +18,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +31,9 @@ from sashimono.engine.encode.exporter import (
     ExportError,
     ExportSettings,
     export_project,
+    place_export,
+    scratch_beside,
+    write_export,
 )
 from sashimono.engine.encode.formats import DEFAULT_FORMAT, format_named, format_of
 from sashimono.engine.encoders import (
@@ -164,7 +166,9 @@ def export_job(
             raise RuntimeError(f"{GL_UNAVAILABLE_MARK}: {exc}") from exc
     notes: list[str] = []
     try:
-        path = export_project(
+        # 親が決めた仮のファイルへ直に書く ここで export_project を使うと、子の中でもう 1 つ
+        # 仮のファイルを作り、子が落ちたときに親の知らない書きかけが残る（PR #547 の指摘）
+        path = write_export(
             project,
             settings,
             progress=progress,
@@ -198,19 +202,6 @@ def _discard(path: Path) -> None:
     """子の仮のファイルを消す 消せなくても元の失敗を隠さない"""
     with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
-
-
-def _scratch_for(target: Path) -> Path:
-    """子が書く仮のファイル 書き出し先と同じフォルダに、同じ拡張子で置く
-
-    子は書き出し先へ直には書かない 子が落ちた・取り消しの猶予を過ぎて止めたときは子の中の
-    後片付けが走らないので、直に書くと途中で切れた動画が利用者の選んだ場所に残る 親が
-    書き出し先を消せば、まだ書き始めてもいないのに前からあったファイルまで消える 仮の
-    ファイルに書かせて、終わったときだけ置き換える
-    同じフォルダに置くのは、置き換えをドライブを跨がない名前の付け替えで済ませるため
-    拡張子を残すのは、入れ物の形とチャプターを埋めるかを拡張子で決めているため
-    """
-    return target.with_name(f".{target.stem}.{uuid.uuid4().hex[:8]}.writing{target.suffix}")
 
 
 def export_anywhere(
@@ -250,7 +241,10 @@ def export_anywhere(
                 names.append(named)
             probes = probe_and_remember(names)
         target = settings.path
-        scratch = _scratch_for(target)
+        # 子は書き出し先へ直には書かない 子が落ちた・取り消しの猶予を過ぎて止めたときは子の中の
+        # 後片付けが走らないので、直に書くと途中で切れた動画が利用者の選んだ場所に残る 親が
+        # 仮の名前を決めて子に書かせ、終わったときだけ置き換える 子が落ちても親が消せる
+        scratch = scratch_beside(target)
         try:
             outcome = run_in_process(
                 export_job,
@@ -293,12 +287,11 @@ def export_anywhere(
                 raise ExportError(outcome.error)
             try:
                 # run_in_process は子が終わるまで待ってから戻るので、子はもうファイルを掴んでいない
-                scratch.replace(target)
-            except OSError as exc:
+                # 付け替える直前の中止も見る（同じプロセスの書き出しと同じ place_export）
+                place_export(scratch, target, should_cancel)
+            except ExportError:
                 _discard(scratch)
-                raise ExportError(
-                    f"書き出したファイルを置き換えられない: {target} ({exc})"
-                ) from exc
+                raise
             if notice is not None:
                 for note in outcome.notes:
                     notice(note)
