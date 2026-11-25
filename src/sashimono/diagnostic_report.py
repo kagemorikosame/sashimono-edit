@@ -38,8 +38,9 @@ from sashimono.runtime import is_frozen
 from sashimono.stall_summary import default_paths, read, report, summarize
 from sashimono.stall_watch import program_place
 from sashimono.ui.report_masking import (
+    mask_error_record,
+    mask_fault_record,
     mask_places,
-    mask_record_text,
     mask_report,
     mask_secrets,
 )
@@ -114,7 +115,8 @@ def gather(log: FaultLog) -> Gathered:
     stalls = ""
     try:
         unread: list[Path] = []
-        records = read(default_paths(), unread=unread)
+        skipped: list[Path] = []
+        records = read(default_paths(), unread=unread, skipped=skipped)
         if records:
             stalls = report(summarize(records), top=STALL_TOP)
         # 読む側は無いファイルも読めなかった物に数える 1 世代前は無いのが普通なので、
@@ -122,7 +124,9 @@ def gather(log: FaultLog) -> Gathered:
         problems.extend(
             f"画面の止まりの記録を読めなかった: {path.name}" for path in unread if path.exists()
         )
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        if skipped:
+            problems.append(f"画面の止まりの記録で形の違う行を {len(skipped)} 行飛ばした")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         problems.append(f"画面の止まりの記録を読めなかった: {type(exc).__name__}")
     errors: list[str] = []
     unread_errors: list[Path] = []
@@ -140,8 +144,8 @@ def gather(log: FaultLog) -> Gathered:
     problems.extend(f"落ちた起動の記録を読めなかった: {path.name}" for path in unread_sessions)
     # 前の起動の記録は、今の作品から作る伏せる表に無い名前と本文を含みうる 例外の文が名前と
     # 本文を入れる形（囲んだ文・名前と拡張子の語）を、集めた所で伏せる（PR #550 の指摘）
-    errors = [mask_record_text(entry, TEXT_MARK) for entry in errors]
-    lost = [replace(session, text=mask_record_text(session.text, TEXT_MARK)) for session in lost]
+    errors = [mask_error_record(entry, TEXT_MARK) for entry in errors]
+    lost = [replace(session, text=mask_fault_record(session.text, TEXT_MARK)) for session in lost]
     return Gathered(stalls, tuple(errors), tuple(lost), tuple(problems))
 
 
@@ -159,10 +163,32 @@ def preference_lines(preferences: Mapping[str, Any]) -> list[str]:
             lines.append(f"  {key}: {json.dumps(value)}")
         elif isinstance(value, str):
             # 空の置き場は「既定」 値を伏せた欄は印のまま（選んであることだけ分かる）
-            lines.append(f"  {key}: {value if value else '（空 既定）'}")
+            # 選択肢の名前（dark h264 など）の形だけを写す 本人が名付けた物（プリセットの名前・
+            # 声の名前・URL）は形が決まらないので「設定あり」にする
+            # （伏せる物を探さず、残す形を決める）
+            if not value:
+                shown = "（空 既定）"
+            elif value == PATH_MARK or _CHOICE.fullmatch(value):
+                shown = value
+            else:
+                shown = "（設定あり）"
+            lines.append(f"  {key}: {shown}")
         else:
-            lines.append(f"  {key}: {'（有り）' if value else '（無し）'}")
+            lines.append(f"  {key}: {'（有り）' if _has_content(value) else '（無し）'}")
     return lines
+
+
+#: 設定の文字の値で、そのまま写してよい形（選択肢の名前）
+_CHOICE = re.compile(r"[A-Za-z0-9_.:+\-]{1,40}")
+
+
+def _has_content(value: object) -> bool:
+    """並びや辞書に中身があるか 中が全部空の辞書（何も決めていない編集の方針）は無しと数える"""
+    if isinstance(value, Mapping):
+        return any(_has_content(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_has_content(item) for item in value)
+    return bool(value)
 
 
 def build_report(
@@ -257,15 +283,16 @@ def mask(
     4. 場所（置き場の印の下 ``%USERPROFILE%\Videos\旅行 1 日目.mp4`` とドライブ名・UNC の場所）を
        空白で止めずに伏せる 形で拾う伏せ方は空白で止まり、名前の後ろが残る
     5. 素材の名前の表と、表に無い残りの絶対の場所
-    6. 秘密（API の鍵・トークン） 名前の表より前にも 1 度伏せる（表が鍵の名前を消すため）
+    6. 秘密（API の鍵・トークン） 1 の直後にも伏せる 2 と 5 が鍵の名前を印に変えると、
+       名前で見つける伏せ方が値を見つけられないため 最後にもう 1 度（伏せた後にできた形のため）
     """
     text = program_paths(text)
+    # 秘密は何より先に伏せる 後の伏せ方（字幕と文字・名前の表）が鍵の名前（password など）を
+    # 印に変えると、名前で見つける秘密の伏せ方が値を見つけられない（PR #550 の指摘が 2 回）
+    text = mask_secrets(text)
     text = str(hide_text(text, sorted(set(texts), key=len, reverse=True), labels=False))
     text = mask_report(text, folders=folders)
     text = mask_places(text, PATH_MARK)
-    # 秘密は名前の表より先に伏せる 素材や作品の名前が鍵の名前（password など）と同じだと、
-    # 表が鍵の名前を消し、後の秘密の伏せ方が値を見つけられない（PR #550 の指摘）
-    text = mask_secrets(text)
     text = str(redact(text, names))
     return mask_secrets(text)
 

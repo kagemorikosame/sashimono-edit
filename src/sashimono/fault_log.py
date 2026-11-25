@@ -56,6 +56,8 @@ MAX_LOG_BYTES = 1024 * 1024
 #: 残しておく落ちた起動の数 古い物から消す 毎回落ちる機械でも溜まり続けない
 KEEP_LOST = 5
 #: エラーの記録の 1 件の頭 ``=== 2026-11-24T12:00:00`` の前で切る
+#: 起動ごとの記録の頭の行（:meth:`FaultLog.install` が書く形）
+_SESSION_HEAD = re.compile(r"起動 (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) 版 ([0-9A-Za-z.+\-]+)")
 _ENTRY_HEAD = re.compile(r"^(?==== \d{4}-\d{2}-\d{2}T)", re.MULTILINE)
 
 
@@ -77,8 +79,15 @@ class LostSession:
 
 
 def _rotate(path: Path) -> None:
-    if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
-        path.replace(path.with_suffix(path.suffix + ".1"))
+    """大きくなった記録を 1 世代前へ回す 回せなくても上げない
+
+    2 つ目の窓が同じ記録を開いている間は、Windows では名前を変えられない 上げると、
+    回せなかっただけで記録を書くこと（:meth:`FaultLog.record_error`）や記録の係を掛けること
+    （:meth:`FaultLog.install`）まで止まる 回すのは次の機会でよい
+    """
+    with contextlib.suppress(OSError):
+        if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
+            path.replace(path.with_suffix(path.suffix + ".1"))
 
 
 class FaultLog:
@@ -110,7 +119,9 @@ class FaultLog:
         try:
             self.sessions.mkdir(parents=True, exist_ok=True)
             _rotate(self.errors_path)
-            self._forget_old()
+            # 古い記録を片付けられなくても掛ける 片付けは次の起動でもできる
+            with contextlib.suppress(OSError):
+                self._forget_old()
             # 持ち主がいることを錠で示す 中身（プロセス番号）では見分けない 番号は使い回される
             self._lock = try_hold(self.sessions / f"{mark}.lock")
             path = self.sessions / f"{mark}.log"
@@ -248,9 +259,13 @@ class FaultLog:
             return []
         found: list[LostSession] = []
         for path in sorted(self.sessions.glob("*.log"), key=lambda path: path.name):
-            if path == self.session_path or self._alive(path):
+            if path == self.session_path:
                 continue
             try:
+                # 動いているかを確かめられない記録（錠を見られない）は読めなかった物に数える
+                # 上げると、ほかの落ちた起動の記録まで集められない
+                if self._alive(path):
+                    continue
                 text = path.read_text(encoding="utf-8", errors="replace")
             except FileNotFoundError:
                 continue
@@ -259,9 +274,10 @@ class FaultLog:
                     unread.append(path)
                 continue
             head, _, rest = text.partition("\n")
-            parts = head.split()
-            started = parts[1] if len(parts) >= 4 and parts[0] == "起動" else path.stem
-            version = parts[3] if len(parts) >= 4 and parts[2] == "版" else "不明"
+            # 頭の行は決まった形のときだけ読む 形が違えば（壊れた・手で書き換えた）中身を写さない
+            shape = _SESSION_HEAD.fullmatch(head.strip())
+            started = shape.group(1) if shape else path.stem
+            version = shape.group(2) if shape else "不明"
             found.append(LostSession(started=started, version=version, text=rest.strip()))
         return found
 

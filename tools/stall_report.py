@@ -92,9 +92,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paths = args.paths or default_paths()
     unread: list[Path] = []
+    skipped: list[Path] = []
     records = [
         record
-        for record in read(paths, unread=unread)
+        for record in read(paths, unread=unread, skipped=skipped)
         if float(record["stall_ms"]) >= args.min_ms
         and (args.since is None or str(record.get("time", "")) >= args.since)
     ]
@@ -103,6 +104,9 @@ def main(argv: list[str] | None = None) -> int:
         # 気付けない 既定の場所の .1 は無いのが普通なので、そちらは黙る
         for path in unread:
             print(f"読めなかった: {path}", file=sys.stderr)
+    if skipped:
+        # 欄の型が違う行は数えずに飛ばす 黙ると、記録より止まりが少なく見える理由が分からない
+        print(f"形の違う行を {len(skipped)} 行飛ばした", file=sys.stderr)
     print(report(summarize(records), top=args.top))
     return 0
 

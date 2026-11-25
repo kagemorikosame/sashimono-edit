@@ -20,8 +20,9 @@ __all__ = [
     "HOME_PLACEHOLDER",
     "SECRET_MARK",
     "marked_root_labels",
+    "mask_error_record",
+    "mask_fault_record",
     "mask_places",
-    "mask_record_text",
     "mask_report",
     "mask_secrets",
     "mask_user_folders",
@@ -212,70 +213,144 @@ def mask_places(text: str, mark: str) -> str:
     return _PLACE.sub(one, text)
 
 
-#: 前の起動の記録で、そのまま残してよい行の形 どれもアプリと Python が決まった文で書く行で、
-#: 本人の文（素材の名前・字幕）は入らない ここに当たらない行は丸ごと伏せる
-_KEPT_LINES = tuple(
-    re.compile(pattern)
-    for pattern in (
-        # 記録の頭（``=== 時刻 版 0.2.7 スレッド 名前``） スレッドの名前はアプリが付ける
-        r"^=== \d{4}-\d{2}-\d{2}T[\d:]+ ",
-        r"^\s*Traceback \(most recent call last\):$",
-        r"^\s*(?:During handling of the above exception, another exception occurred"
-        r"|The above exception was the direct cause of the following exception):$",
-        # 並びの行 場所は後で本体の中の場所にし、名前は関数の名前
-        r'^\s*File "[^"]*", line \d+',
-        # 並びの印（Python 3.11 からの ``^^^^``）
-        r"^\s*[\^~]+\s*$",
-        # faulthandler が書く決まった行 致命的な例外の種類・スレッドの番号・部品の名前
-        r"^(?:Fatal Python error|Windows fatal exception): ",
-        r"^(?:Current thread|Thread) 0x[0-9a-fA-F]+ .*:$",
-        r"^\s*<no Python frame>$",
-        r"^Extension modules: ",
-    )
+#: 前の起動の記録を伏せる作り（#516 PR #550 の CodeRabbit の指摘が 4 回）
+#:
+#: 名前や字幕の形を探して伏せる作りは、囲みの中の ``\'``・空白を含む名前・囲みも拡張子も無い文と、
+#: 見直しのたびに漏れ道が見つかった 残してよい行の形を決めて、その形から**要る所だけを取り出して
+#: 組み直す** 行の残り（例外の本文・ソースの行・行末の続き）は写さない 当たらない行は丸ごと伏せる
+#: 記録は 2 つの形があり、混ぜると片方の決まった行の形が、もう片方の本文に紛れ込む（例外の本文に
+#: ``Extension modules:`` で始まる行があると残る） 形ごとに読み手を分ける
+#:
+#: - エラーの記録（``errors.log`` Python の ``traceback`` の形）：記録の頭・``Traceback`` と連鎖の
+#:   決まった行・並びの行（場所・行の番号・関数の名前）・例外の行（種類と OS の番号）
+#: - 落ちた起動の記録（``faulthandler`` の形）：致命的な例外の種類・スレッドの番号・並びの行・
+#:   部品の名前の一覧
+#:
+#: ソースの行は写さない 外の部品の並びでも、例外の起きた行に本人の文が書かれていることがある
+
+#: 例外の種類と見なす名前の終わり これで終わらない名前の行（字幕の ``社長: こんにちは`` や
+#: ``Hello: world``）を例外の行として残さない 当たらない作り付けの例外は種類ごと伏せる
+_EXCEPTION_SUFFIXES = ("Error", "Exception", "Warning", "Interrupt", "Exit", "Iteration", "Group")
+
+_ERROR_HEAD = re.compile(
+    r"^=== (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) 版 ([0-9A-Za-z.+\-]+)"
+    r"(?: スレッド ([A-Za-z0-9_.\-]+))?"
 )
-#: 例外の行（``OSError: 本文``） 種類は残し、本文は伏せる 本文の頭の番号（``[Errno 2]``
-#: ``[WinError 5]``）は OS が決めた番号なので残す
-_EXCEPTION_LINE = re.compile(
-    r"^(\s*[A-Za-z_][\w.]*(?:: |:$))(\[(?:Errno|WinError) -?\d+\] )?(.*)$", re.ASCII
+_FIXED_ERROR_LINES = frozenset(
+    {
+        "Traceback (most recent call last):",
+        "During handling of the above exception, another exception occurred:",
+        "The above exception was the direct cause of the following exception:",
+    }
 )
+#: 並びの行 エラーの記録は ``, in 名前`` faulthandler は `` in 名前``
+_FRAME = re.compile(r'^(\s*)File "([^"\n]*)", line (\d+)(?:,? in ([\w<>.]+))?')
+_EXCEPTION = re.compile(
+    r"^(\s*)([A-Za-z_][A-Za-z0-9_.]*)(?:(:)(?: (\[(?:Errno|WinError) -?\d+\]))?(.*))?$", re.ASCII
+)
+_FATAL = re.compile(
+    r"^(Fatal Python error|Windows fatal exception): ([A-Za-z][A-Za-z ]{0,40})(.*)$"
+)
+_FAULT_CODE = re.compile(r"^Windows fatal exception: code (0x[0-9a-fA-F]+)$")
+_THREAD = re.compile(r"^(Current thread|Thread) (0x[0-9a-fA-F]+) \(most recent call first\):$")
+_FIXED_FAULT_LINES = re.compile(r"^\s*(?:<no Python frame>|Garbage-collecting)$")
+_MODULES = re.compile(r"^Extension modules: (.*)$")
+_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
 
 
-def mask_record_text(text: str, mark: str) -> str:
-    """前の起動の記録（エラーや落ちた時の並び）を、残してよい形の行だけ残して伏せる
+def _frame_line(found: re.Match[str], comma: bool) -> str:
+    indent, place, number, function = found.groups()
+    line = f'{indent}File "{place}", line {number}'
+    if function:
+        line += f"{',' if comma else ''} in {function}"
+    return line
 
-    今の作品から作る伏せる表には、前の起動で開いた素材の名前や字幕は入っていない 表を
-    起動をまたいで持つと、伏せたい物そのものを本人の置き場へ書き残すことになるので持たない
-    名前や字幕の形を探して伏せる作りは、囲みの中の ``\\'``・空白を含む名前・囲みも拡張子も
-    無い文と、レビューのたびに漏れ道が見つかった（PR #550 の CodeRabbit の指摘が 3 回）
-    探すのをやめ、アプリと Python が決まった文で書く行（:data:`_KEPT_LINES`）だけを残す
-    例外の行は種類と OS の番号だけを残して本文を伏せる 並びの行のすぐ後の字下げした行
-    （本体のソースの行）も残す それ以外の行は丸ごと伏せ、続けて伏せた行は 1 つにまとめる
+
+def _exception_line(line: str, mark: str) -> str | None:
+    """例外の行を種類と OS の番号だけにする 例外の行の形でなければ ``None``"""
+    found = _EXCEPTION.match(line)
+    if found is None:
+        return None
+    indent, kind, colon, number, body = found.groups()
+    if not kind.rsplit(".", 1)[-1].endswith(_EXCEPTION_SUFFIXES):
+        return None
+    if not colon:
+        return indent + kind
+    rest = f" {number}" if number else ""
+    return f"{indent}{kind}:{rest}" + (f" {mark}" if (body or "").strip() else "")
+
+
+def _hidden(lines: list[str], line: str, mark: str) -> None:
+    """伏せた印を足す 続けて伏せた行は 1 つにまとめる（何行あったかも本文の手掛かりになる）"""
+    indent = line[: len(line) - len(line.lstrip())]
+    if not (lines and lines[-1] == indent + mark):
+        lines.append(indent + mark)
+
+
+def mask_error_record(text: str, mark: str) -> str:
+    """エラーの記録（``errors.log`` の 1 件）を、決まった形から要る所だけを取り出して組み直す"""
+    lines: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            lines.append("")
+            continue
+        head = _ERROR_HEAD.match(line)
+        if head is not None:
+            time, version, thread = head.groups()
+            lines.append(f"=== {time} 版 {version}" + (f" スレッド {thread}" if thread else ""))
+            continue
+        if line.strip() in _FIXED_ERROR_LINES:
+            lines.append(line.rstrip())
+            continue
+        frame = _FRAME.match(line)
+        if frame is not None:
+            lines.append(_frame_line(frame, comma=True))
+            continue
+        exception = _exception_line(line, mark)
+        if exception is not None:
+            lines.append(exception)
+            continue
+        _hidden(lines, line, mark)
+    return "\n".join(lines)
+
+
+def mask_fault_record(text: str, mark: str) -> str:
+    """落ちた起動の記録（``faulthandler`` の書いた物）を組み直す
+
+    決まった形から要る所だけを取り出す（:func:`mask_error_record` と同じ考え方）
     """
     lines: list[str] = []
-    after_frame = False
     for line in text.splitlines():
-        if any(pattern.match(line) for pattern in _KEPT_LINES):
-            lines.append(line)
-            after_frame = line.lstrip().startswith('File "')
-            continue
-        if after_frame and line.startswith("    "):
-            # 並びの行の下のソースの行 本体のコードで、本人の文ではない
-            lines.append(line)
-            after_frame = False
-            continue
-        after_frame = False
-        found = _EXCEPTION_LINE.match(line)
-        if found is not None and not found.group(1).strip().startswith("==="):
-            head, number, body = found.group(1), found.group(2) or "", found.group(3)
-            lines.append(head + number + (mark if body.strip() else ""))
-            continue
         if not line.strip():
-            lines.append(line)
+            lines.append("")
             continue
-        indent = line[: len(line) - len(line.lstrip())]
-        if lines and lines[-1] == indent + mark:
+        code = _FAULT_CODE.match(line)
+        if code is not None:
+            lines.append(f"Windows fatal exception: code {code.group(1)}")
             continue
-        lines.append(indent + mark)
+        fatal = _FATAL.match(line)
+        if fatal is not None:
+            name, reason, rest = fatal.groups()
+            lines.append(f"{name}: {reason.strip()}" + (f" {mark}" if rest.strip() else ""))
+            continue
+        thread = _THREAD.match(line)
+        if thread is not None:
+            lines.append(f"{thread.group(1)} {thread.group(2)} (most recent call first):")
+            continue
+        frame = _FRAME.match(line)
+        if frame is not None:
+            lines.append(_frame_line(frame, comma=False))
+            continue
+        if _FIXED_FAULT_LINES.match(line):
+            lines.append(line.rstrip())
+            continue
+        modules = _MODULES.match(line)
+        if modules is not None:
+            # 部品の名前だけを並べ直す 名前の形でない物（数や括弧の中の続き）は写さない
+            names = [name for name in _MODULE_NAME.findall(modules.group(1)) if name != "total"]
+            lines.append("Extension modules: " + ", ".join(names))
+            continue
+        _hidden(lines, line, mark)
     return "\n".join(lines)
 
 

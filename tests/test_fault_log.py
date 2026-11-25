@@ -17,7 +17,7 @@ import pytest
 
 from sashimono import __version__
 from sashimono.core.io.locks import try_hold
-from sashimono.fault_log import KEEP_LOST, FaultLog
+from sashimono.fault_log import KEEP_LOST, MAX_LOG_BYTES, FaultLog
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -169,6 +169,30 @@ class TestLostSessions:
         assert lost.version == __version__
         # Python の外で止まった（強制終了など）ので、落ちた時の並びは無い
         assert lost.text == ""
+
+
+def test_an_error_is_kept_even_when_the_log_cannot_be_rotated(tmp_path: Path) -> None:
+    # 壊れると、2 つ目の窓が記録を開いていて回せないだけで、エラーを書かずに落とす
+    log = FaultLog(tmp_path, catch_faults=False)
+    log.errors_path.write_bytes(b"x" * (MAX_LOG_BYTES + 1))
+    # 1 世代前の名前をフォルダにして、名前を変えられなくする
+    log.errors_path.with_suffix(".log.1").mkdir()
+    try:
+        raise ValueError("回せない")
+    except ValueError:
+        kind, error, trace = sys.exc_info()
+        assert kind is not None and error is not None
+        log.record_error(kind, error, trace)
+    assert "ValueError: 回せない" in log.errors_path.read_text(encoding="utf-8")
+
+
+def test_a_session_head_of_the_wrong_shape_is_not_copied(tmp_path: Path) -> None:
+    # 壊れると、頭の行が壊れた・書き換えられた記録の中身が、起動の時刻や版として報告に写る
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "20261124-100000-1.log").write_text("起動 顧客 版 社外秘 続き\n", encoding="utf-8")
+    (lost,) = FaultLog(tmp_path).lost_sessions()
+    assert (lost.started, lost.version) == ("20261124-100000-1", "不明")
 
 
 def test_a_folder_that_cannot_be_written_does_not_stop_the_start(tmp_path: Path) -> None:

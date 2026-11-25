@@ -4242,9 +4242,20 @@ class MainWindow(QMainWindow):
         if saved is None:
             return
         # 保存した所を次に開く所にする 報告に添える物を同じ所へまとめられる
-        if str(saved.parent) != self._preferences.report_folder:
-            self._remember_preferences(replace(self._preferences, report_folder=str(saved.parent)))
-        self.statusBar().showMessage(f"診断情報を保存しました: {saved}", 10000)
+        # 設定を書けたときだけ覚える 先に覚えると、書けなかったときに次の保存で同じ所を
+        # 選んでも「もう覚えている」と見て書き直さない（PR #550 の指摘） 知らせは 1 つにまとめる
+        # （設定を書けなかった知らせを、保存の知らせで上書きしない）
+        message = f"診断情報を保存しました: {saved}"
+        folder = str(saved.parent)
+        if folder != self._preferences.report_folder:
+            changed = replace(self._preferences, report_folder=folder)
+            try:
+                PreferenceStore().save(changed)
+            except OSError as exc:
+                message += f"（保存した場所は設定に書けなかったので覚えていません: {exc}）"
+            else:
+                self._preferences = changed
+        self.statusBar().showMessage(message, 10000)
 
     def _open_link(self, url: str) -> None:
         # 既定のブラウザが決まっていない機械では開けない 黙ると押しても何も

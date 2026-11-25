@@ -109,10 +109,18 @@ class Summary:
     busy_threads: Counter[str] = field(default_factory=Counter)
 
 
-def read(paths: Iterable[Path], *, unread: list[Path] | None = None) -> list[dict[str, Any]]:
+def read(
+    paths: Iterable[Path],
+    *,
+    unread: list[Path] | None = None,
+    skipped: list[Path] | None = None,
+) -> list[dict[str, Any]]:
     """記録を読む 壊れた行（書いている最中に落ちた等）は飛ばす
 
-    読めなかったファイルは ``unread`` へ足す
+    読めなかったファイルは ``unread`` へ足す JSON としては読めても欄の型が違う行（記録の形が
+    変わった後・手で書き換えた後）も飛ばし、1 行ごとにそのファイルを ``skipped`` へ足す
+    通すと数える所（:func:`parse`）で落ち、同じファイルの正しい行も、診断情報のほかの記録も
+    集められなくなる（PR #550 の CodeRabbit の指摘）
     """
     records: list[dict[str, Any]] = []
     for path in paths:
@@ -129,10 +137,47 @@ def read(paths: Iterable[Path], *, unread: list[Path] | None = None) -> list[dic
                 record = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
-            if isinstance(record, dict) and "stall_ms" in record:
+            if not isinstance(record, dict) or "stall_ms" not in record:
+                continue
+            if _well_formed(record):
                 records.append(record)
+            elif skipped is not None:
+                skipped.append(path)
     records.sort(key=lambda record: str(record.get("time", "")))
     return records
+
+
+def _number(value: object) -> bool:
+    """数か（真偽は数に数えない JSON の true が 1 ms の止まりになる）"""
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _well_formed(record: dict[str, Any]) -> bool:
+    """:func:`parse` が読む欄の型が合っているか 省いた欄（``gc`` など）は合っていると見る"""
+    if not _number(record.get("stall_ms")):
+        return False
+    pauses = record.get("gc") or []
+    if not isinstance(pauses, list) or not all(
+        isinstance(pause, dict) and _number(pause.get("ms", 0)) for pause in pauses
+    ):
+        return False
+    samples = record.get("samples") or []
+    if not isinstance(samples, list) or not all(isinstance(sample, dict) for sample in samples):
+        return False
+    if samples:
+        threads = samples[0].get("threads", {})
+        if not isinstance(threads, dict) or not all(
+            isinstance(name, str)
+            and isinstance(lines, list)
+            and all(isinstance(line, str) for line in lines)
+            for name, lines in threads.items()
+        ):
+            return False
+    memory = record.get("memory_mb") or {}
+    if not isinstance(memory, dict):
+        return False
+    private = memory.get("private")
+    return private is None or _number(private)
 
 
 def parse(record: dict[str, Any]) -> Stall:

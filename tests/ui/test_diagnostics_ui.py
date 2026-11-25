@@ -118,6 +118,37 @@ class TestTheMenu:
         assert window._preferences.report_folder == str(target.parent)
         assert PreferenceStore().load().report_folder == str(target.parent)
 
+    def test_a_folder_that_could_not_be_remembered_is_tried_again(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # 壊れると、設定を書けなかったのに覚えたことになり、書けるようになってから同じ所へ
+        # 保存しても書き直さない 書けなかった知らせも保存の知らせで消える（PR #550 の指摘）
+        target = tmp_path / "報告" / "診断.txt"
+        target.parent.mkdir()
+
+        def save(self: DiagnosticDialog) -> int:
+            assert self.save_to(target)
+            return int(QDialog.DialogCode.Accepted)
+
+        monkeypatch.setattr(DiagnosticDialog, "exec", save)
+        real_save = PreferenceStore.save
+
+        def refuse(self: PreferenceStore, preferences: Preferences) -> None:
+            raise OSError("書けない")
+
+        monkeypatch.setattr(PreferenceStore, "save", refuse)
+        before = window._preferences.report_folder
+        window.create_diagnostics()
+        assert target.is_file()
+        assert window._preferences.report_folder == before
+        message = window.statusBar().currentMessage()
+        assert "診断情報を保存しました" in message and "覚えていません" in message
+
+        monkeypatch.setattr(PreferenceStore, "save", real_save)
+        window.create_diagnostics()
+        assert window._preferences.report_folder == str(target.parent)
+        assert PreferenceStore().load().report_folder == str(target.parent)
+
 
 class TestTheFolder:
     def test_a_missing_folder_falls_back(self, tmp_path: Path) -> None:

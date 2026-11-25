@@ -14,7 +14,7 @@ import pytest
 
 from sashimono import diagnostic_report
 from sashimono.ai.outbound import PATH_MARK, TEXT_MARK, file_secrets, secret_pairs
-from sashimono.core.model import Project
+from sashimono.core.model import Project, StyleGuide
 from sashimono.diagnostic_report import (
     Environment,
     Gathered,
@@ -29,8 +29,9 @@ from sashimono.fault_log import FaultLog, LostSession
 from sashimono.ui.report_masking import (
     HOME_PLACEHOLDER,
     SECRET_MARK,
+    mask_error_record,
+    mask_fault_record,
     mask_places,
-    mask_record_text,
     mask_secrets,
 )
 from sashimono.ui.workspace import Preferences
@@ -43,8 +44,11 @@ FOLDERS = [(HOME, HOME_PLACEHOLDER)]
 #: Windows だけなので、ほかの OS では Windows の形の入力を使う試験を飛ばす
 WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="Windows の場所の形を使う")
 
+#: 本体の置き場 並びの中の本体の場所は、ここの下にある物だけを本体の中の場所にする
+PACKAGE = Path(diagnostic_report.__file__).absolute().parent
+
 TRACE = rf"""Traceback (most recent call last):
-  File "{HOME}\Programs\Sashimono\_internal\sashimono\ui\main_window.py", line 12, in save
+  File "{PACKAGE}\ui\main_window.py", line 12, in save
   File "C:\Python313\Lib\pathlib.py", line 3, in open
 FileNotFoundError: [Errno 2] No such file or directory: '{HOME}\Videos\旅行 1 日目.mp4'
 """
@@ -128,7 +132,7 @@ class TestMask:
     @WINDOWS_ONLY
     def test_program_paths_only_touch_traces(self) -> None:
         # 並びの外の場所は削らない（伏せる側が伏せる） 削ると素材の名前だけが残る
-        text = r'File "C:\x\sashimono\app.py", line 1' + "\n" + r"C:\x\旅行.mp4"
+        text = f'File "{PACKAGE / "app.py"}", line 1' + "\n" + r"C:\x\旅行.mp4"
         assert program_paths(text) == 'File "sashimono/app.py", line 1' + "\n" + r"C:\x\旅行.mp4"
 
 
@@ -142,7 +146,7 @@ class TestPastRecords:
             "OSError: 社員旅行の記録.mp4 を読めない\n"
             "ValueError: 書体に無い字 「社長のあいさつ」 と 'secret plan.txt'\n"
         )
-        masked = mask_record_text(record, TEXT_MARK)
+        masked = mask_error_record(record, TEXT_MARK)
         assert "社員旅行" not in masked and "社長" not in masked and "secret plan" not in masked
         # 並びの行・版・部品の名前は残す
         assert '  File "sashimono/engine/decode/probe.py", line 3, in probe_media' in masked
@@ -171,38 +175,71 @@ class TestPastRecords:
         assert f"OSError: {TEXT_MARK}\n" in masked
         assert f"ImportError: {TEXT_MARK}\n" in masked
 
-    def test_only_the_kept_shapes_survive(self) -> None:
-        # 壊れると、囲みも拡張子も無い本文（顧客名 田中）や、例外の形でない行の字幕が残る
-        # 名前の形を探す作りは 3 回続けて漏れた（PR #550） 残してよい形だけを残す
+    def test_an_error_record_keeps_only_the_fixed_shapes(self) -> None:
+        # 壊れると、囲みも拡張子も無い本文（顧客名 田中）・例外の形でない行の字幕・ソースの行の
+        # 文字・決まった見出しで始まる本文の行が残る 名前の形を探す作りは 3 回続けて漏れた
+        # （PR #550） 決まった形から要る所だけを取り出して組み直す
         record = (
             "=== 2026-11-24T10:00:00 版 0.2.7 スレッド sashimono-encoder-probe\n"
             "Traceback (most recent call last):\n"
             '  File "sashimono/core/io/project.py", line 9, in load\n'
-            "    data = json.loads(text)\n"
+            '    raise ValueError("顧客 山田様")\n'
             "           ^^^^^^^^^^^^^^^^\n"
             "ValueError: 顧客名 田中\n"
             "社長のあいさつ\n"
-            "続きの字幕\n"
+            "Extension modules: 顧客名簿の続き\n"
+            "社長: こんにちは\n"
             "FileNotFoundError: [Errno 2] No such file or directory: 'x'\n"
-            "Windows fatal exception: access violation\n"
-            "Current thread 0x00001a2b (most recent call first):\n"
-            '  File "sashimono/engine/gpu/context.py", line 40 in make_current\n'
+            "Windows fatal exception: 顧客\n"
         )
-        masked = mask_record_text(record, TEXT_MARK)
-        assert "田中" not in masked and "社長" not in masked and "続きの字幕" not in masked
-        assert f"ValueError: {TEXT_MARK}" in masked
-        # 続けて伏せた行は 1 つにまとめる
-        assert f"ValueError: {TEXT_MARK}\n{TEXT_MARK}\nFileNotFoundError" in masked
-        assert f"FileNotFoundError: [Errno 2] {TEXT_MARK}" in masked
-        for kept in (
-            "スレッド sashimono-encoder-probe",
-            "    data = json.loads(text)",
-            "^^^^^^^^^^^^^^^^",
+        masked = mask_error_record(record, TEXT_MARK)
+        for gone in ("田中", "山田", "社長", "顧客", "^^^^"):
+            assert gone not in masked
+        assert masked.splitlines() == [
+            "=== 2026-11-24T10:00:00 版 0.2.7 スレッド sashimono-encoder-probe",
+            "Traceback (most recent call last):",
+            '  File "sashimono/core/io/project.py", line 9, in load',
+            # ソースの行と印は写さない 続けて伏せた行は 1 つにまとめる
+            f"    {TEXT_MARK}",
+            f"           {TEXT_MARK}",
+            f"ValueError: {TEXT_MARK}",
+            TEXT_MARK,
+            f"FileNotFoundError: [Errno 2] {TEXT_MARK}",
+            TEXT_MARK,
+        ]
+
+    def test_a_fault_record_keeps_only_the_fixed_shapes(self) -> None:
+        # 壊れると、落ちた時の記録の行の後ろに続いた文や、例外の本文に似た行が残る
+        record = (
+            "Windows fatal exception: access violation\n"
+            "Windows fatal exception: code 0xc0000005\n"
+            "Fatal Python error: Segmentation fault 顧客名\n"
+            "\n"
+            "Current thread 0x00001a2b (most recent call first):\n"
+            '  File "sashimono/engine/gpu/context.py", line 40 in make_current 顧客\n'
+            "  <no Python frame>\n"
+            "Extension modules: numpy.core._multiarray_umath, PySide6.QtCore 顧客 (total: 2)\n"
+            "ValueError: 社長\n"
+        )
+        masked = mask_fault_record(record, TEXT_MARK)
+        assert "顧客" not in masked and "社長" not in masked
+        assert masked.splitlines() == [
             "Windows fatal exception: access violation",
+            "Windows fatal exception: code 0xc0000005",
+            f"Fatal Python error: Segmentation fault {TEXT_MARK}",
+            "",
             "Current thread 0x00001a2b (most recent call first):",
             '  File "sashimono/engine/gpu/context.py", line 40 in make_current',
-        ):
-            assert kept in masked
+            "  <no Python frame>",
+            "Extension modules: numpy.core._multiarray_umath, PySide6.QtCore",
+            TEXT_MARK,
+        ]
+
+    def test_a_secret_is_hidden_even_when_a_subtitle_matches_its_key(self) -> None:
+        # 壊れると、字幕に password という文があると、字幕の伏せ方が鍵の名前を印に変え、
+        # 秘密の伏せ方が値を見つけられずに残す（PR #550 の指摘）
+        masked = mask("password: hunter2", texts=["password"], folders=FOLDERS)
+        assert "hunter2" not in masked
 
     def test_a_secret_is_hidden_even_when_a_name_matches_its_key(self) -> None:
         # 壊れると、作品の名前が password のとき、名前の表が鍵の名前を消し、値が残る
@@ -269,14 +306,25 @@ class TestReport:
         from dataclasses import asdict
 
         preferences = asdict(
-            Preferences(package_folder=r"D:\山田\packages", report_folder="", theme="light")
+            Preferences(
+                package_folder=r"D:\山田\packages",
+                report_folder="",
+                theme="light",
+                new_project_style_guide=StyleGuide(notes="社外秘の方針 顧客 A 社向け"),
+                subtitle_look_last="社長の字幕",
+            )
         )
         lines = "\n".join(preference_lines(preferences))
-        assert "山田" not in lines
+        for gone in ("山田", "社外秘", "顧客", "社長"):
+            assert gone not in lines
         assert f"package_folder: {PATH_MARK}" in lines
         assert "report_folder: （空 既定）" in lines
         assert "theme: light" in lines
-        assert "new_project_style_guide: （" in lines
+        # 方針は中身がある印だけ 本人が名付けた物は形が決まらないので「設定あり」
+        assert "new_project_style_guide: （有り）" in lines
+        assert "subtitle_look_last: （設定あり）" in lines
+        empty = "\n".join(preference_lines(asdict(Preferences())))
+        assert "new_project_style_guide: （無し）" in empty
 
     def test_the_file_name_has_the_time(self) -> None:
         # 壊れると、2 度作ったときに前の報告を上書きする
@@ -309,15 +357,56 @@ class TestGather:
         assert "落ちた起動の記録を読めなかった: 20261124-100000-1.log" in gathered.problems
 
     def test_stalls_are_counted_the_same_way_as_the_tool(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # 報告の表と、開発者が tools/stall_report.py で数えた表が食い違わない
+        # 報告の表と、開発者が tools/stall_report.py で数えた表が食い違わない 同じ記録を
+        # 道具の入口にも渡し、同じ数（場所の件数も報告と同じ）で出た表と比べる
+        import importlib.util
+
         stalls = tmp_path / "stalls.jsonl"
         stalls.write_text(
-            '{"time": "2026-11-24T10:00:00", "stall_ms": 120, "gc": [], "samples": []}\n壊れた行\n',
+            '{"time": "2026-11-24T10:00:00", "stall_ms": 120, "gc": [], "samples": []}\n'
+            '{"time": "2026-11-24T10:00:01", "stall_ms": 45.5}\n'
+            "壊れた行\n",
             encoding="utf-8",
         )
         monkeypatch.setattr(diagnostic_report, "default_paths", lambda: [stalls])
         gathered = gather(FaultLog(tmp_path, catch_faults=False))
-        assert gathered.stalls.startswith("止まり 1 回 合計 120 ms")
+        spec = importlib.util.spec_from_file_location(
+            "stall_report_for_parity",
+            Path(__file__).resolve().parents[1] / "tools" / "stall_report.py",
+        )
+        assert spec is not None and spec.loader is not None
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        capsys.readouterr()
+        assert tool.main([str(stalls), "--top", str(diagnostic_report.STALL_TOP)]) == 0
+        assert capsys.readouterr().out.strip() == gathered.stalls.strip()
+        assert gathered.stalls.startswith("止まり 2 回")
         assert gathered.problems == ()
+
+    def test_a_stall_line_of_the_wrong_shape_is_skipped_and_counted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、欄の型が違う 1 行で数える所が落ち、止まりの表もエラーと落ちた起動の記録も
+        # 集められない（PR #550 の指摘） 正しい行と、ほかの記録は集める
+        stalls = tmp_path / "stalls.jsonl"
+        stalls.write_text(
+            '{"time": "2026-11-24T10:00:00", "stall_ms": 120}\n'
+            '{"time": "2026-11-24T10:00:01", "stall_ms": 80, "gc": [0]}\n'
+            '{"time": "2026-11-24T10:00:02", "stall_ms": 80, "samples": "x"}\n'
+            '{"time": "2026-11-24T10:00:03", "stall_ms": 80, "memory_mb": 3}\n'
+            '{"time": "2026-11-24T10:00:04", "stall_ms": true}\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "errors.log").write_text(
+            "=== 2026-11-24T10:00:00 版 0.2.7\nOSError: x\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(diagnostic_report, "default_paths", lambda: [stalls])
+        gathered = gather(FaultLog(tmp_path, catch_faults=False))
+        assert gathered.stalls.startswith("止まり 1 回 合計 120 ms")
+        assert gathered.problems == ("画面の止まりの記録で形の違う行を 4 行飛ばした",)
+        assert len(gathered.errors) == 1
