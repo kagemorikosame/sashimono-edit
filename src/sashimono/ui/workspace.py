@@ -1275,6 +1275,15 @@ class PreferenceStore:
         _PREFERENCES_SEEN[_path_key(self.path)] = preferences
         return preferences
 
+    def stored(self) -> Preferences:
+        """書いてある設定を読むだけ :meth:`load` と違い、保存で変えた所を見分ける元を変えない
+
+        保存（:meth:`save`）は前に読んだ設定と比べて、変えた所だけを重ねる 比べるためだけに
+        :meth:`load` で読み直すと元が今の中身に替わり、画面の中で変えて書けていない所を
+        「変えていない」と見て書かなくなる（診断情報の保存の置き場 PR #550 の指摘）
+        """
+        return self._parse(self._read())
+
     def _read(self) -> dict[str, Any] | None:
         """書いてある中身 無い・壊れているなら ``None``"""
         try:

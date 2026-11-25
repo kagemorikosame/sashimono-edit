@@ -116,7 +116,7 @@ class TestTheMenu:
         window.create_diagnostics()
         assert target.read_text(encoding="utf-8") == "本人が直した中身"
         assert window._preferences.report_folder == str(target.parent)
-        assert PreferenceStore().load().report_folder == str(target.parent)
+        assert PreferenceStore().stored().report_folder == str(target.parent)
 
     def test_a_folder_that_could_not_be_remembered_is_tried_again(
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -147,7 +147,7 @@ class TestTheMenu:
         monkeypatch.setattr(PreferenceStore, "save", real_save)
         window.create_diagnostics()
         assert window._preferences.report_folder == str(target.parent)
-        assert PreferenceStore().load().report_folder == str(target.parent)
+        assert PreferenceStore().stored().report_folder == str(target.parent)
 
 
 class TestTheFolder:
@@ -181,6 +181,56 @@ def test_a_folder_only_in_memory_is_written(
         return int(QDialog.DialogCode.Accepted)
 
     monkeypatch.setattr(DiagnosticDialog, "exec", save)
-    assert PreferenceStore().load().report_folder != str(target.parent)
+    assert PreferenceStore().stored().report_folder != str(target.parent)
     window.create_diagnostics()
-    assert PreferenceStore().load().report_folder == str(target.parent)
+    assert PreferenceStore().stored().report_folder == str(target.parent)
+
+
+def test_a_folder_already_written_is_also_set_in_memory(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 壊れると、ファイルには A があり画面の中だけ B（書けなかった）のとき、A へ保存しても
+    # 画面の中が B のまま残り、次の保存の窓が B で開く（PR #550 の指摘）
+    written = tmp_path / "A"
+    written.mkdir()
+    PreferenceStore().save(replace(window._preferences, report_folder=str(written)))
+    window._preferences = replace(window._preferences, report_folder=str(tmp_path / "B"))
+    target = written / "診断.txt"
+
+    def save(self: DiagnosticDialog) -> int:
+        assert self.save_to(target)
+        return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(DiagnosticDialog, "exec", save)
+    window.create_diagnostics()
+    assert window._preferences.report_folder == str(written)
+
+
+def test_comparing_the_folder_does_not_reset_what_save_compares_with(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 壊れると、保存の置き場を比べるために設定を読み直した所で、保存が変えた所を見分ける元が
+    # ファイルの今の中身に替わる すると 2 つ目の窓が書いた設定（テーマ）を、この窓の古い値を
+    # 「変えた」と見て書き戻して消す（PR #550 の指摘）
+    target = tmp_path / "報告" / "診断.txt"
+    target.parent.mkdir()
+    assert window._preferences.theme != "light"
+    # 2 つ目の窓（別のプロセス）の代わりに、設定のファイルを直に書き換える
+    # 同じプロセスの読み手で書くと、見分ける元（プロセスの中で 1 つ）まで替わる
+    import json
+
+    store = PreferenceStore()
+    data = json.loads(store.path.read_text(encoding="utf-8")) if store.path.exists() else {}
+    data["theme"] = "light"
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(json.dumps(data), encoding="utf-8")
+
+    def save(self: DiagnosticDialog) -> int:
+        assert self.save_to(target)
+        return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(DiagnosticDialog, "exec", save)
+    window.create_diagnostics()
+    stored = PreferenceStore().stored()
+    assert stored.report_folder == str(target.parent)
+    assert stored.theme == "light"

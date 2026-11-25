@@ -250,7 +250,11 @@ _ERROR_HEAD = re.compile(
 #: 名前だけ 英数字の並びなら何でも通すと、頭の形をした本文の行の名前が写る（PR #550 の指摘と
 #: 同じ種類） 当たらない名前は写さない（スレッドの話は落とすが、伏せた印も要らない）
 _THREAD_NAME = re.compile(
-    r"MainThread|Thread-\d+|Dummy-\d+|ThreadPoolExecutor-\d+_\d+|sashimono-[A-Za-z0-9_.\-]{1,60}"
+    # アプリの名前は ``sashimono-`` と小文字の語と番号だけ（``sashimono-probe-3``
+    # ``sashimono-install-whisper``） 頭だけを見ると ``sashimono-CustomerA`` が通る
+    # （PR #550 の指摘と同じ種類）
+    r"MainThread|Thread-\d+|Dummy-\d+|ThreadPoolExecutor-\d+_\d+"
+    r"|sashimono(?:-[a-z]+)+(?:-\d+)?"
 )
 #: 例外の集まり（``ExceptionGroup``）の並びの印 枠の線の行はそのまま写し、``| `` の後ろは
 #: ふつうの行として読む 読まないと、場所と例外の種類まで伏せる（PR #550 の指摘）
@@ -432,9 +436,10 @@ def mask_fault_record(text: str, mark: str) -> str:
             items = [item.strip() for item in modules.group(1).split(",")]
             shown: list[str] = []
             for item in items:
-                # 形に加えて、頭の部品が今も読み込んであるかを見る 形だけだと英字の本文の語
-                # （``CustomerAlice``）が部品の名前として写る（例外の種類と同じ訳）
-                if _MODULE_NAME.fullmatch(item) and item.split(".", 1)[0] in sys.modules:
+                # 形に加えて、その名前の部品が今も読み込んであるかを名前の全体で見る 頭だけを見ると
+                # ``numpy.CustomerAlice`` が通り、形だけだと英字の本文の語が写る（PR #550 の指摘
+                # 例外の種類と同じ訳） 落ちた起動で読んでいて今は読んでいない部品は印になる
+                if _MODULE_NAME.fullmatch(item) and item in sys.modules:
                     shown.append(item)
                 elif not shown or shown[-1] != mark:
                     shown.append(mark)

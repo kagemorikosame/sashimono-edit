@@ -4254,14 +4254,20 @@ class MainWindow(QMainWindow):
         # 比べるのは書けた設定（ファイルの中） 画面の中の値と比べると、設定画面で変えて書けなかった
         # 置き場へ保存したときに「もう覚えている」と見て書き直さず、次の起動で前の置き場に戻る
         # （PR #550 の指摘）
-        if folder != PreferenceStore().load().report_folder:
-            changed = replace(self._preferences, report_folder=folder)
+        # 読み直しは比べるためだけ（``stored``） ``load`` で読むと、保存が変えた所を見分ける元が
+        # 替わり、画面の中で変えて書けていないほかの設定を書かなくなる（PR #550 の指摘）
+        changed = replace(self._preferences, report_folder=folder)
+        if folder != PreferenceStore().stored().report_folder:
             try:
                 PreferenceStore().save(changed)
             except OSError as exc:
                 message += f"（保存した場所は設定に書けなかったので覚えていません: {exc}）"
             else:
                 self._preferences = changed
+        else:
+            # ファイルにはもう書いてある 画面の中だけが別の所（設定画面で変えて書けなかった所）を
+            # 指していれば、保存した所にそろえる そろえないと次の保存の窓が別の所で開く
+            self._preferences = changed
         self.statusBar().showMessage(message, 10000)
 
     def _open_link(self, url: str) -> None:

@@ -218,7 +218,7 @@ class TestPastRecords:
             "Current thread 0x00001a2b (most recent call first):\n"
             '  File "sashimono/engine/gpu/context.py", line 40 in make_current 顧客\n'
             "  <no Python frame>\n"
-            "Extension modules: numpy.core._multiarray_umath, PySide6.QtCore 顧客 (total: 2)\n"
+            "Extension modules: PySide6.QtCore, PySide6.QtCore 顧客 (total: 2)\n"
             "ValueError: 社長\n"
         )
         masked = mask_fault_record(record, TEXT_MARK)
@@ -231,7 +231,7 @@ class TestPastRecords:
             "Current thread 0x00001a2b (most recent call first):",
             '  File "sashimono/engine/gpu/context.py", line 40 in make_current',
             "  <no Python frame>",
-            f"Extension modules: numpy.core._multiarray_umath, {TEXT_MARK} (total: 2)",
+            f"Extension modules: PySide6.QtCore, {TEXT_MARK} (total: 2)",
             TEXT_MARK,
         ]
 
@@ -243,7 +243,7 @@ class TestPastRecords:
             "Windows fatal exception: access violation\n"
             "Fatal Python error: Customer Alice wrote this\n"
             '  File "Customer Alice notes", line 3 in run\n'
-            "Extension modules: numpy.core._multiarray_umath, PySide6.QtCore Customer Alice"
+            "Extension modules: PySide6.QtCore, PySide6.QtCore Customer Alice"
             " (total: 2)\n"
         )
         masked = mask_fault_record(record, TEXT_MARK)
@@ -253,7 +253,7 @@ class TestPastRecords:
             "Windows fatal exception: access violation",
             f"Fatal Python error: {TEXT_MARK}",
             '  File "?", line 3 in run',
-            f"Extension modules: numpy.core._multiarray_umath, {TEXT_MARK} (total: 2)",
+            f"Extension modules: PySide6.QtCore, {TEXT_MARK} (total: 2)",
         ]
 
     def test_ascii_text_shaped_like_a_type_or_a_head_is_not_copied(self) -> None:
@@ -507,8 +507,11 @@ class TestSixthReview:
             f"sashimono.core.io.serialize.ProjectFileError: {TEXT_MARK}",
             "=== 2026-11-24T10:00:00 版 0.2.7",
         ]
-        faults = mask_fault_record("Extension modules: numpy.core, CustomerAlice (total: 2)", "印")
-        assert faults == "Extension modules: numpy.core, 印 (total: 2)"
+        faults = mask_fault_record(
+            "Extension modules: math, CustomerAlice, numpy.CustomerAlice (total: 3)", "印"
+        )
+        # 頭の部品（numpy）が読み込んであっても、名前の全体が無ければ写さない（PR #550 の指摘）
+        assert faults == "Extension modules: math, 印 (total: 3)"
 
     def test_an_exception_group_keeps_its_places_and_types(self) -> None:
         # 壊れると、例外の集まりの並びの印（|）のせいで、場所と例外の種類まで伏せる
@@ -550,3 +553,20 @@ class TestStallNumbers:
         assert gathered.stalls.startswith("止まり 1 回 合計 120 ms")
         assert "inf" not in gathered.stalls and "nan" not in gathered.stalls
         assert gathered.problems == ("画面の止まりの記録で形の違う行を 4 行飛ばした",)
+
+
+@pytest.mark.parametrize(
+    ("thread", "kept"),
+    [
+        ("sashimono-probe-3", True),
+        ("sashimono-install-whisper", True),
+        ("MainThread", True),
+        ("sashimono-CustomerA", False),
+        ("sashimono-", False),
+    ],
+)
+def test_only_the_apps_thread_names_are_copied(thread: str, kept: bool) -> None:
+    # 壊れると、頭（sashimono-）だけを見て、本文の行の名前（CustomerA）がスレッドの名前として写る
+    masked = mask_error_record(f"=== 2026-11-24T10:00:00 版 0.2.7 スレッド {thread}", TEXT_MARK)
+    assert (f"スレッド {thread}" in masked) is kept
+    assert masked.startswith("=== 2026-11-24T10:00:00 版 0.2.7")
