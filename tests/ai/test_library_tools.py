@@ -8,6 +8,7 @@ propose_direction が登録したフォルダの音を取り込んで使い、�
 
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -32,6 +33,7 @@ from sashimono.core.material_library import (
     Measure,
     MeasureBook,
     file_id,
+    set_category,
 )
 from sashimono.core.model import (
     AudioStreamInfo,
@@ -393,9 +395,21 @@ class TestFavorites:
 class TestMeasuringInTheBackground:
     def test_measuring_does_not_hold_the_editor(self, work: _LibraryHost) -> None:
         # 壊れると、測っていない音が 20 本あるだけで、道具が画面のスレッドで数秒止まる
+        # 測るのが編集画面のスレッドでないことを、測る関数が呼ばれたスレッドで確かめる
+        # （秒で測ると機械の速さで落ちる）
+        threads: list[int] = []
+        measure = work.material.measure
+        assert measure is not None
+
+        def recorded(path: Path) -> Measure | None:
+            threads.append(threading.get_ident())
+            return measure(path)
+
+        work.material = replace(work.material, measure=recorded)
         result = run(work, "search_library")
         assert isinstance(result, Pending)
         done = settle(result)
+        assert threads and threading.get_ident() not in threads
         assert {row["name"] for row in done["files"]} >= {"ドン.wav"}
         # 見て回るのも裏で行うので、いつも待つ形で返る 測り終えた物は測り直さない
         count = len(work.measured_calls)
@@ -457,3 +471,107 @@ class TestFourthReview:
         state = run(work, "get_direction_plan")
         used = next(item for item in state["items"] if item["number"] == first["number"])
         assert used["media_id"] == first["media_id"]
+
+
+class TestFifthReview:
+    def test_the_answer_follows_the_settings_after_waiting(
+        self, work: _LibraryHost, folders: dict[str, Path]
+    ) -> None:
+        # 壊れると、待つ間に BGM の自動を切ったのに「付けてよい」と返すか、後から子を効果音で
+        # 登録した素材を BGM として知らせる
+        work.material = replace(work.material, auto_bgm=True)
+        pending = run(work, "search_library", category=CATEGORY_MUSIC)
+        # 待つ間に BGM のフォルダを効果音として登録し直す（BGM の頼みには入らなくなる）
+        work.material = replace(
+            work.material,
+            auto_bgm=False,
+            folders=set_category(
+                work.material.folders, str(folders[CATEGORY_MUSIC]), CATEGORY_SOUND_EFFECT
+            ),
+        )
+        done = settle(pending)
+        assert done["auto_bgm"] is False
+        assert done["files"] == []
+
+    def test_an_unfinished_scan_is_not_an_empty_answer(
+        self, work: _LibraryHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、見て回るのが待つ上限に間に合わない大きな登録先で、毎回「素材が無い」と答える
+        release = threading.Event()
+        original = MaterialLibrary.scan_for_ai
+
+        def slow(library: MaterialLibrary) -> list[Any]:
+            release.wait()
+            return original(library)
+
+        monkeypatch.setattr(MaterialLibrary, "scan_for_ai", slow)
+        pending = run(work, "search_library")
+        assert isinstance(pending, Pending)
+        early = pending.then()
+        assert isinstance(early, dict) and early["scanning"] is True
+        # 呼び直すと同じ仕事を待つ（見て回り直さない）
+        again = run(work, "search_library")
+        assert isinstance(again, Pending)
+        release.set()
+        done = settle(again)
+        assert "scanning" not in done and done["files"]
+
+    def test_a_known_file_that_is_no_longer_allowed_is_refused_at_once(
+        self, work: _LibraryHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、使わせない設定にした音を置こうとしただけで、残りの登録先を全部見て回り直す
+        row = _file(work, "ドン.wav")
+        work.material = replace(work.material, ai_categories=(CATEGORY_MUSIC,))
+
+        def no_scan(_library: MaterialLibrary) -> list[Any]:
+            raise AssertionError("見て回り直した")
+
+        monkeypatch.setattr(MaterialLibrary, "scan_for_ai", no_scan)
+        with pytest.raises(ToolError, match="見つかりません"):
+            run(work, "place_sound", library_file_id=row["file_id"])
+
+
+class TestSelfReviewFive:
+    def test_a_category_that_is_not_text_is_refused(self, work: _LibraryHost) -> None:
+        # 壊れると、分類に配列を渡しただけで型の例外になり、道具ごと落ちる
+        with pytest.raises(ToolError):
+            run(work, "search_library", category=["sound_effect"])
+
+    def test_an_unknown_id_is_refused_without_scanning(
+        self, work: _LibraryHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、知らない印を 1 つ渡されただけで、画面のスレッドで登録先を全部見て回る
+        def no_scan(_library: MaterialLibrary) -> list[Any]:
+            raise AssertionError("見て回った")
+
+        monkeypatch.setattr(MaterialLibrary, "scan_for_ai", no_scan)
+        with pytest.raises(ToolError, match="search_library"):
+            run(work, "place_sound", library_file_id="lib_0000000000000000")
+
+    def test_a_refusal_does_not_carry_the_name_of_an_unimported_file(
+        self, work: _LibraryHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、取り込む前の素材の名前が断りの文に入り、名前を送らないと決めた人の所でも出る
+        row = _file(work, "ドン.wav")
+
+        def silent(path: Path) -> MediaItem:
+            return MediaItem(path=path, duration=Fraction(1))
+
+        monkeypatch.setattr(work, "probe", silent)
+        with pytest.raises(ToolError) as caught:
+            run(work, "place_sound", library_file_id=row["file_id"])
+        assert "ドン" not in str(caught.value)
+        assert row["file_id"] in str(caught.value)
+
+    def test_a_sound_replaced_after_the_plan_is_not_read_in(
+        self, work: _LibraryHost, folders: dict[str, Path]
+    ) -> None:
+        # 壊れると、計画の後で差し替えた長い音を、計画のときの短い長さのまま素材へ入れる
+        row = _file(work, "ドン.wav")
+        run(work, "propose_direction", cues=_cues(), sound_file_id=row["file_id"])
+        (folders[CATEGORY_SOUND_EFFECT] / "ドン.wav").write_bytes(b"replaced and longer")
+        before = len(work.document.project.media)
+        result = proposal_for(work.document).apply(work.document)
+        assert result is not None
+        assert result.skipped and all("変わった" in reason for _, reason in result.skipped)
+        assert len(work.document.project.media) == before

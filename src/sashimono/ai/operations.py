@@ -20,6 +20,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -50,6 +51,7 @@ from sashimono.ai.auto_fix import (
 from sashimono.ai.direction_plan import (
     ProposalView,
     build_items,
+    file_version,
     proposal_for,
     sound_problem,
 )
@@ -308,6 +310,7 @@ from sashimono.core.material_library import (
     CATEGORY_MUSIC,
     LibraryFile,
     MaterialLibrary,
+    MeasureBook,
     match_files,
 )
 from sashimono.core.mixing import (
@@ -2838,6 +2841,7 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
     if end <= start:
         raise ToolError("範囲（start_frame〜end_frame）が空です")
     sound = None
+    version: tuple[int, int] | None = None
     raw_sound = arguments.get("sound_media_id")
     raw_file = arguments.get("sound_file_id")
     if raw_sound and raw_file:
@@ -2846,7 +2850,10 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         sound = _require_media(project, str(raw_sound))
     elif raw_file:
         # 登録したフォルダの効果音（#522） 計画に出すだけで、取り込むのは人の〔付ける〕
-        sound, _ = _library_media(host, raw_file)
+        sound, fresh = _library_media(host, raw_file)
+        if fresh:
+            # 取り込むのは〔付ける〕のとき その間にファイルが差し替わったら付けない
+            version = file_version(sound.path)
     if sound is not None:
         problem = sound_problem(sound)
         if problem is not None:
@@ -2864,6 +2871,7 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         [ClipId(p.source) if p.source else None for p in planned],
         sound,
         end,
+        version,
     )
     view = proposal_for(host.document).propose(items, dropped, DIRECTION_STRENGTHS[taste.strength])
     note = (
@@ -3520,7 +3528,8 @@ def _library_category(library: MaterialLibrary, arguments: dict[str, Any]) -> st
     raw = arguments.get("category")
     if raw is None:
         return None
-    if raw not in LIBRARY_CATEGORIES:
+    # 文字か確かめてから表で引く 配列や辞書を渡されると、表で引く所で型の例外になり道具ごと落ちる
+    if not isinstance(raw, str) or raw not in LIBRARY_CATEGORIES:
         raise ToolError(f"category は {'・'.join(LIBRARY_CATEGORIES)} のどれかです")
     if raw not in library.ai_categories:
         raise ToolError(
@@ -3535,11 +3544,35 @@ def _library_category(library: MaterialLibrary, arguments: dict[str, Any]) -> st
 LIBRARY_MEASURE_WAIT = 60.0
 
 
+@dataclass
+class _LibraryLook:
+    """裏で見て回る・測る仕事 1 つ
+
+    見て回り終えたか（``scanned``）と測り終えたか（``done``）を分けて持つ
+
+    同じ頼み（場所・分類・名前・お気に入り）が走っている間に呼び直されたら、新しく見て回らずに
+    この仕事を待つ 待ちきれずに答えたときも、呼び直せば続きを待てる
+    """
+
+    scanned: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+    found: list[LibraryFile] = field(default_factory=list)
+    missing: int = 0
+
+
+#: 走っている見て回る仕事 本人の測った物の控えごと（作品の窓ごと）に、頼みの形で引く
+_LIBRARY_LOOKS: weakref.WeakKeyDictionary[MeasureBook, dict[tuple[object, ...], _LibraryLook]] = (
+    weakref.WeakKeyDictionary()
+)
+_LIBRARY_LOOKS_LOCK = threading.Lock()
+
+
 def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
     """登録したフォルダから、AI が使ってよい分類の素材を名前と長さで探す（#522）
 
-    まだ測っていないファイルは裏のスレッドで測り、測り終えてから答える（:class:`Pending`）
-    道具は画面のスレッドで動くので、ここで 20 本をデコードすると数秒のあいだ画面が止まる
+    見て回るのも測るのも裏のスレッドで行い、終わってから答える（:class:`Pending`） 道具は画面の
+    スレッドで動くので、ここで見て回ったり 20 本をデコードしたりすると数秒のあいだ画面が止まる
+    答えは待った後の今の設定（登録・分類・BGM）で組み直す
     """
     library = host.material_library
     category = _library_category(library, arguments)
@@ -3551,61 +3584,89 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 本人がお気に入りに入れた物だけ（いつもの効果音） 使ってよい分類の外の物は、
     # お気に入りでも出さない（見て回るのが使ってよい分類のフォルダだけなので）
     favorites_only = _flag_argument(arguments, "favorites_only", False)
-    head: dict[str, Any] = {
-        "categories": [
-            {"category": key, "name": LIBRARY_CATEGORIES[key]} for key in library.ai_categories
-        ],
-        # BGM を頼まれなくても付けてよいか（本人の設定 既定は頼まれたときだけ）
-        "auto_bgm": library.auto_bgm,
-    }
     folders = [
         folder for folder in library.ai_folders if category is None or folder.category == category
     ]
     if not folders:
-        return head | {"files_total": 0, "files": [], "note": _NO_LIBRARY}
-    found: list[LibraryFile] = []
-    missing: list[int] = []
-    done = threading.Event()
+        return _library_head(library) | {"files_total": 0, "files": [], "note": _NO_LIBRARY}
+    key = (tuple(library.folders), library.ai_categories, category, query, favorites_only)
+    with _LIBRARY_LOOKS_LOCK:
+        looks = _LIBRARY_LOOKS.setdefault(library.book, {})
+        look = looks.get(key)
+        fresh = look is None or look.done.is_set()
+        if fresh:
+            look = _LibraryLook()
+            looks[key] = look
+    assert look is not None
 
     def look_and_measure() -> None:
         """見て回るのも測るのも裏（大きな登録先で画面のスレッドを止めない）"""
         try:
             scans = [scan for scan in library.scan_for_ai() if scan.folder in folders]
-            missing.append(sum(1 for scan in scans if scan.missing))
-            found.extend(
+            look.missing = sum(1 for scan in scans if scan.missing)
+            look.found.extend(
                 file
                 for file in match_files((file for scan in scans for file in scan.files), query)
                 if not favorites_only or library.is_favorite(file)
             )
+            look.scanned.set()
             # 前に測れなかったファイルは、変わるまで測る数を使わずに飛ばす 飛ばさないと、読めない
             # ファイルが頭に並んだときに、呼び直すたびに同じ物で数を使い切り、後ろが測られない
             wanted = [
                 file
-                for file in found
+                for file in look.found
                 if library.measured(file, allow_measure=False) is None and not library.tried(file)
             ][:LIBRARY_MEASURE_PER_CALL]
             for file in wanted:
                 library.measured(file, allow_measure=True)
         finally:
-            done.set()
+            look.scanned.set()
+            look.done.set()
 
     def finish() -> object:
-        # 待っている間に本人が登録や AI に使わせる分類を変えていれば、今の設定で絞り直す
-        # 待つ前の範囲のまま返すと、使わせないと決めた分類の名前とフォルダが外へ出る
         now = host.material_library
-        allowed = [
-            file
-            for file in found
-            if (owner := now.owner_of(file.path)) is not None
-            and owner.category in now.ai_categories
-            and (category is None or owner.category == category)
-            and (not favorites_only or now.is_favorite(file))
-        ]
-        summary = head | {"folders_missing": missing[0] if missing else 0}
+        head = _library_head(now)
+        if not look.scanned.is_set():
+            # 見て回り終えていない 空の答え（素材が無い）と見分けが付くように、途中だと返す
+            return head | {
+                "scanning": True,
+                "files_total": 0,
+                "files": [],
+                "note": (
+                    "登録したフォルダをまだ見て回っています（大きいか応答の遅い登録先） 少し待って"
+                    "同じ引数で呼び直すと、続きを待ちます"
+                ),
+            }
+        # 待っている間に本人が登録や AI に使わせる分類を変えていれば、今の設定で絞り直し、
+        # 今の持ち主（一番深い登録）の分類とフォルダで答える 待つ前の物のまま返すと、使わせない
+        # と決めた分類の名前が出るか、後から子を別の分類で登録した素材を前の分類で知らせる
+        allowed: list[LibraryFile] = []
+        for file in look.found:
+            owner = now.owner_of(file.path)
+            if owner is None or owner.category not in now.ai_categories:
+                continue
+            if category is not None and owner.category != category:
+                continue
+            current = LibraryFile(file.path, owner, file.size, file.modified_ns)
+            if favorites_only and not now.is_favorite(current):
+                continue
+            allowed.append(current)
+        summary = head | {"folders_missing": look.missing}
         return _library_rows(host, now, summary, allowed, shortest, longest, arguments)
 
-    threading.Thread(target=look_and_measure, name="search-library", daemon=True).start()
-    return Pending(wait=done.wait, seconds=LIBRARY_MEASURE_WAIT, then=finish)
+    if fresh:
+        threading.Thread(target=look_and_measure, name="search-library", daemon=True).start()
+    return Pending(wait=look.done.wait, seconds=LIBRARY_MEASURE_WAIT, then=finish)
+
+
+def _library_head(library: MaterialLibrary) -> dict[str, Any]:
+    """答えの頭 使ってよい分類と、BGM を頼まれなくても付けてよいか（どちらも今の本人の設定）"""
+    return {
+        "categories": [
+            {"category": key, "name": LIBRARY_CATEGORIES[key]} for key in library.ai_categories
+        ],
+        "auto_bgm": library.auto_bgm,
+    }
 
 
 def _library_rows(
@@ -3690,7 +3751,9 @@ def _library_media(host: EditorHost, raw: object) -> tuple[MediaItem, bool]:
     """
     if not isinstance(raw, str) or not raw:
         raise ToolError("library_file_id は search_library の file_id を文字で渡してください")
-    file = host.material_library.find_for_ai(raw)
+    # 覚えていない印は見て回らずに断る 道具は画面のスレッドで動くので、ここで登録したフォルダを
+    # 全部見て回ると大きな登録先で画面が止まる（search_library は裏で見て回り、印を覚える）
+    file = host.material_library.find_for_ai(raw, scan=False)
     if file is None:
         raise ToolError(
             f"library_file_id のファイルが見つかりません: {raw}（本人が AI に使わせる分類の"
@@ -3709,6 +3772,31 @@ def _library_media(host: EditorHost, raw: object) -> tuple[MediaItem, bool]:
             f"登録したフォルダのファイルを開けません（{raw}） 壊れているか、読めない形式です"
             " 別の file_id を選んでください"
         ) from None
+
+
+def _hiding_library_names(
+    handler: Callable[[EditorHost, dict[str, Any]], object],
+) -> Callable[[EditorHost, dict[str, Any]], object]:
+    """登録したフォルダの素材を置く道具の断りの文から、まだ取り込んでいない素材の名前を除く
+
+    断りの文（「X に音がありません」など）は伏せる表を通るが、表には作品の素材の名前しか無い
+    取り込む前の素材の名前は、名前と場所を送らないと決めた人の所でもそのまま出る 印に置き換える
+    """
+
+    def guarded(host: EditorHost, arguments: dict[str, Any]) -> object:
+        try:
+            return handler(host, arguments)
+        except ToolError as exc:
+            raw = arguments.get("library_file_id")
+            if not isinstance(raw, str) or not raw:
+                raise
+            file = host.material_library.find_for_ai(raw, scan=False)
+            text = str(exc)
+            if file is not None:
+                text = text.replace(file.name, f"〔{raw}〕").replace(file.path.stem, f"〔{raw}〕")
+            raise ToolError(text) from None
+
+    return guarded
 
 
 def _media_or_library(host: EditorHost, arguments: dict[str, Any]) -> tuple[MediaItem, bool]:
@@ -13055,7 +13143,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 },
             },
         ),
-        handler=_place_media,
+        handler=_hiding_library_names(_place_media),
         sends=_WITH_FILES,
         preview=from_arguments(),
         name_keys=frozenset({"placed", "folder"}),
@@ -14815,7 +14903,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 "fade_out_seconds": _number("終わりのフェードアウト 秒（0〜60）"),
             },
         ),
-        handler=_place_sound,
+        handler=_hiding_library_names(_place_sound),
         writes=True,
         sends=_WITH_FILES,
         preview=from_arguments(),

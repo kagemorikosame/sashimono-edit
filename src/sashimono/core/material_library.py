@@ -136,7 +136,8 @@ def file_id(path: Path) -> str:
     同じファイルが別の印にならないよう、場所はそろえてから数える
     """
     key = os.path.normcase(os.path.normpath(Path(path).absolute()))
-    return "lib_" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    # 対にならないサロゲートを含む Windows のファイル名でも投げない（その 1 つで一覧と道具が落ちる）
+    return "lib_" + hashlib.sha1(key.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +227,14 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
+def _real_key(path: str) -> str:
+    """実体の場所の鍵（リンクとジャンクションを解く） 解けなければ書いたままの場所の鍵"""
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except (OSError, RuntimeError, ValueError):
+        return _folder_key(path)
+
+
 def _junction(entry: os.DirEntry[str]) -> bool:
     """Windows のジャンクションか（``is_dir(follow_symlinks=False)`` はジャンクションにも真を返す）
 
@@ -259,7 +268,7 @@ def scan_folder(
     present, problem = reachable_dir(root)
     if not present:
         return FolderScan(folder, missing=True, error=problem)
-    skipped = {_folder_key(entry) for entry in skip}
+    skipped = {_folder_key(entry) for entry in skip} | {_real_key(entry) for entry in skip}
     # リンクの実体の照らしに使うのは、自分の中にある別の登録だけ（実体を含む登録のうち一番深い
     # 物で分類を決める） 自分を含む親の登録まで見ると、子の登録が持つリンクを子自身の走査でも捨てる
     others = [Path(entry) for entry in skip if _inside(Path(entry), root)]
@@ -280,7 +289,13 @@ def scan_folder(
         for entry in listed:
             try:
                 if entry.is_dir(follow_symlinks=False):
-                    if _folder_key(entry.path) not in skipped and not _junction(entry):
+                    # 別の登録は書き方（ジャンクション・別のドライブの割り当て）が違っても
+                    # 実体で見分ける 見分けないと、子の分類の物を親の分類で拾う
+                    if (
+                        _folder_key(entry.path) not in skipped
+                        and _real_key(entry.path) not in skipped
+                        and not _junction(entry)
+                    ):
                         folders.append(Path(entry.path))
                     continue
                 if Path(entry.name).suffix.lower() not in suffixes:
@@ -312,7 +327,13 @@ class FolderListing:
     missing: bool = False
 
 
-def list_folder(folder: LibraryFolder, directory: Path, limit: int = SCAN_LIMIT) -> FolderListing:
+def list_folder(
+    folder: LibraryFolder,
+    directory: Path,
+    limit: int = SCAN_LIMIT,
+    *,
+    accept: Callable[[LibraryFile], bool] | None = None,
+) -> FolderListing:
     """登録した ``folder`` の中の ``directory`` 1 段の、分類に合うファイルと下のフォルダ
 
     木で開いたフォルダの中身を出すのに使う 下まで全部を見て回ると、根を開くたびに
@@ -343,8 +364,11 @@ def list_folder(folder: LibraryFolder, directory: Path, limit: int = SCAN_LIMIT)
             stat = entry.stat()
         except OSError:
             continue
-        if len(files) < limit:
-            files.append(LibraryFile(Path(entry.path), folder, stat.st_size, stat.st_mtime_ns))
+        file = LibraryFile(Path(entry.path), folder, stat.st_size, stat.st_mtime_ns)
+        # 絞り込み（``accept``）に合う物だけを上限に数える 先に上限で打ち切ると、上限より後ろに
+        # しか無い種類の物が出ない
+        if len(files) < limit and (accept is None or accept(file)):
+            files.append(file)
     return FolderListing(tuple(files), tuple(folders))
 
 
@@ -529,7 +553,8 @@ Measurer = Callable[[Path], Measure | None]
 _BOOK_VERSION = 2
 
 
-@dataclass
+# 同じ控えかは中身でなく物そのもので見る（AI の道具が走っている仕事を控えごとに引くため）
+@dataclass(eq=False)
 class MeasureBook:
     """測った手がかりの控え ファイルの場所・大きさ・更新時刻で引く
 
@@ -588,6 +613,13 @@ class MeasureBook:
     def found(self, wanted: str) -> Path | None:
         with self._lock:
             return self._found.get(wanted)
+
+    def preload(self) -> None:
+        """控えのファイルを先に読んでおく（裏のスレッドから呼ぶ） 初めて一覧を並べるときに、
+        画面のスレッドで数万行の控えを読まない
+        """
+        with self._lock:
+            self._load()
 
     def failed(self, file: LibraryFile) -> bool:
         """少し前に測れなかったファイルか（変わっておらず :data:`FAILURE_SECONDS` の内）"""
@@ -770,7 +802,7 @@ class MaterialLibrary:
             return None
         return max(owners, key=lambda folder: len(Path(_folder_key(folder.path)).parts))
 
-    def find_for_ai(self, wanted: str) -> LibraryFile | None:
+    def find_for_ai(self, wanted: str, *, scan: bool = True) -> LibraryFile | None:
         """AI が渡した印のファイル AI に使わせない分類のフォルダからは探さない
 
         前に見て回って覚えた場所があれば、それが今も AI に使わせる登録の物かだけを確かめて返す
@@ -778,11 +810,16 @@ class MaterialLibrary:
         """
         known = self.book.found(wanted)
         if known is not None:
+            # 覚えている印は、今の登録と分類で通らなければそこで断る（見て回り直さない）
+            # 断るだけの道具で大きな登録先を見て回ると、画面のスレッドが止まる
             quick = self._check(known)
-            if quick is not None and quick.id == wanted:
-                return quick
-        for scan in self.scan_for_ai():
-            for file in scan.files:
+            return quick if quick is not None and quick.id == wanted else None
+        if not scan:
+            # 覚えていない印は見て回らずに断る（画面のスレッドから呼ぶ道具のため） 呼び手は
+            # search_library で探し直すよう伝える
+            return None
+        for found in self.scan_for_ai():
+            for file in found.files:
                 if file.id == wanted:
                     return file
         return None
@@ -795,14 +832,18 @@ class MaterialLibrary:
         if path.suffix.lower() not in _SUFFIXES.get(owner.category, _SUFFIXES[CATEGORY_OTHER]):
             return None
         root = Path(owner.path)
-        others = [
-            Path(folder.path)
-            for folder in self.folders
-            if not same_place(folder.path, owner.path) and _inside(Path(folder.path), root)
-        ]
         try:
-            if path.is_symlink() and not _linked_inside(path, root, others):
-                return None
+            if path.is_symlink():
+                # 実体を解くのはリンクのときだけ（画面のスレッドから呼ぶので、応えないネットワークの
+                # 登録先を含む全部の登録を解きに行かない） 中の別の登録は文字の場所で先に絞る
+                others = [
+                    Path(folder.path)
+                    for folder in self.folders
+                    if not same_place(folder.path, owner.path)
+                    and is_favorite([owner.path], folder.path)
+                ]
+                if not _linked_inside(path, root, others):
+                    return None
             # 途中のフォルダがジャンクションやリンクなら、見て回るときは入らない
             for parent in path.parents:
                 if same_place(parent, root):
@@ -824,6 +865,10 @@ class MaterialLibrary:
         if self.book.failed(file):
             return None
         fresh = self.measure(file.path)
+        if not _unchanged(file):
+            # 測っている間に同じ場所のファイルが差し替わった 新しいファイルの測った物を前の
+            # ファイルの物として覚えず、返しもしない（成功も失敗も覚えない 次に測り直す）
+            return None
         if fresh is None:
             self.book.put_failure(file)
         else:
@@ -833,3 +878,12 @@ class MaterialLibrary:
     def tried(self, file: LibraryFile) -> bool:
         """前に測ろうとして測れなかったか（測る数を使わずに飛ばす）"""
         return self.book.failed(file)
+
+
+def _unchanged(file: LibraryFile) -> bool:
+    """見て回ったときから大きさと更新時刻が変わっていないか"""
+    try:
+        stat = file.path.stat()
+    except OSError:
+        return False
+    return (stat.st_size, stat.st_mtime_ns) == (file.size, file.modified_ns)

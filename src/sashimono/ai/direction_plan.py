@@ -20,6 +20,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from fractions import Fraction
+from pathlib import Path
 
 from sashimono.core.commands import AddClip, AddMedia, AddTrack, Command
 from sashimono.core.commands.history import Author, Document
@@ -107,6 +108,9 @@ class DirectionItem:
     #: エクスプローラーに登録したフォルダから選んだ効果音（#522） まだ作品の素材ではないので、
     #: 〔付ける〕で素材へ入れてから置く 計画を出すだけでは作品を変えない（素材一覧にも出さない）
     sound_media: MediaItem | None = None
+    #: ``sound_media`` を調べたときのファイルの版（大きさ, 更新時刻） 〔付ける〕までに差し替わった
+    #: ファイルを、計画を出したときの長さと流れのまま取り込まない
+    sound_version: tuple[int, int] | None = None
 
     @property
     def action_name(self) -> str:
@@ -284,6 +288,7 @@ def build_items(
     clips: Sequence[ClipId | None],
     sound: MediaItem | None,
     limit: int,
+    sound_version: tuple[int, int] | None = None,
 ) -> tuple[list[DirectionItem], list[tuple[str, str]]]:
     """レシピの選んだ演出を、付ける先の決まった計画の項目にする
 
@@ -361,6 +366,7 @@ def build_items(
                     and project.find_media(sound.id) is None
                     else None
                 ),
+                sound_version=sound_version,
             )
         )
         if len(items) >= ITEMS_LIMIT:
@@ -437,6 +443,21 @@ def apply_items(
                     (item.number, "効果音のフォルダが AI に使わせない設定になったので付けません")
                 )
                 continue
+            if (
+                sound is not None
+                and item.sound_version is not None
+                and _held(document.project, sound) is None
+                and file_version(sound.path) != item.sound_version
+            ):
+                # 計画の後でファイルが差し替わった（消えた） 計画を出したときに調べた長さと流れの
+                # まま取り込むと、置いたクリップが今のファイルと合わない
+                skipped.append(
+                    (
+                        item.number,
+                        "計画の後で効果音のファイルが変わったので付けません 計画し直してください",
+                    )
+                )
+                continue
             try:
                 commands = _commands(document.project, item)
                 # 先に写しへ当てて、項目の命令がすべて通るかを見る 通らない物（鍵の掛かった
@@ -463,6 +484,15 @@ def apply_items(
                     if isinstance(command, AddClip) and command.clip.media_id is not None
                 )
     return ApplyResult(tuple(applied), tuple(skipped), tuple(used))
+
+
+def file_version(path: Path) -> tuple[int, int] | None:
+    """ファイルの版（大きさ, 更新時刻） 読めなければ ``None``"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
 
 
 def _held(project: Project, sound: MediaItem) -> MediaItem | None:

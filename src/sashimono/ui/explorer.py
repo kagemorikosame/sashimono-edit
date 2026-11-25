@@ -257,6 +257,9 @@ class _Worker(QObject):
         #: 仕事の名前 → 登録の印 印は、同じ名前の古い仕事が終わったときに後から頼んだ新しい
         #: 仕事の登録まで消さないためと、取り消した仕事を始めずに飛ばすため
         self._pending: dict[str, object] = {}
+        #: 走っている仕事の名前 場所を移って取り消した後に同じ物を頼み直しても、走っている物の
+        #: 結果が届くので 2 回目は始めない（始めると同じ音を 2 回読む）
+        self._running: set[str] = set()
         self._lock = threading.Lock()
         self._closed = False
         self._threads = [
@@ -267,7 +270,7 @@ class _Worker(QObject):
 
     def submit(self, key: str, job: Callable[[], object]) -> None:
         with self._lock:
-            if self._closed or key in self._pending:
+            if self._closed or key in self._pending or key in self._running:
                 return
             token = object()
             self._pending[key] = token
@@ -285,12 +288,14 @@ class _Worker(QObject):
                 if self._pending.get(key) is not token:
                     # 取り消した（場所を移った）仕事は始めない
                     continue
+                self._running.add(key)
             try:
                 result = job()
             except Exception:
                 # 1 つの壊れた素材で裏の仕事を止めない その行の列と絵が空のまま残るだけ
                 result = None
             with self._lock:
+                self._running.discard(key)
                 if self._pending.get(key) is token:
                     del self._pending[key]
                 if self._closed:
@@ -552,6 +557,8 @@ class _PreviewPane(QWidget):
         #: 調べる頼みの番号 同じファイルを選び直したときに、前の頼みの古い結果を使わないため
         self._probe_number = 0
         self._peaks_for_wanted: np.ndarray | None = None
+        #: 出している（調べている）ファイルの版（大きさと更新時刻） 同じ場所でも版が違えば開き直す
+        self._version: str | None = None
         self._play_when_open = False
         self._probed.connect(self._on_probed)
 
@@ -614,15 +621,25 @@ class _PreviewPane(QWidget):
         self._volume.setValue(max(0, min(100, percent)))
         self._player.set_volume(self._volume.value() / 100)
 
-    def show_file(self, path: Path | None, peaks: np.ndarray | None = None) -> None:
+    def show_file(
+        self, path: Path | None, peaks: np.ndarray | None = None, version: str | None = None
+    ) -> None:
         """下見に出す 同じファイルなら位置を保つ 再生はしない（ダブルクリックか〔再生〕）
+
+        ``version`` はファイルの版（大きさと更新時刻） 同じ場所でも版が違えば開き直す
+        開き直さないと、読み直した後も差し替える前の長さと絵のまま下見する
 
         素材を調べるのは裏のスレッド 初めて選んだ動画は開いて頭のコマを読むので、遅い
         ドライブでは画面のスレッドで待つと次の素材を選べない 調べ終えたときにまだ同じ
         ファイルを選んでいれば下見に出す
         """
-        if path is not None and path in (self._player.path, self._wanted):
+        if (
+            path is not None
+            and path in (self._player.path, self._wanted)
+            and version == self._version
+        ):
             return
+        self._version = version
         self._player.close()
         self._shown_frame = -1
         self._picture.set_tile(None)
@@ -694,7 +711,10 @@ class _PreviewPane(QWidget):
             if self._wanted is not None:
                 self._play_when_open = True
             return
-        if not self._player.playing and self._before_play is not None:
+        info = self._player.info
+        playable = info is not None and not info.is_still
+        if playable and not self._player.playing and self._before_play is not None:
+            # 鳴らせる物を鳴らす前だけ作品を止める 静止画で止めると、どちらも鳴らない
             self._before_play()
         self._player.toggle()
         self._timer.start()
@@ -837,6 +857,7 @@ class ExplorerPanel(QWidget):
         before_play: Callable[[], None] | None = None,
         thumbs: Path | None = None,
         measure: Callable[[Path], Measure | None] | None = measure_library_file,
+        active: bool = True,
     ) -> None:
         """``player`` は下見の口 渡さなければ本物（音は機械の出口から鳴る）
         試験は鳴らさない物を渡す ``before_play`` は下見を鳴らす前に呼ぶ（窓が作品の再生を
@@ -871,6 +892,11 @@ class ExplorerPanel(QWidget):
         self._tree_lister = _Worker(self, workers=1)
         self._tree_lister.finished.connect(self._on_tree_listed)
         self._tree_number = 0
+        #: 読み始めてよいか（:meth:`set_active` 窓が初めて見せるまで偽にする） 単独で使うときは真
+        self._active = active
+        self._deferred_restore: tuple[str, str] | None = None
+        #: 木を作り直して選び直している途中（人の選びと分けるため）
+        self._rebuilding = False
         #: 登録とお気に入りを確かめた結果 そろえた場所 → "file"・"dir"・"missing"
         self._kinds: dict[str, str] = {}
         #: 確かめている途中の木の番号
@@ -900,7 +926,7 @@ class ExplorerPanel(QWidget):
         self._tree = QTreeWidget(self)
         self._tree.setHeaderHidden(True)
         self._tree.itemExpanded.connect(self._expand)
-        self._tree.currentItemChanged.connect(lambda *_args: self._show_files())
+        self._tree.currentItemChanged.connect(self._on_tree_current)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._show_tree_menu)
         left = QWidget(self)
@@ -1117,6 +1143,23 @@ class ExplorerPanel(QWidget):
     def is_favorite(self, path: Path | str) -> bool:
         return any(same_place(entry, path) for entry in self._favorites)
 
+    def set_active(self, active: bool) -> None:
+        """読み始めてよいか 窓は初めてパネルを見せるまで偽にしておく
+
+        見せる前から中身を読んで測り始めると、エクスプローラーを開かずに編集を始めただけで、
+        数百の素材を裏で測ることになる 偽の間に頼まれた読み込みと前回の場所は覚えておき、
+        真になったときにまとめて始める
+        """
+        if active == self._active:
+            return
+        self._active = active
+        if active:
+            restore = self._deferred_restore
+            self._deferred_restore = None
+            self._fill_tree()
+            if restore is not None:
+                self.restore_location(*restore)
+
     def restore_location(self, folder: str, file: str) -> None:
         """前回の場所から開く そのフォルダが消えていれば何もしない（先頭から開く）
 
@@ -1124,6 +1167,9 @@ class ExplorerPanel(QWidget):
         選んでいたファイルは中身を読み終えてから選ぶ
         """
         if not folder:
+            return
+        if not self._active:
+            self._deferred_restore = (folder, file)
             return
         self._restore_number += 1
         self._restoring = (self._restore_number, folder, file)
@@ -1141,7 +1187,12 @@ class ExplorerPanel(QWidget):
             return
         wanted = [Path(file)] if file else []
         self._pending_select = wanted
-        if not self.open_folder(folder):
+        self._rebuilding = True
+        try:
+            opened = self.open_folder(folder)
+        finally:
+            self._rebuilding = False
+        if not opened:
             self._pending_select = []
             return
         if not self.listing and self._pending_select:
@@ -1362,6 +1413,19 @@ class ExplorerPanel(QWidget):
                 root.addChild(self._top_item(folder.path, folder.path, missing=missing))
             root.setExpanded(True)
         self._tree.blockSignals(False)
+        self._rebuilding = True
+        try:
+            self._reselect(current)
+        finally:
+            self._rebuilding = False
+        self._show_files()
+        if check and self._active:
+            places = [folder.path for folder in self._folders] + list(self._favorites)
+            self._checking = self._tree_number
+            self._tree_lister.submit(f"check:{self._tree_number}", partial(_kinds_of, places))
+
+    def _reselect(self, current: tuple[str, str] | None) -> None:
+        """作り直した木で前に選んでいた所を選び直す（人の選びとは数えない）"""
         if current == (_FAVORITE_NODE, ""):
             # お気に入りの根を見ていた（外した後の残りを続けて整理する） 根が残っていれば選び直す
             favorites_root = self._favorite_root()
@@ -1376,11 +1440,6 @@ class ExplorerPanel(QWidget):
             found = self._find_node(os.path.normcase(os.path.normpath(current[1])))
             if found is not None:
                 self._tree.setCurrentItem(found)
-        self._show_files()
-        if check:
-            places = [folder.path for folder in self._folders] + list(self._favorites)
-            self._checking = self._tree_number
-            self._tree_lister.submit(f"check:{self._tree_number}", partial(_kinds_of, places))
 
     def _top_item(self, owner: str, place: str, *, missing: bool) -> QTreeWidgetItem:
         label = Path(place).name or place
@@ -1407,6 +1466,13 @@ class ExplorerPanel(QWidget):
             return
         self._kinds = result
         self._fill_tree(check=False)
+
+    def _on_tree_current(self, *_args: object) -> None:
+        if not self._rebuilding:
+            # 人が木で選んだ（作り直しで選び直したのではない） 確かめている途中の前回の場所は
+            # 開かない 遅れて届いた結果で、人の選んだ場所を前回の場所に置き換えない
+            self._restoring = None
+        self._show_files()
 
     def _favorite_root(self) -> QTreeWidgetItem | None:
         for top in range(self._tree.topLevelItemCount()):
@@ -1620,6 +1686,9 @@ class ExplorerPanel(QWidget):
                 "ここで探して下見し、置けます AI に使わせる分類は 表示 → 設定… で選びます"
             )
             return
+        if not self._active:
+            # 見せるまで読まない（:meth:`set_active`）
+            return
         self._listing_number += 1
         number = self._listing_number
         if node == (_FAVORITE_NODE, ""):
@@ -1636,7 +1705,15 @@ class ExplorerPanel(QWidget):
         # 一覧の物を置くと、見ている場所と違う素材が置かれる 選びは残し、読み終えたら戻す
         self._views.setEnabled(False)
         self._place_button.setEnabled(False)
-        self._lister.submit(f"list:{number}", job)
+        listed, book = job, self._book
+
+        def read() -> object:
+            # 測った値の控えも裏で読んでおく 読み終えた一覧を並べるときに画面のスレッドで
+            # 数万行の控えを初めて読むと、その間止まる（2 回目からは読み終えた物を使う）
+            book.preload()
+            return listed()
+
+        self._lister.submit(f"list:{number}", read)
 
     @property
     def listing(self) -> bool:
@@ -1759,23 +1836,23 @@ class ExplorerPanel(QWidget):
     def _on_worker(self, key: str, result: object) -> None:
         kind, _, file_key = key.partition(":")
         file = self._files.get(file_key)
-        if file is None:
-            # 別の場所を開いた後に届いた 測った物だけは控えに入れる（次に開いたときに使う）
-            return
         if kind == "measure" and isinstance(result, tuple):
             asked, measure = result
-            # 頼んだときのファイルと今の行のファイルが同じ（大きさと更新時刻まで）ときだけ使う
-            # 差し替わった後の行に前のファイルの長さを出さない
-            if asked != file:
+            if not isinstance(asked, LibraryFile):
                 return
-            if not isinstance(measure, Measure):
+            # 測った物は、別の場所を開いた後に届いても控えに入れる（次に開いたときに測り直さない）
+            # 控えは頼んだときの版（大きさと更新時刻）で引くので、差し替えた後の版には使わない
+            if isinstance(measure, Measure):
+                self._book.put(asked, measure)
+            else:
                 self._book.put_failure(asked)
+            # 行に出すのは、今の行のファイルが頼んだときと同じ版のときだけ
+            if file is None or asked != file or not isinstance(measure, Measure):
                 return
-            self._book.put(asked, measure)
             cells = self._row_of(file_key)
             if cells is not None:
                 self._fill_measure(cells, measure)
-        elif kind in ("still", "peaks") and isinstance(result, tuple):
+        elif file is not None and kind in ("still", "peaks") and isinstance(result, tuple):
             asked, data = result
             # 測った値と同じく、頼んだときのファイルと今の行のファイルが同じときだけ使う
             # 作っている間に差し替わった物の絵を、新しいファイルの物として覚えない
@@ -1884,7 +1961,7 @@ class ExplorerPanel(QWidget):
         path = files[0]
         file = next((f for f in self._files.values() if f.path == path), None)
         peaks = self._peaks.get(_stamp(file)) if file is not None else None
-        self._preview.show_file(path, peaks)
+        self._preview.show_file(path, peaks, _stamp(file) if file is not None else None)
         if file is not None and peaks is None and kind_of(path) == KIND_SOUND:
             # 音の下見に波形を出す 一覧表示でも作る（作った物はアイコンの絵にも使う）
             self._request_picture(file)
@@ -2026,8 +2103,11 @@ def _listing(
                 and not same_place(other.path, directory)
                 and not same_place(other.path, folder.path)
             ]
+            # 名前は登録したフォルダから見た場所で照らす（行を作るときと同じ基準） 開いた下の
+            # フォルダから見ると、「爆発」の中で「爆発」と探しても見つからない
+            owned = partial(_as_owned, folder, accept)
             scan = scan_folder(
-                LibraryFolder(str(directory), folder.category), accept=accept, skip=inside
+                LibraryFolder(str(directory), folder.category), accept=owned, skip=inside
             )
             if scan.missing:
                 notes.append(f"{directory.name} が見つかりません（消えたか移った）")
@@ -2042,7 +2122,8 @@ def _listing(
                     LibraryFile(file.path, folder, file.size, file.modified_ns),
                 )
         else:
-            listed = list_folder(folder, directory)
+            # 種類も 1 段の一覧の上限より先に当てる（音が上限まで並んだフォルダでも動画が出る）
+            listed = list_folder(folder, directory, accept=accept)
             if listed.missing:
                 # 開いていた下のフォルダが消えた 空のフォルダと見分けが付くように知らせる
                 notes.append(f"{directory.name} が見つかりません（消えたか移った）")
@@ -2151,3 +2232,10 @@ def _kinds_of(places: Sequence[str]) -> dict[str, str]:
 
 def _reachable(path: Path) -> bool:
     return reachable_dir(path)[0]
+
+
+def _as_owned(
+    folder: LibraryFolder, accept: Callable[[LibraryFile], bool], file: LibraryFile
+) -> bool:
+    """登録したフォルダの物として照らす（見て回る根が下のフォルダでも、名前の基準をそろえる）"""
+    return accept(LibraryFile(file.path, folder, file.size, file.modified_ns))

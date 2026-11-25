@@ -98,10 +98,13 @@ class TestPreviewPlayer:
         path = write_tone(tmp_path / "音.wav", tone(3.0, -12.0))
         sinks: list[_Sink] = []
         clock = _Clock()
+        # 1 回目の出口は止めるまで書かせない 先に鳴らし切ると、終わりで止まった形になり
+        # 止める・飛ぶを確かめられない（音の仕事が終わりを決めるので、速い機械ほど起きる）
+        gate = threading.Event()
 
         def make(rate: int, channels: int) -> _Sink:
             assert (rate, channels) == (48000, 2)
-            sinks.append(_Sink())
+            sinks.append(_Sink(gate if not sinks else None))
             return sinks[-1]
 
         player = PreviewPlayer(sink=make, clock=clock)
@@ -115,6 +118,7 @@ class TestPreviewPlayer:
         assert player.position == pytest.approx(1.0)
         player.pause()
         assert not player.playing
+        gate.set()
         wait_until(sinks[0].closed.is_set, "止めた後の出口の片付け")
         assert player.position == pytest.approx(1.0)
         player.seek(2.5)
@@ -124,7 +128,8 @@ class TestPreviewPlayer:
         # 出口を開き終えて時計が進み始めてから時計を進める（開く間は時計を進めない作り）
         wait_until(lambda: len(sinks) == 2 and sinks[1].samples > 0, "2 回目の下見の音")
         clock.now = 10.0
-        assert not player.playing
+        # 音のある素材の終わりは音の仕事が鳴らし切ったときに決まる（時計では決めない）
+        wait_until(lambda: not player.playing, "鳴らし切り")
         assert player.position == pytest.approx(3.0, abs=0.01)
         player.play()
         assert player.position == pytest.approx(0.0)
@@ -135,9 +140,12 @@ class TestPreviewPlayer:
         path = write_video(tmp_path / "動画.mp4", 2.0, tone_db=-20.0)
         clock = _Clock()
         sinks: list[_Sink] = []
+        # 音の仕事を最初の 1 回の後で止めておく 鳴らし切ると止まった形になり、絵も止まる
+        # （本物の出口は鳴らす速さで書かせるので、鳴らし切る前に時計が進む）
+        gate = threading.Event()
 
         def make(_rate: int, _channels: int) -> _Sink:
-            sinks.append(_Sink())
+            sinks.append(_Sink(gate))
             return sinks[-1]
 
         player = PreviewPlayer(sink=make, clock=clock)
@@ -157,6 +165,7 @@ class TestPreviewPlayer:
             "動いた絵",
         )
         player.close()
+        gate.set()
         assert player.frame() is None
 
     def test_a_missing_file_is_reported(self, tmp_path: Path) -> None:
@@ -271,3 +280,59 @@ class TestPreviewPlayer:
         wait_until(lambda: bool(sinks) and sinks[0].samples > 0, "音")
         assert "絵を読めません" in (player.error or "")
         player.close()
+
+    def test_pausing_works_until_the_sound_has_played(self, tmp_path: Path) -> None:
+        # 壊れると、出口を開いた後の最初の読み込みが遅い短い音で、時計が先に終わりへ着いて
+        # 〔一時停止〕が効かず、画面が〔再生〕に戻った後で音が鳴る
+        path = write_tone(tmp_path / "短い.wav", tone(0.05, -12.0))
+        gate = threading.Event()
+        sinks: list[_Sink] = []
+
+        def make(_rate: int, _channels: int) -> _Sink:
+            sinks.append(_Sink(gate))
+            return sinks[-1]
+
+        clock = _Clock()
+        player = PreviewPlayer(sink=make, clock=clock)
+        player.open(path)
+        player.play()
+        wait_until(lambda: bool(sinks) and sinks[0].samples > 0, "最初の音")
+        clock.now = 5.0
+        assert player.playing
+        player.pause()
+        gate.set()
+        wait_until(sinks[0].closed.is_set, "止めた後の片付け")
+        assert sinks[0].drained is False
+        assert not player.playing
+
+    def test_the_first_picture_of_a_video_uses_the_player_decoder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、縦に撮った動画の見本と選んだ直後の下見だけが横を向き、再生すると向きが変わる
+        # （回転を当てるのは再生と同じデコーダ 画像の読み方では当たらない）
+        path = write_video(tmp_path / "動画.mp4", 1.0)
+
+        def no_image(_path: Path) -> object:
+            raise AssertionError("画像の読み方で動画を読んだ")
+
+        monkeypatch.setattr(library_sound, "read_image", no_image)
+        tile = still_of(path)
+        assert tile is not None and tile.ndim == 3
+
+    def test_a_video_whose_sound_cannot_play_ends_by_the_clock(self, tmp_path: Path) -> None:
+        # 壊れると、音の出口を開けない機械で動画を下見すると、絵が終わりで止まったまま
+        # 〔一時停止〕から戻らず、次の〔再生〕が頭から始まらない
+        path = write_video(tmp_path / "動画.mp4", 1.0, tone_db=-20.0)
+
+        def broken(_rate: int, _channels: int) -> _Sink:
+            raise RuntimeError("出口がありません")
+
+        clock = _Clock()
+        player = PreviewPlayer(sink=broken, clock=clock)
+        player.open(path)
+        player.play()
+        wait_until(lambda: player.error is not None, "鳴らせない知らせ")
+        assert player.playing
+        clock.now = 5.0
+        assert not player.playing
+        assert player.position == pytest.approx(1.0, abs=0.05)

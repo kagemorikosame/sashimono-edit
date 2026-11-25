@@ -806,6 +806,8 @@ class MainWindow(QMainWindow):
             book=self._explorer_measures,
             before_play=self._stop_for_explorer,
             thumbs=userdirs.cache_root() / EXPLORER_THUMBS,
+            # 初めて見せるまで中身を読まない 開かずに編集を始めただけで、裏で数百の素材を測らない
+            active=False,
         )
         self._apply_explorer_preferences(self._preferences)
         # 前回の場所から開く（#521） 消えていれば先頭から 選び直しのたびに設定を書かないよう、
@@ -925,6 +927,9 @@ class MainWindow(QMainWindow):
         self.tabifyDockWidget(pool_dock, explorer_dock)
         pool_dock.raise_()
         self._explorer_dock = explorer_dock
+        # 隠したら下見を止める（閉じたパネルの下見が鳴り続け、止めるのにまた開くことになる）
+        # 初めて見せたときに中身を読み始める（:meth:`ExplorerPanel.set_active`）
+        explorer_dock.visibilityChanged.connect(self._on_explorer_visible)
 
         chat_dock = self._dock("AI アシスタント", "chat")
         chat_dock.setWidget(self._chat)
@@ -2635,6 +2640,12 @@ class MainWindow(QMainWindow):
         explorer.set_view_mode(preferences.explorer_view)
         explorer.set_icon_size(preferences.explorer_icon_size)
         explorer.set_double_click(preferences.explorer_double_click)
+
+    def _on_explorer_visible(self, visible: bool) -> None:
+        if visible:
+            self._explorer.set_active(True)
+        else:
+            self._explorer.preview.stop()
 
     def show_explorer(self) -> None:
         """エクスプローラーのパネルを前へ出す"""
@@ -5555,17 +5566,17 @@ class MainWindow(QMainWindow):
         }
 
     def _hidden_from_ai(self, place: str) -> bool:
-        """``place`` が AI に使わせない分類の登録したフォルダの中か
+        """``place`` を AI へ見せないか（AI に使ってよい分類の登録したフォルダの中の物だけ見せる）
 
         中に別の登録があれば、場所を含む登録のうち一番深い物の分類で決める（AI の見て回り方と同じ）
+        どの登録の中でもない場所（登録を外した後に残ったお気に入りなど）も見せない
+        見せると、外した登録の中の場所がここから外へ出る
         """
         if not place:
             return False
         # 含むかと深さは同じそろえ方の場所で比べる（`..` を含む書き方の登録でも深さを誤らない）
         deepest = MaterialLibrary(folders=self._preferences.explorer_folders).owner_of(place)
-        return (
-            deepest is not None and deepest.category not in self._preferences.explorer_ai_categories
-        )
+        return deepest is None or deepest.category not in self._preferences.explorer_ai_categories
 
     def view_state(self) -> ViewState:
         """人が画面で見ている表示の状態（#352 :class:`EditorHost` を参照） 読むだけ"""

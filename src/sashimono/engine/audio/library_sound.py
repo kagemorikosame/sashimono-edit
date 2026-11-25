@@ -24,7 +24,7 @@ from typing import Protocol
 
 import numpy as np
 
-from sashimono.core.material_library import Measure
+from sashimono.core.material_library import VIDEO_SUFFIXES, Measure
 from sashimono.core.model import MediaItem
 from sashimono.engine.checks.loudness import LoudnessMeter
 from sashimono.engine.decode.audio import AudioDecoder
@@ -125,7 +125,17 @@ def measure_library_file(path: Path) -> Measure | None:
 
 
 def still_of(path: Path) -> np.ndarray | None:
-    """見本の絵（画像はその絵 動画は頭の 1 コマ） RGBA uint8 読めなければ ``None``"""
+    """見本の絵（画像はその絵 動画は頭の 1 コマ） RGBA uint8 読めなければ ``None``
+
+    動画は再生と同じデコーダで読む（回転の情報を当てる） 画像の読み方で読むと、縦に撮った
+    動画の見本と選んだ直後の下見だけが横を向き、再生すると向きが変わる
+    """
+    if path.suffix.lower() in VIDEO_SUFFIXES:
+        try:
+            with VideoDecoder(path) as decoder:
+                return decoder.frame_at(Fraction(0))
+        except (ProbeError, OSError, ValueError):
+            return None
     return read_image(path)
 
 
@@ -236,6 +246,9 @@ class PreviewPlayer:
         self._starting = False
         #: 終わりまで鳴って止まった 次の〔再生〕は頭から（止めた・飛んだ後は頭へ戻さない）
         self._at_end = False
+        #: 終わりを時計で決めるか 音の無い素材と、音を鳴らせなかった動画（絵だけで続ける）
+        #: 音の仕事が鳴らしている間は音の仕事が決める（:meth:`_settle`）
+        self._by_clock = False
         self._frame: np.ndarray | None = None
         self._frame_number = 0
         #: 止まっている間に頼んだ絵（シークした先の 1 コマ）を読んでいる途中か
@@ -345,6 +358,7 @@ class PreviewPlayer:
             generation = self._generation
             self._position = start
             self._still_pending = False
+            self._by_clock = not info.has_audio
             if info.has_audio:
                 # 時計は音の出口を開き終えてから進める（:meth:`_play_sound`）
                 self._starting = True
@@ -394,21 +408,32 @@ class PreviewPlayer:
         if self._anchor is None:
             return self._position
         start, at = self._anchor
-        return start + max(0.0, self._clock() - at)
+        now = start + max(0.0, self._clock() - at)
+        # 音の素材は鳴らし切るまで止まった形にしないので、時計が先に進んでも終わりで止める
+        info = self._info
+        return min(now, info.duration) if info is not None else now
 
     def _settle(self) -> None:
-        """終わりまで来たら止まった形にする（錠の内で呼ぶ）
+        """時計で終わりを決める素材で、時計が終わりまで来たら止まった形にする（錠の内で呼ぶ）
 
-        頼みの番号は変えない 音の仕事は自分の書いた分を鳴らし切ってから閉じる（終わりの
-        数十ミリ秒を捨てない） 絵の仕事は時計が止まったのを見て抜ける
+        音を鳴らしている間の終わりは時計でなく音の仕事が決める（鳴らし切ったときに :meth:`_ended`）
+        時計で決めると、出口を開いた後の最初のデコードが長い短い効果音で、画面が先に〔再生〕へ
+        戻り、その後で音が鳴る（止めても止まらない） 音を鳴らせなかった動画は時計で決める
+        （決めないと、絵が終わりで止まったまま〔一時停止〕から戻らない）
         """
         info = self._info
-        if self._anchor is None or info is None:
+        if self._anchor is None or info is None or not self._by_clock:
             return
         if self._now() >= info.duration:
-            self._position = info.duration
-            self._anchor = None
-            self._at_end = True
+            self._ended()
+
+    def _ended(self) -> None:
+        """終わりまで鳴って止まった形にする（錠の内で呼ぶ） 次の〔再生〕は頭から"""
+        info = self._info
+        self._position = info.duration if info is not None else 0.0
+        self._anchor = None
+        self._starting = False
+        self._at_end = True
 
     def _same(self, generation: int) -> bool:
         with self._lock:
@@ -436,7 +461,7 @@ class PreviewPlayer:
     def _decode_still(self, path: Path, generation: int, seconds: float) -> None:
         try:
             if seconds <= 0:
-                tile = read_image(path)
+                tile = still_of(path)
             else:
                 with VideoDecoder(path) as decoder:
                     tile = decoder.frame_at(Fraction(seconds).limit_denominator(100000))
@@ -514,6 +539,14 @@ class PreviewPlayer:
                 # 自分の書いた分を最後まで書いたときだけ鳴らし切る 止めた・飛んだ（頼みの番号が
                 # 変わった）ときは、止めた位置がどこでも捨てる
                 finished = cursor >= total
+            if finished and sink is not None:
+                # 鳴らし切ってから止まった形にする（止めるまでの間も〔一時停止〕を受け付ける）
+                closing, sink = sink, None
+                with contextlib.suppress(Exception):
+                    closing.close(drain=True)
+                with self._lock:
+                    if generation == self._generation:
+                        self._ended()
         except (ProbeError, OSError, ValueError) as exc:
             self._fail(generation, f"音を読めません: {exc}")
         except Exception as exc:
@@ -533,8 +566,11 @@ class PreviewPlayer:
             info = self._info
             if info is None:
                 return
+            if info.has_video:
+                # 動画は絵だけを時計で続け、終わりも時計で決める（音の仕事はもう決めない）
+                self._by_clock = True
             if self._starting:
-                # 出口を開けなかった 動画は絵だけを時計で続け、音だけの素材は止まった形へ戻す
+                # 出口を開けなかった 動画は時計を進め始め、音だけの素材は止まった形へ戻す
                 self._starting = False
                 if info.has_video:
                     self._anchor = (self._position, self._clock())

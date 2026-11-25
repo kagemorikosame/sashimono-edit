@@ -466,3 +466,42 @@ class TestReviewFixes:
         assert found is not None and found.path == sound
         closed = MaterialLibrary(folders=library.folders, ai_categories=(), book=library.book)
         assert closed.find_for_ai(file_id(sound)) is None
+
+    def test_a_file_replaced_while_measuring_is_not_kept(self, tmp_path: Path) -> None:
+        # 壊れると、測っている間に差し替えた長いファイルの長さを、前の短いファイルの物として覚える
+        sound = _touch(tmp_path / "SE" / "ドン.wav")
+
+        def measure(path: Path) -> Measure:
+            path.write_bytes(b"longer now")
+            return Measure(seconds=95.0, has_audio=True, has_video=False)
+
+        library = MaterialLibrary(
+            folders=(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT),), measure=measure
+        )
+        file = library.scan_for_ai()[0].files[0]
+        assert library.measured(file, allow_measure=True) is None
+        assert library.book.get(file) is None
+        assert not library.tried(file)
+
+    def test_a_kind_filter_is_applied_before_the_limit(self, tmp_path: Path) -> None:
+        # 壊れると、音が上限まで並んだ「その他」のフォルダで動画を選ぶと 0 個になる
+        for number in range(6):
+            (tmp_path / f"{number:02}.wav").write_bytes(b"")
+        (tmp_path / "zz.mp4").write_bytes(b"")
+        listing = list_folder(
+            LibraryFolder(str(tmp_path), CATEGORY_OTHER),
+            tmp_path,
+            limit=3,
+            accept=lambda file: file.path.suffix == ".mp4",
+        )
+        assert [file.name for file in listing.files] == ["zz.mp4"]
+
+
+def test_an_unknown_id_is_not_scanned_for_when_asked_not_to(tmp_path: Path) -> None:
+    # 壊れると、画面のスレッドの道具が知らない印を渡されるたびに登録先を全部見て回る
+    sound = _touch(tmp_path / "SE" / "ドン.wav")
+    library = MaterialLibrary(folders=(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT),))
+    assert library.find_for_ai(file_id(sound), scan=False) is None
+    assert library.find_for_ai(file_id(sound)) is not None
+    # 一度見つけた印は見て回らずに引ける
+    assert library.find_for_ai(file_id(sound), scan=False) is not None

@@ -8,6 +8,8 @@ AI の道具は tests/ai/test_library_tools.py
 from __future__ import annotations
 
 import json
+import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -21,8 +23,10 @@ from sashimono.core.material_library import (
     CATEGORY_MUSIC,
     CATEGORY_SOUND_EFFECT,
     DEFAULT_AI_CATEGORIES,
+    LibraryFile,
     LibraryFolder,
     Measure,
+    MeasureBook,
 )
 from sashimono.core.model import Project
 from sashimono.engine.audio.library_sound import PreviewPlayer
@@ -560,6 +564,8 @@ class TestLastPlace:
             ),
         )
         first = MainWindow(Project.create(), confirm_unsaved=False)
+        # 窓はエクスプローラーを初めて見せるまで中身を読まない 見せたのと同じにする
+        first._explorer.set_active(True)
         first._explorer.open_folder(str(sounds / "爆発"))
         _settle(first._explorer)
         first._explorer.select_file(sounds / "爆発" / "ドカン.mp3")
@@ -572,6 +578,7 @@ class TestLastPlace:
         assert remembered.explorer_last_file == str(sounds / "爆発" / "ドカン.mp3")
         monkeypatch.setattr(PreferenceStore, "load", lambda _self: remembered)
         second = MainWindow(Project.create(), confirm_unsaved=False)
+        second._explorer.set_active(True)
         try:
             _settle(second._explorer)
             assert second._explorer.location_text().endswith("› 爆発")
@@ -814,3 +821,213 @@ class TestFourthReview:
         finally:
             window.close()
             window.deleteLater()
+
+
+class TestFifthReview:
+    def test_a_still_picture_does_not_stop_the_work(
+        self, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        # 壊れると、作品の再生中に画像をダブルクリックすると作品が止まり、どちらも鳴らない
+        del qt_application
+        from PySide6.QtGui import QImage
+
+        stopped: list[bool] = []
+        root = tmp_path / "画像"
+        root.mkdir()
+        image = QImage(16, 9, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF3366FF)
+        assert image.save(str(root / "青.png"))
+        panel = ExplorerPanel(
+            player=_quiet_player(), before_play=lambda: stopped.append(True), measure=None
+        )
+        try:
+            panel.register(str(root), "image")
+            _settle(panel)
+            panel.select_file(root / "青.png")
+            _settle(panel)
+            panel.preview.toggle()
+            assert stopped == []
+        finally:
+            panel.shutdown()
+            panel.deleteLater()
+
+    def test_nothing_is_read_until_shown(self, qt_application: QApplication, sounds: Path) -> None:
+        # 壊れると、エクスプローラーを開かずに編集を始めただけで、裏で数百の素材を測り始める
+        del qt_application
+        asked: list[Path] = []
+
+        def measure(path: Path) -> Measure | None:
+            asked.append(path)
+            return None
+
+        panel = ExplorerPanel(
+            [LibraryFolder(str(sounds), CATEGORY_SOUND_EFFECT)],
+            player=_quiet_player(),
+            measure=measure,
+            active=False,
+        )
+        try:
+            panel.restore_location(str(sounds / "爆発"), "")
+            for _ in range(20):
+                _process()
+            assert panel.visible_files() == [] and asked == []
+            panel.set_active(True)
+            _settle(panel)
+            assert panel.location_text().endswith("› 爆発")
+        finally:
+            panel.shutdown()
+            panel.deleteLater()
+
+    def test_choosing_in_the_tree_cancels_the_last_place(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、起動直後に人が選んだ場所が、遅れて確かめ終えた前回の場所に置き換わる
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        panel.restore_location(str(sounds / "爆発"), "")
+        root = panel._category_root(CATEGORY_SOUND_EFFECT)
+        assert root is not None
+        panel._tree.setCurrentItem(root)
+        _settle(panel)
+        assert panel.location_text() == "効果音"
+
+    def test_names_inside_an_opened_subfolder_count_from_the_registration(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、「爆発」を開いて「爆発」と探すと、その中のドカンが見つからない
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        panel.open_folder(str(sounds / "爆発"))
+        _settle(panel)
+        panel._filter.setText("爆発")
+        _settle(panel)
+        assert [p.name for p in panel.visible_files()] == ["ドカン.mp3"]
+
+    def test_hiding_the_panel_stops_the_preview(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、パネルを閉じても下見の BGM が鳴り続け、止めるにはまた開くことになる
+        del qt_application
+        monkeypatch.setattr(PreferenceStore, "save", lambda _self, _prefs: None)
+        window = MainWindow(Project.create(), confirm_unsaved=False)
+        try:
+            stopped: list[bool] = []
+            monkeypatch.setattr(window._explorer.preview, "stop", lambda: stopped.append(True))
+            window._on_explorer_visible(False)
+            assert stopped == [True]
+        finally:
+            window.close()
+            window.deleteLater()
+
+
+class TestSelfReviewFive:
+    def test_places_outside_every_registration_are_not_sent(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、登録を外した後に残ったお気に入りと前回の場所が、設定の写しから外へ出る
+        del qt_application
+        monkeypatch.setattr(PreferenceStore, "save", lambda _self, _prefs: None)
+        window = MainWindow(Project.create(), confirm_unsaved=False)
+        try:
+            left = str(tmp_path / "外した" / "ドン.wav")
+            window._apply_preferences(
+                Preferences(
+                    explorer_folders=(LibraryFolder(str(tmp_path / "SE"), CATEGORY_SOUND_EFFECT),),
+                    explorer_favorite_paths=(left,),
+                    explorer_last_folder=str(tmp_path / "外した"),
+                    explorer_last_file=left,
+                )
+            )
+            copied = window.app_settings()["preferences"]
+            assert isinstance(copied, dict)
+            assert copied["explorer_favorite_paths"] == []
+            assert copied["explorer_last_folder"] == ""
+            assert copied["explorer_last_file"] == ""
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_a_replaced_file_is_opened_again(self, panel: ExplorerPanel, sounds: Path) -> None:
+        # 壊れると、読み直した後も、差し替える前のファイルの長さと絵のまま下見する
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        target = sounds / "ドン.wav"
+        panel.select_file(target)
+        _settle(panel)
+        opened: list[Path | None] = []
+        original = panel.preview.show_file
+
+        def recorded(path: Path | None, *rest: object) -> None:
+            opened.append(path)
+            original(path, *rest)  # type: ignore[arg-type]
+
+        panel.preview.show_file = recorded  # type: ignore[method-assign, assignment]
+        target.write_bytes(b"replaced and longer")
+        os.utime(target, ns=(1_000_000_000, 1_000_000_000))
+        panel.rescan()
+        _settle(panel)
+        panel.select_file(target)
+        _settle(panel)
+        assert panel.preview._version is not None
+        assert opened and opened[-1] == target
+
+    def test_a_measure_that_arrives_after_moving_is_kept(
+        self, qt_application: QApplication, sounds: Path
+    ) -> None:
+        # 壊れると、測り終える前に別の場所を開くと、測った長さを捨て、戻るたびに測り直す
+        del qt_application
+        release = threading.Event()
+        asked: list[Path] = []
+
+        def slow(path: Path) -> Measure | None:
+            asked.append(path)
+            release.wait()
+            return _lengths(path)
+
+        book = MeasureBook()
+        panel = ExplorerPanel(player=_quiet_player(), measure=slow, book=book)
+        try:
+            panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+            wait_until(lambda: bool(asked), "測り始め", step=_process)
+            panel.open_folder(str(sounds / "爆発"))
+            release.set()
+            _settle(panel)
+            measured = list(asked)
+            assert measured
+            file = LibraryFile(
+                path=measured[0],
+                folder=LibraryFolder(str(sounds), CATEGORY_SOUND_EFFECT),
+                size=measured[0].stat().st_size,
+                modified_ns=measured[0].stat().st_mtime_ns,
+            )
+            assert book.get(file) is not None
+        finally:
+            release.set()
+            panel.shutdown()
+            panel.deleteLater()
+
+    def test_a_job_asked_again_while_running_is_not_run_twice(
+        self, qt_application: QApplication
+    ) -> None:
+        # 壊れると、場所を移って戻るたびに、まだ作っている途中の波形をもう 1 本作り始める
+        del qt_application
+        worker = explorer_module._Worker(workers=2)
+        release = threading.Event()
+        started: list[str] = []
+
+        def job() -> object:
+            started.append("x")
+            release.wait()
+            return None
+
+        try:
+            worker.submit("peaks:a", job)
+            wait_until(lambda: bool(started), "走り始め", step=_process)
+            worker.forget()
+            worker.submit("peaks:a", job)
+            release.set()
+            wait_until(lambda: not worker.busy, "終わり", step=_process)
+            assert started == ["x"]
+        finally:
+            release.set()
+            worker.close()
