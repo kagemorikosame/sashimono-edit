@@ -2271,8 +2271,16 @@ AI の道具 `list_looks`（一覧）・`apply_preset`・`place_alias`・`place_
 形式の表は `engine/encode/formats.py` の 1 か所 窓・AI の `export_video`・書き出しの係が同じ表を引く
 
 - **形式は名前の拡張子で決まる** FFmpeg も拡張子で入れ物を選ぶので、別に形式を持たせると名前と
-  食い違う 別のプロセスの書き出しと AI の書き出しは仮の名前で書くが、拡張子だけは残して渡す
-  （`export_job._scratch_for` `ui/ai_export.py`） 知らない拡張子は `build_settings` と書き出しの係が断る
+  食い違う 書き出しの係と AI の書き出しは仮の名前で書くが、拡張子だけは残して渡す
+  （`exporter.scratch_beside` `ui/ai_export.py`） 知らない拡張子は `build_settings` と書き出しの係が断る
+- **書き出しは仮のファイルに書いてから置き換える**（`engine/encode/exporter.py`） 仮の名前を決める
+  `scratch_beside`（書き出し先の隣 拡張子を残す）・仮のファイルへ直に書く `write_export`・付け替える
+  `place_export` の 3 つに分け、`export_project` はこれを並べるだけ 書き出し先へ直に書くと、開いた所で
+  前のファイルが空になり、中止や失敗で前に書き出した物まで消える `place_export` は付け替える直前にも
+  中止を見る（吐き出しの間に押した中止で前のファイルを置き換えない） 別のプロセスの書き出し
+  （`export_job.export_anywhere`）は親が `scratch_beside` で仮の名前を決め、子は `write_export` で
+  そこへ直に書き、親が `place_export` で付け替える 子の中でもう 1 つ仮のファイルを作ると、子が落ちたか
+  猶予を過ぎて止めたときに親の知らない書きかけが残る
 - 窓で形式を替えると名前の拡張子も替わり、名前を打ち替えて拡張子を変えると形式が合わせて替わる
   知らない拡張子（`作品.v2`）は付け替えずに後ろへ足す 窓で最後に選んだ形式は
   `Preferences.export_format` に覚える（書き出し先のフォルダと同じく、好みではなく覚えている物なので
