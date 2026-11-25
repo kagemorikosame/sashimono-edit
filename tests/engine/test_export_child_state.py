@@ -100,6 +100,10 @@ NOT_FOR_THE_CHILD = frozenset(
         "theme",
         # 作品を開くときに素材を探す順 子は場所を決め終えた作品をそのまま受け取る
         "media_relative_first",
+        # 素材を読み込むときと既定を覚えるときに見る（#524） 子は置き終えた作品を受け取る
+        "media_defaults_global",
+        # 静止画を素材にして置く長さ（#525） 子は置き終えた作品を受け取る
+        "still_seconds",
         # 編集の時に作品へ書き込む物 書き込んだ結果は作品ごと子へ渡る
         "match_video",
         "preset_with_text",
