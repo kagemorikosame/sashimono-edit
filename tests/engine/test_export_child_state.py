@@ -28,6 +28,7 @@ BY_RUNTIME = {
 
 #: 書き出しの窓が :class:`ExportSettings` に入れて渡す設定（子へは書き出しの設定ごと届く）
 #: ``export_process`` は子を使うかそのもの ``export_folder`` は書き出し先の既定の置き場
+#: ``export_format`` は窓の初めの形式で、子へは書き出し先の名前の拡張子として届く
 #: ビットレートの 2 つは親が素材に合わせて求め、``video_bitrate`` に入れて渡す
 BY_EXPORT_SETTINGS = frozenset(
     {
@@ -38,6 +39,7 @@ BY_EXPORT_SETTINGS = frozenset(
         "export_chapters",
         "encoder_priority",
         "export_folder",
+        "export_format",
         "export_process",
         "export_bitrate_auto",
         "export_bitrate_mbps",

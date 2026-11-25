@@ -118,7 +118,9 @@ from sashimono.engine.checks import LOUDNESS_TARGETS
 from sashimono.engine.encode import (
     BITRATE_RANGE_MBPS,
     DEFAULT_BITRATE_MBPS,
+    DEFAULT_FORMAT,
     DEFAULT_PIPELINE_DEPTH,
+    FORMAT_KEYS,
     MAX_PIPELINE_DEPTH,
     BitrateChoice,
 )
@@ -957,6 +959,11 @@ class Preferences:
     #: 初めの場所になり、AI アシスタントが書ける場所にも入る（作品のフォルダと、人が
     #: 窓で選んで書き出した所だけ 2026-10-14 利用者の決定 #350）
     export_folder: str = ""
+    #: 書き出しの窓で前に選んだ形式（#527 ``mp4`` ``webm`` ``mp3`` など
+    #: :data:`~sashimono.engine.encode.FORMAT_KEYS`） 書き出し先のフォルダと同じく
+    #: 好みではなく覚えている物なので、設定画面には出さない BGM だけを何本も書き出す人が
+    #: 窓を開くたびに選び直さずに済む 既定は MP4（今までと同じ）
+    export_format: str = DEFAULT_FORMAT
     #: 持ち出し用パッケージ（#423）を開くときに展開するフォルダ 空は既定
     #: （``%LOCALAPPDATA%\Sashimono\packages``） 素材ごと取り出すので数十 GB になりうる
     #: 空きのある別のドライブへ移したい人がいるので、設定画面で選べるようにする
@@ -1510,6 +1517,7 @@ class PreferenceStore:
             ),
             ocr_engine=_choice(data.get("ocr_engine"), OCR_ENGINES, plain.ocr_engine),
             export_folder=_folder(data.get("export_folder"), plain.export_folder),
+            export_format=_choice(data.get("export_format"), FORMAT_KEYS, plain.export_format),
             package_folder=_folder(data.get("package_folder"), plain.package_folder),
             media_relative_first=_flag(
                 data.get("media_relative_first"), plain.media_relative_first
