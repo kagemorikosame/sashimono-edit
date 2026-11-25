@@ -40,7 +40,7 @@ from sashimono.engine.audio.waveform import Waveform
 from sashimono.engine.cache import SceneState, ScreenState
 from sashimono.engine.cache.thumbnails import Filmstrip
 from sashimono.engine.checks import CheckRequest, CheckState
-from sashimono.engine.encode import BitrateChoice
+from sashimono.engine.encode import DEFAULT_AUDIO_KBPS, BitrateChoice
 from sashimono.engine.vision import ScreenKind
 
 __all__ = [
@@ -89,6 +89,8 @@ class ExportRequest:
     #: 置いた素材に合わせた値を、書き出すスレッドで求めるか（#414） 素材のファイルの大きさを
     #: 読むので、許す前の画面のスレッドで求めると、応えないネットワークの共有で画面が固まる
     match_bitrate: bool = False
+    #: 音声だけの形式（MP3・M4A）の音質（kbps #527） 形式は ``path`` の拡張子で決まる
+    audio_kbps: int = DEFAULT_AUDIO_KBPS
 
 
 @dataclass(frozen=True, slots=True)

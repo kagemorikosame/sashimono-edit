@@ -511,15 +511,23 @@ from sashimono.engine.checks.report import CheckReport, ClipIndex, sorted_proble
 from sashimono.engine.checks.scan import LOUDNESS, SOUND_KINDS
 from sashimono.engine.checks.words import check_words
 from sashimono.engine.encode import (
+    AUDIO_KBPS_CHOICES,
     BITRATE_RANGE_MBPS,
     CONTAINER_SUFFIXES,
+    DEFAULT_AUDIO_KBPS,
     DEFAULT_BITRATE_MBPS,
     RANGE_ALL,
     RANGE_WORK_AREA,
+    WEB_AUTOMATIC_CODECS,
+    WEB_VIDEO_CODECS,
     available_video_codecs,
+    available_web_codecs,
     chosen_range,
     export_target,
+    format_of,
+    has_sound,
 )
+from sashimono.engine.encode.formats import VIDEO_WEB
 from sashimono.engine.highlights import DEFAULT_MIN_SECONDS as HIGHLIGHT_MIN_SECONDS
 from sashimono.engine.highlights import DEFAULT_THRESHOLD as HIGHLIGHT_THRESHOLD
 from sashimono.engine.highlights import LAUGHTER as HIGHLIGHT_LAUGHTER
@@ -11195,7 +11203,26 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
     実行の時点の作品で確かめ直す
     """
     raw = arguments.get("path")
-    _require_suffix(raw, CONTAINER_SUFFIXES, "書き出す動画")
+    _require_suffix(raw, CONTAINER_SUFFIXES, "書き出すファイル")
+    # 形式（#527）は名前の拡張子で決まる 画面の窓の「形式」と同じ表（engine/encode/formats.py）
+    chosen = format_of(Path(str(raw).strip()))
+    if chosen is None:  # 上の拡張子の確かめを通った名前は、どれかの形式に当たる
+        raise ToolError(f"書き出す形式が分かりません: {raw}")
+    raw_kbps = arguments.get("audio_kbps")
+    if raw_kbps is not None and not chosen.audio_quality:
+        # 黙って捨てると、選んだ音質が効いたと思わせる
+        raise ToolError("audio_kbps を選べるのは .mp3 と .m4a（音声だけ）の書き出しだけです")
+    if raw_kbps is None:
+        raw_kbps = DEFAULT_AUDIO_KBPS
+    if (
+        not isinstance(raw_kbps, int)
+        or isinstance(raw_kbps, bool)
+        or raw_kbps not in AUDIO_KBPS_CHOICES
+    ):
+        raise ToolError(
+            f"audio_kbps は {' / '.join(str(kbps) for kbps in AUDIO_KBPS_CHOICES)} のどれかです:"
+            f" {raw_kbps}"
+        )
     # 待つ秒数も確かめの前に見る 確かめの後で断ると、人が許したのに書き出しが始まらない
     _wait_seconds(arguments)
     if host.export_status().get("state") in EXPORT_RUNNING:
@@ -11205,6 +11232,15 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
             "始めてください"
         )
     path = _write_target(host, raw)
+    # 書く先はリンクを辿った後の場所 形式も辿った後の名前で決まる（書き出しの係はそちらで書く）
+    # 名前とリンク先で形式が違えば断る 名前の形式で確かめて箱に出し、リンク先へ別の形式で
+    # 書くと、許した物と書いた物が食い違う（PR #547 の指摘）
+    resolved = format_of(path)
+    if resolved is None or resolved.key != chosen.key:
+        raise ToolError(
+            f"書き出す名前（{Path(str(raw).strip()).suffix}）とリンク先（{path.suffix}）で"
+            "形式が違います リンクではない名前を渡してください"
+        )
     whole = host.document.project
     raw_scene = arguments.get("scene_id")
     scene_id = SceneId(str(raw_scene)) if raw_scene else None
@@ -11223,18 +11259,49 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
         frame_range = chosen_range(target, choice)
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
-    codecs = available_video_codecs()
-    if not codecs:
-        raise ToolError("この機械には使える映像コーデックがありません 書き出せません")
     raw_codec = str(arguments.get("codec") or AUTO)
-    if raw_codec != AUTO and raw_codec not in codecs:
-        raise ToolError(f"codec は {AUTO} か、使える物（{', '.join(codecs)}）から選んでください")
-    codec = None if raw_codec == AUTO else raw_codec
-    # 省いたら画面の書き出しの窓の初めの値と同じ（素材に合わせるかは本人の設定 #414）
     raw_bitrate = arguments.get("bitrate_mbps")
+    if chosen.audio_only:
+        # 音声だけの形式（#527）は映像を書かない 映像の引数を受けると効いたと思わせる
+        # 値ではなく渡したかで見る codec="auto" も渡した物なので断る（PR #547 の指摘）
+        if "codec" in arguments or "bitrate_mbps" in arguments:
+            raise ToolError(
+                f"{path.suffix} は音声だけの書き出しです codec と bitrate_mbps は渡さないでください"
+                "（音質は audio_kbps）"
+            )
+        if not has_sound(target):
+            raise ToolError(
+                "鳴る物が無いので、音声だけの形式では書き出せません 音のクリップを置くか、"
+                "映像の形式（.mp4 など）で書き出してください"
+            )
+        codec = None
+    else:
+        # WebM は VP9 か AV1 だけ（入れ物が H.264 を受けない） 並びは画面の窓と同じ
+        codecs = available_web_codecs() if chosen.video == VIDEO_WEB else available_video_codecs()
+        if not codecs:
+            raise ToolError(
+                f"この機械には {path.suffix} で使える映像コーデックがありません 書き出せません"
+            )
+        if raw_codec != AUTO and raw_codec not in codecs:
+            raise ToolError(
+                f"codec は {AUTO} か、{path.suffix} で使える物（{', '.join(codecs)}）から"
+                "選んでください"
+            )
+        if (
+            raw_codec == AUTO
+            and chosen.video == VIDEO_WEB
+            and not (set(codecs) & set(WEB_AUTOMATIC_CODECS))
+        ):
+            # WebM の自動は VP9 だけ（AV1 へは落とさない） 使えないのに許すと書き出しで失敗する
+            raise ToolError(
+                f"この機械では VP9 を使えません .webm の codec は {', '.join(codecs)} から"
+                "選んでください"
+            )
+        codec = None if raw_codec == AUTO else raw_codec
+    # 省いたら画面の書き出しの窓の初めの値と同じ（素材に合わせるかは本人の設定 #414）
     # 素材に合わせる値は書き出すスレッドで求める ここ（画面のスレッド 許す前）で素材の大きさを
     # 読むと、応えないネットワークの共有で窓が出る前に画面が固まる（PR #451 の CodeRabbit の指摘）
-    match = raw_bitrate is None and host.export_bitrate.auto
+    match = raw_bitrate is None and host.export_bitrate.auto and not chosen.audio_only
     if raw_bitrate is None:
         raw_bitrate = host.export_bitrate.mbps
     low, high = BITRATE_RANGE_MBPS
@@ -11249,11 +11316,17 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
     what = "メイン" if scene is None else f"シーン「{scene.name}」"
     span = "全体" if frame_range is None else "指定した範囲"
     label = "自動" if codec is None else codec
+    if chosen.audio_only:
+        quality = f" / 音質 {raw_kbps} kbps" if chosen.audio_quality else ""
+        form = f"形式 {chosen.label}{quality}"
+    else:
+        form = f"形式 {path.suffix.lstrip('.')} / 映像 {label} / " + (
+            f"素材に合わせる（上限 {raw_bitrate} Mbps）" if match else f"{raw_bitrate} Mbps"
+        )
     parts = [
         f"{what} の{span}（{format_timecode(start, rate)} 〜 {format_timecode(end, rate)}、"
         f"{end - start} フレーム）",
-        f"形式 {path.suffix.lstrip('.')} / 映像 {label} / "
-        + (f"素材に合わせる（上限 {raw_bitrate} Mbps）" if match else f"{raw_bitrate} Mbps"),
+        form,
         _replacing(path, "ファイル"),
     ]
     request = ExportRequest(
@@ -11265,6 +11338,7 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
         match_bitrate=match,
         # 許したときの書き出し先 描く数分の間に名前が現れたり中身が変わったりしたら置かない
         expect=expect_now(path),
+        audio_kbps=raw_kbps,
     )
     _refuse_elsewhere()
     return _ExportPlan(request=request, detail="\n".join(part for part in parts if part))
@@ -11272,8 +11346,11 @@ def _export_plan(host: EditorHost, arguments: dict[str, Any]) -> _ExportPlan:
 
 def _export_consent(host: EditorHost, arguments: dict[str, Any]) -> Consent:
     plan = _export_plan(host, arguments)
+    chosen = format_of(plan.request.path)
     return Consent(
-        action="動画を書き出します",
+        action="音声を書き出します"
+        if chosen is not None and chosen.audio_only
+        else "動画を書き出します",
         target=str(plan.request.path),
         detail=plan.detail,
         basis=plan.request.expect,
@@ -15063,13 +15140,16 @@ OPERATIONS: tuple[Operation, ...] = (
             " 書き出しは裏で進み、すぐ戻る 進み具合は export_status で読み、止めるのは "
             "cancel_export 書けるのは今の作品のフォルダと、書き出しの窓で前に選んだフォルダの"
             "中だけ 元の素材と同じファイルには書かない"
+            " 名前を .wav / .mp3 / .m4a / .flac で終えると、映像を描かずに音声だけを書き出す"
+            "（鳴る物が無い作品では断る）"
         ),
         schema=_schema(
             {
                 "path": _string(
                     "書き出し先 形式は名前の終わりで決まる（"
                     + " / ".join(CONTAINER_SUFFIXES)
-                    + "） 相対の場所は今の作品のフォルダから読む"
+                    + "） .webm の映像は VP9（既定）か AV1、音声は Opus .wav .mp3 .m4a .flac は"
+                    " 音声だけ 相対の場所は今の作品のフォルダから読む"
                 ),
                 "range": {
                     "type": "string",
@@ -15083,13 +15163,24 @@ OPERATIONS: tuple[Operation, ...] = (
                 "codec": _string(
                     f"映像のコーデック {AUTO}（既定 使えなければ次の候補へ）か、"
                     "h264_nvenc / h264_amf / h264_qsv / libx264 などこの機械で使える物"
+                    f" .webm は {' / '.join(WEB_VIDEO_CODECS)}（{AUTO} は VP9）"
+                    " 音声だけの形式では渡さない"
                 ),
                 "bitrate_mbps": _integer(
                     f"映像のビットレート（{BITRATE_RANGE_MBPS[0]}〜{BITRATE_RANGE_MBPS[1]} Mbps）"
                     " 省くと画面の書き出しの窓と同じ初めの値（本人の設定で、置いた素材に合わせて"
                     f"上限 {DEFAULT_BITRATE_MBPS} Mbps か、決めた値）"
                     " 素材より高くしても見た目は良くならず、ファイルだけが大きくなる"
+                    " 音声だけの形式では渡さない"
                 ),
+                "audio_kbps": {
+                    "type": "integer",
+                    "enum": list(AUDIO_KBPS_CHOICES),
+                    "description": (
+                        f"音質（kbps） .mp3 と .m4a だけ 省くと {DEFAULT_AUDIO_KBPS}"
+                        "（画面の書き出しの窓の初めの値と同じ）"
+                    ),
+                },
                 "wait_seconds": _number(
                     f"終わるまで待つ秒数（0〜{MAX_WAIT_SECONDS}、既定 0 は待たずに戻る）"
                     " 待っても終わらなければ、その時の進み具合を返す"

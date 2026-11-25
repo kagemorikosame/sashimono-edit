@@ -76,6 +76,7 @@ def test_the_window_passes_the_setting_to_the_export(
     class Recorder:
         embeds_chapters = True
         started_folder = None
+        chosen_format = "mp4"
 
         def __init__(self, *_arguments: object, gpu_color: bool = True, **_options: object):
             seen.append(gpu_color)
