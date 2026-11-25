@@ -966,6 +966,13 @@ class Preferences:
     #: 作品のフォルダを写して別の作品にした人は、写した先の素材を指してほしいことがあり、
     #: 元の素材を指してほしい人もいる 既定は前の版と同じ物を開く側
     media_relative_first: bool = False
+    #: 素材の既定（#524）をほかの作品でも使う 真（既定）なら、覚えた既定を本人の置き場にも
+    #: 書き、読み込んだ素材へ写す 本人が〔既定にする〕を選んだのだから、別の作品で同じ素材を
+    #: 置いたときにも効くと思うのが自然 作品ごとに置き方を変えたい人は切る
+    media_defaults_global: bool = True
+    #: 〔静止画をタイムラインへ置く〕（#525）で置く長さ（秒） 止め絵に使う人とサムネイルに使う人で
+    #: 欲しい長さが違う 既定は素材の静止画を置くときと同じ 5 秒
+    still_seconds: int = 5
     #: 持ち出し用に書き出す窓で前に選んだ物 好みではなく覚えている物なので設定画面には出さない
     #: 窓の既定は知らない人が困らない側（使う範囲だけ・前後 1 秒・付け足しの情報を取り除く）
     #: 素材をまるごと入れる
@@ -1507,6 +1514,12 @@ class PreferenceStore:
             media_relative_first=_flag(
                 data.get("media_relative_first"), plain.media_relative_first
             ),
+            media_defaults_global=_flag(
+                data.get("media_defaults_global"), plain.media_defaults_global
+            ),
+            still_seconds=_within(
+                data.get("still_seconds"), STILL_SECONDS_RANGE, plain.still_seconds
+            ),
             package_whole=_flag(data.get("package_whole"), plain.package_whole),
             package_margin_seconds=_within(
                 data.get("package_margin_seconds"), PACKAGE_MARGINS, plain.package_margin_seconds
@@ -1748,6 +1761,8 @@ BACKUP_GENERATIONS_RANGE = (1, 200)
 
 #: 残った退避を片付けるまでの日数として受け付ける範囲 0 は片付けない
 RECOVERY_KEEP_DAYS_RANGE = (0, 365)
+#: 〔静止画をタイムラインへ置く〕の長さ（秒 #525） 0 は置いても見えない 10 分を超える止め絵は無い
+STILL_SECONDS_RANGE = (1, 600)
 
 #: 置き場の容量の上限として受け付ける範囲（MB） 0 は上限なし 上は 1TB
 #: 小さくしても大事な物（今の退避と各プロジェクトのいちばん新しい控え）は消さないので、

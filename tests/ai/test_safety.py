@@ -206,6 +206,9 @@ class TestAppSettingsAreReadOnly:
             # ナレーション（#335） 作品のフォルダの下の narration を用意し、そこへ WAV を書く
             # 作品を書く口で、アプリの設定は変えない 書く先は pinned_place で確かめた所だけ
             "make_narration_folder",
+            # 静止画を素材にする（#525） 作品のフォルダの下の stills を用意する ナレーションと同じく
+            # 作品を書く口で、アプリの設定は変えない 書くのは write_snapshot
+            "make_still_folder",
             # 開く・新規（#349） 作品を差し替える 取り消せない操作の道具からだけ呼ぶ
             # アプリ自身の設定は変えない（新しい作品の初めの値は本人の設定を読むだけ）
             "open_project_file",
@@ -302,6 +305,8 @@ WRITING_PORTS = frozenset(
         "copy_text",
         "make_narration_folder",
         "write_narration",
+        # 静止画を素材にする（#525） 文書の同じ一覧に書いてある
+        "make_still_folder",
         # 場面の説明を素材の解析の控えに覚える（#326） 文書の同じ一覧に書いてある
         "remember_scene_notes",
         # 持ち出し用パッケージ（#423） 文書の同じ一覧に書いてある

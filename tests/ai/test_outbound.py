@@ -543,6 +543,12 @@ WRITE_EXAMPLES: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = {
     "rename_scene": lambda _ids: {"scene_id": "無い", "name": "場面"},
     "remove_scene": lambda _ids: {"scene_id": "無い"},
     "remove_media": lambda ids: {"media_id": ids["media"]},
+    # 素材を持たないテキストからは覚えられないので断る（#524）
+    "set_media_defaults": lambda ids: {"clip_id": ids["text"]},
+    # テキストは動画の絵を持たないので止められずに断る（#525）
+    "freeze_frame": lambda ids: {"clip_id": ids["text"], "frame": 0},
+    # 作品を保存していないので書く場所が無く断る（#525）
+    "snapshot_to_media": lambda _ids: {"place": True},
     "set_work_area": lambda _ids: {"start_frame": 0, "end_frame": 30},
     "add_filter": lambda _ids: {},
     "add_group_control": lambda _ids: {},

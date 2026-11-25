@@ -36,6 +36,7 @@ from sashimono.core.model import (
     Keyframe,
     LayerMode,
     Marker,
+    MediaDefaults,
     MediaId,
     MediaItem,
     PackedSpan,
@@ -74,6 +75,8 @@ __all__ = [
     "json_text",
     "keep_pre_upgrade_copy",
     "load_project",
+    "media_defaults_from_json",
+    "media_defaults_to_json",
     "project_from_dict",
     "project_to_dict",
     "save_project",
@@ -589,7 +592,71 @@ def _media_to_json(item: MediaItem, base: Path | None = None) -> dict[str, Any]:
             if item.packed
             else {}
         ),
+        # 置き方の既定（#524）は覚えたときだけ書く 版は上げない 前の本体は項目を捨てて開き、
+        # 絵も音も変わらない（次に置くときの初めの値が無くなるだけ） 版を上げて前の本体で
+        # 開けなくするほどの損ではない
+        **(
+            {"defaults": media_defaults_to_json(item.defaults)}
+            if item.defaults is not None and not item.defaults.is_empty
+            else {}
+        ),
     }
+
+
+def media_defaults_to_json(defaults: MediaDefaults) -> dict[str, Any]:
+    """置き方の既定（#524）を辞書へ 作品の素材と、本人の置き場（アプリ全体）の両方で使う"""
+    written: dict[str, Any] = {
+        "picture": [effect_to_json(effect) for effect in defaults.picture],
+        "sounds": [
+            {"stream": index, "effects": [effect_to_json(effect) for effect in effects]}
+            for index, effects in defaults.sounds
+        ],
+    }
+    if defaults.opacity is not None:
+        written["opacity"] = defaults.opacity
+    if defaults.native_size is not None:
+        written["native_size"] = defaults.native_size
+    if defaults.offset is not None:
+        written["offset"] = _fraction_to_json(defaults.offset)
+    return written
+
+
+def media_defaults_from_json(raw: object) -> MediaDefaults:
+    """:func:`media_defaults_to_json` の逆 形の違う物は :class:`ProjectFileError`
+
+    中のエフェクトの値の形の違い（数の欄に配列など）で出る :class:`ValueError` と
+    :class:`TypeError` もここでまとめて直す 出したままだと、作品を開く側が既定だけを
+    捨てられずに作品ごと開けなくなる
+    """
+    try:
+        return _media_defaults(raw)
+    except ProjectFileError:
+        raise
+    except (ValueError, TypeError) as error:
+        raise ProjectFileError(f"置き方の既定が壊れている: {error}") from error
+
+
+def _media_defaults(raw: object) -> MediaDefaults:
+    data = _require(raw, "defaults")
+    sounds = []
+    for entry in _get_list(data, "sounds"):
+        pair = _require(entry, "sound")
+        effects = tuple(effect_from_json(effect) for effect in _get_list(pair, "effects"))
+        sounds.append((_get_int(pair, "stream"), effects))
+    opacity = data.get("opacity")
+    if opacity is not None and (isinstance(opacity, bool) or not isinstance(opacity, int | float)):
+        raise ProjectFileError(f"opacity が数ではない: {opacity!r}")
+    native_size = data.get("native_size")
+    if native_size is not None and not isinstance(native_size, bool):
+        raise ProjectFileError(f"native_size が真偽ではない: {native_size!r}")
+    offset = data.get("offset")
+    return MediaDefaults(
+        picture=tuple(effect_from_json(effect) for effect in _get_list(data, "picture")),
+        opacity=None if opacity is None else float(opacity),
+        native_size=native_size,
+        sounds=tuple(sorted(sounds, key=lambda pair: pair[0])),
+        offset=None if offset is None else _fraction_from_json(offset, "offset"),
+    )
 
 
 def _media_place(
@@ -675,6 +742,7 @@ def _media_from_json(
         display_name=_get_str(data, "display_name"),
         id=MediaId(_get_str(data, "id")),
         packed=_packed_from_json(data),
+        defaults=_defaults_or_none(data.get("defaults")),
     )
     # 7 までは素材に 1 つ（1 本目の音声の字幕） 8 からは音声ストリームごと
     legacy = data.get("transcript")
@@ -686,6 +754,20 @@ def _media_from_json(
             _transcript_from_json(pair.get("transcript")), _get_int(pair, "stream")
         )
     return item
+
+
+def _defaults_or_none(raw: object) -> MediaDefaults | None:
+    """素材の置き方の既定（#524） 無いか壊れていれば ``None``
+
+    壊れていても作品は開く 既定は次に置くときの初めの値でしかなく、そのために作品ごと
+    開けなくすると、編集したクリップまで触れなくなる
+    """
+    if raw is None:
+        return None
+    try:
+        return media_defaults_from_json(raw)
+    except ProjectFileError:
+        return None
 
 
 def _packed_from_json(data: dict[str, Any]) -> tuple[PackedSpan, ...]:

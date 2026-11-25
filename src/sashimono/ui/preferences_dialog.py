@@ -166,6 +166,7 @@ from sashimono.ui.workspace import (
     SCRIPTS_MOVE_AUTO,
     SCRIPTS_MOVE_OFF,
     SNAP_DISTANCES,
+    STILL_SECONDS_RANGE,
     SUBTITLE_WRAP_PERCENTS,
     Preferences,
 )
@@ -951,6 +952,29 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._media_relative_first)
 
+        # 素材の既定（#524）を作品をまたいで覚えるか 作品ごとに置き方を変えたい人がいる
+        self._media_defaults_global = QCheckBox(
+            "素材の既定（位置・大きさ・音量・頭のずれ）をほかの作品でも使う", self
+        )
+        self._media_defaults_global.setChecked(preferences.media_defaults_global)
+        self._media_defaults_global.setToolTip(
+            "クリップの右クリック〔この設定を素材の既定にする〕で覚えた既定を、作品の外にも覚え、"
+            "別の作品で同じ素材を読み込んだときにも初めの値にする 素材は中身で見分けるので、"
+            "場所や名前を変えても効く 切ると、覚えるのも使うのもその作品の中だけになる"
+        )
+        form.addRow(self._media_defaults_global)
+
+        # 〔静止画をタイムラインへ置く〕の長さ（#525） 止め絵とサムネイルで欲しい長さが違う
+        self._still_seconds = QSpinBox(self)
+        self._still_seconds.setRange(*STILL_SECONDS_RANGE)
+        self._still_seconds.setSuffix(" 秒")
+        self._still_seconds.setValue(preferences.still_seconds)
+        self._still_seconds.setToolTip(
+            "編集メニューとプレビューの右クリックの〔静止画をタイムラインへ置く〕で置く長さ"
+            " 置いた後はふつうのクリップと同じく端をドラッグして変えられる"
+        )
+        form.addRow("静止画をタイムラインへ置く長さ", self._still_seconds)
+
         self._wheel_unfocused = QCheckBox(
             "設定パネルで、クリックしていない欄でもホイールで値を変える", self
         )
@@ -1653,6 +1677,8 @@ class PreferencesDialog(QDialog):
             save_overwrite_without_asking=self._save_overwrite.isChecked(),
             package_folder=self._package_folder.folder(),
             media_relative_first=self._media_relative_first.isChecked(),
+            media_defaults_global=self._media_defaults_global.isChecked(),
+            still_seconds=self._still_seconds.value(),
             wheel_unfocused=self._wheel_unfocused.isChecked(),
             timeline_snap=self._timeline_snap.isChecked(),
             snap_distance=self._snap_distance.value(),
