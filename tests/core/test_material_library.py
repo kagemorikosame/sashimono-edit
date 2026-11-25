@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -505,3 +506,43 @@ def test_an_unknown_id_is_not_scanned_for_when_asked_not_to(tmp_path: Path) -> N
     assert library.find_for_ai(file_id(sound)) is not None
     # 一度見つけた印は見て回らずに引ける
     assert library.find_for_ai(file_id(sound), scan=False) is not None
+
+
+def test_reading_the_book_ahead_does_not_hold_up_saving_or_measuring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 壊れると、初めての先読みの間に窓を閉じると終わりの保存が待たされ、先読みが終わったときに
+    # その間に測った値を古い控えで上書きする
+    sound = _touch(tmp_path / "SE" / "ドン.wav")
+    store = tmp_path / "measures.json"
+    store.write_text(json.dumps({"version": 1, "files": {}}), encoding="utf-8")
+    book = MeasureBook(path=store)
+    gate = threading.Event()
+    reading = threading.Event()
+    original = material_library._read_book
+    calls: list[int] = []
+
+    def slow(path: Path | None) -> dict[str, dict[str, object]]:
+        calls.append(1)
+        if len(calls) == 1:
+            reading.set()
+            gate.wait()
+        return original(path)
+
+    monkeypatch.setattr(material_library, "_read_book", slow)
+    worker = threading.Thread(target=book.preload)
+    worker.start()
+    try:
+        assert reading.wait(5)
+        book.save()  # 何も測っていないので、先読みを待たずに戻る
+        file = (
+            MaterialLibrary(folders=(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT),))
+            .scan_for_ai()[0]
+            .files[0]
+        )
+        measure = Measure(seconds=0.8, has_audio=True, has_video=False)
+        book.put(file, measure)
+    finally:
+        gate.set()
+        worker.join(5)
+    assert book.get(file) == measure

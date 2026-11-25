@@ -575,3 +575,53 @@ class TestSelfReviewFive:
         assert result is not None
         assert result.skipped and all("変わった" in reason for _, reason in result.skipped)
         assert len(work.document.project.media) == before
+
+
+class TestSixthReview:
+    def test_a_replaced_sound_is_skipped_even_when_read_in_by_hand(
+        self, work: _LibraryHost, folders: dict[str, Path]
+    ) -> None:
+        # 壊れると、計画の後で差し替えた長い音を人が取り込むと、その素材へ計画のときの短い長さで置く
+        row = _file(work, "ドン.wav")
+        run(work, "propose_direction", cues=_cues(), sound_file_id=row["file_id"])
+        sound = folders[CATEGORY_SOUND_EFFECT] / "ドン.wav"
+        sound.write_bytes(b"replaced and longer")
+        work.document.execute(
+            AddMedia(MediaItem(path=sound, duration=Fraction(3), audio_streams=_AUDIO))
+        )
+        result = proposal_for(work.document).apply(work.document)
+        assert result is not None
+        assert result.skipped and all("変わった" in reason for _, reason in result.skipped)
+        # 寄る・揺らすは付くが、差し替えた音はどこにも置かない
+        placed = {
+            clip.media_id for track in work.document.project.timeline.tracks for clip in track.clips
+        }
+        held = [m.id for m in work.document.project.media if m.path == sound]
+        assert held and not placed.intersection(held)
+
+    def test_a_sound_changed_while_probing_is_refused(
+        self, work: _LibraryHost, folders: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、調べている間に差し替わった音の古い長さに新しい版を付け、〔付ける〕で古い長さの
+        # まま取り込む
+        row = _file(work, "ドン.wav")
+        sound = folders[CATEGORY_SOUND_EFFECT] / "ドン.wav"
+        original = work.probe
+
+        def changing(path: Path) -> MediaItem:
+            item = original(path)
+            sound.write_bytes(b"replaced while probing")
+            return item
+
+        monkeypatch.setattr(work, "probe", changing)
+        with pytest.raises(ToolError, match="変わりました"):
+            run(work, "propose_direction", cues=_cues(), sound_file_id=row["file_id"])
+
+    def test_finished_searches_are_not_kept(self, work: _LibraryHost) -> None:
+        # 壊れると、違う名前で探すたびに見つけた一覧が窓を閉じるまで残る
+        from sashimono.ai import operations
+
+        _search(work, query="ドン")
+        _search(work, query="拍手")
+        looks = operations._LIBRARY_LOOKS[work.material.book]
+        assert len(looks) == 1

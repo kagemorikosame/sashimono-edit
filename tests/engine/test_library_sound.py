@@ -26,17 +26,19 @@ from tests.waiting import wait_until
 class _Sink:
     """鳴らさずに受け取る出口 機械の出口を待たないので、時計より速く読み進む"""
 
-    def __init__(self, gate: threading.Event | None = None) -> None:
+    def __init__(self, gate: threading.Event | None = None, *, hold_first: bool = False) -> None:
         self.samples = 0
         self.closed = threading.Event()
         self.drained: bool | None = None
         #: 渡すと、最初の 1 回を書いた後はこれが立つまで次を書かせない（止める間合いを決める）
         self._gate = gate
+        #: 真なら最初の 1 回からこれが立つまで書かせない（最初の読み込みが遅い機械の代わり）
+        self._hold_first = hold_first
 
     def write(self, samples: np.ndarray) -> None:
-        self.samples += len(samples)
-        if self._gate is not None:
+        if self._gate is not None and (self.samples > 0 or self._hold_first):
             self._gate.wait()
+        self.samples += len(samples)
 
     def close(self, drain: bool) -> None:
         self.drained = drain
@@ -114,13 +116,15 @@ class TestPreviewPlayer:
         player.play()
         assert player.playing
         wait_until(lambda: bool(sinks) and sinks[0].samples > 0, "下見の音")
-        clock.now = 1.0
-        assert player.position == pytest.approx(1.0)
+        # 出口へ書いた所（最初の 1 ブロック 約 0.04 秒）の内で止める 書いた所より先では
+        # 止めた所から再開しない作り（:meth:`PreviewPlayer.pause`）
+        clock.now = 0.02
+        assert player.position == pytest.approx(0.02)
         player.pause()
         assert not player.playing
         gate.set()
         wait_until(sinks[0].closed.is_set, "止めた後の出口の片付け")
-        assert player.position == pytest.approx(1.0)
+        assert player.position == pytest.approx(0.02)
         player.seek(2.5)
         assert player.position == pytest.approx(2.5)
         # 終わりまで来たら止まった形になり、次の〔再生〕は頭から
@@ -180,17 +184,25 @@ class TestPreviewPlayer:
         # 壊れると、再生中に終わりの近くへ飛ぶと頭へ戻り、飛んだ所が聞けない
         path = write_tone(tmp_path / "音.wav", tone(3.0, -12.0))
         clock = _Clock()
-        player = PreviewPlayer(sink=lambda _rate, _channels: _Sink(), clock=clock)
-        player.open(path)
-        player.play()
-        player.seek(2.98)
-        assert player.position == pytest.approx(2.98)
-        # 止めている間に終わりの近くへ飛んでから〔再生〕を押しても頭へ戻さない
-        player.pause()
-        player.seek(2.98)
-        player.play()
-        assert player.position == pytest.approx(2.98)
-        player.close()
+        # 位置を読み終えるまで出口へ書かせない 書き切らせると、位置を読む前に鳴らし切って
+        # 終わりで止まった形になり、正しい動きでも試験が揺れる
+        gate = threading.Event()
+        player = PreviewPlayer(
+            sink=lambda _rate, _channels: _Sink(gate, hold_first=True), clock=clock
+        )
+        try:
+            player.open(path)
+            player.play()
+            player.seek(2.98)
+            assert player.position == pytest.approx(2.98)
+            # 止めている間に終わりの近くへ飛んでから〔再生〕を押しても頭へ戻さない
+            player.pause()
+            player.seek(2.98)
+            player.play()
+            assert player.position == pytest.approx(2.98)
+        finally:
+            gate.set()
+            player.close()
 
     def test_a_short_sound_waits_for_the_output(self, tmp_path: Path) -> None:
         # 壊れると、出口を開くのが音の長さより遅い短い効果音は 1 つも書かないまま終わる
@@ -212,8 +224,11 @@ class TestPreviewPlayer:
         assert player.playing
         assert player.position == pytest.approx(0.0)
         opened.set()
-        wait_until(lambda: bool(sinks) and sinks[0].closed.is_set(), "短い音の書き終わり")
-        assert sinks[0].samples > 0
+        wait_until(lambda: bool(sinks) and sinks[0].samples > 0, "短い音の書き始め")
+        # 鳴らし切るのは時計が終わりへ着いてから
+        clock.now = 2.0
+        wait_until(sinks[0].closed.is_set, "短い音の書き終わり")
+        assert sinks[0].drained is True
 
     def test_a_sound_that_cannot_play_stops(self, tmp_path: Path) -> None:
         # 壊れると、出口を開けない機械で時計だけが進み、〔一時停止〕のまま押し直しても試せない
@@ -251,7 +266,9 @@ class TestPreviewPlayer:
         # 終わりまで鳴らしたときだけ鳴らし切る
         player.seek(0.0)
         player.play()
-        wait_until(lambda: len(sinks) == 2 and sinks[1].closed.is_set(), "鳴らし切り")
+        wait_until(lambda: len(sinks) == 2 and sinks[1].samples > 0, "2 回目の音")
+        clock.now = 10.0
+        wait_until(sinks[1].closed.is_set, "鳴らし切り")
         assert sinks[1].drained is True
 
     def test_a_broken_picture_does_not_silence_the_sound(
@@ -336,3 +353,47 @@ class TestPreviewPlayer:
         clock.now = 5.0
         assert not player.playing
         assert player.position == pytest.approx(1.0, abs=0.05)
+
+    def test_pausing_before_anything_is_written_resumes_from_the_start(
+        self, tmp_path: Path
+    ) -> None:
+        # 壊れると、最初の読み込みが音の長さより遅い短い効果音で〔一時停止〕すると、時計の進んだ
+        # 末尾から再開し、何も鳴らずに終わる
+        path = write_tone(tmp_path / "短い.wav", tone(0.05, -12.0))
+        gate = threading.Event()
+        sinks: list[_Sink] = []
+
+        def make(_rate: int, _channels: int) -> _Sink:
+            sinks.append(_Sink(gate, hold_first=True))
+            return sinks[-1]
+
+        clock = _Clock()
+        player = PreviewPlayer(sink=make, clock=clock)
+        try:
+            player.open(path)
+            player.play()
+            wait_until(lambda: bool(sinks), "出口")
+            clock.now = 5.0
+            player.pause()
+            assert player.position == pytest.approx(0.0)
+        finally:
+            gate.set()
+            player.close()
+
+    def test_pausing_while_the_last_block_plays_throws_it_away(self, tmp_path: Path) -> None:
+        # 壊れると、最後のブロックを書いた後に〔一時停止〕しても、出口に残った音が鳴り切る
+        path = write_tone(tmp_path / "短い.wav", tone(0.05, -12.0))
+        sinks: list[_Sink] = []
+
+        def make(_rate: int, _channels: int) -> _Sink:
+            sinks.append(_Sink())
+            return sinks[-1]
+
+        player = PreviewPlayer(sink=make, clock=_Clock())
+        player.open(path)
+        player.play()
+        wait_until(lambda: bool(sinks) and sinks[0].samples >= int(0.05 * 48000), "書き終わり")
+        assert player.playing
+        player.pause()
+        wait_until(sinks[0].closed.is_set, "止めた後の片付け")
+        assert sinks[0].drained is False

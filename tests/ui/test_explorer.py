@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import os
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -544,6 +545,8 @@ class TestFavorites:
         _settle(panel)
         index = panel._icons_view.currentIndex()
         option = QStyleOptionViewItem()
+        # 型の上では QAbstractItemDelegate を返すが、中身は initStyleOption を持つ
+        # QStyledItemDelegate（型の宣言が親の型なので無視する）
         panel._icons_view.itemDelegate().initStyleOption(option, index)  # type: ignore[attr-defined]
         assert option.text.startswith(STAR_ON)
 
@@ -949,27 +952,22 @@ class TestSelfReviewFive:
 
     def test_a_replaced_file_is_opened_again(self, panel: ExplorerPanel, sounds: Path) -> None:
         # 壊れると、読み直した後も、差し替える前のファイルの長さと絵のまま下見する
+        target = write_tone(sounds / "ドン.wav", tone(0.5, -12.0))
         panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
         _settle(panel)
-        target = sounds / "ドン.wav"
         panel.select_file(target)
         _settle(panel)
-        opened: list[Path | None] = []
-        original = panel.preview.show_file
-
-        def recorded(path: Path | None, *rest: object) -> None:
-            opened.append(path)
-            original(path, *rest)  # type: ignore[arg-type]
-
-        panel.preview.show_file = recorded  # type: ignore[method-assign, assignment]
-        target.write_bytes(b"replaced and longer")
-        os.utime(target, ns=(1_000_000_000, 1_000_000_000))
+        before = panel.preview.player.info
+        assert before is not None and before.duration == pytest.approx(0.5, abs=0.01)
+        write_tone(target, tone(1.5, -12.0))
+        # 同じ秒の内に書き直しても版が変わるように、更新時刻をはっきり動かす
+        stat = target.stat()
+        os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
         panel.rescan()
         _settle(panel)
-        panel.select_file(target)
-        _settle(panel)
-        assert panel.preview._version is not None
-        assert opened and opened[-1] == target
+        assert panel.selected_files() == [target]
+        after = panel.preview.player.info
+        assert after is not None and after.duration == pytest.approx(1.5, abs=0.01)
 
     def test_a_measure_that_arrives_after_moving_is_kept(
         self, qt_application: QApplication, sounds: Path
@@ -989,22 +987,52 @@ class TestSelfReviewFive:
         try:
             panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
             wait_until(lambda: bool(asked), "測り始め", step=_process)
+            measuring = asked[0]
+            # 先に移った先の一覧を出し切り、測っている物がそこに無いことを確かめる
             panel.open_folder(str(sounds / "爆発"))
-            release.set()
             _settle(panel)
-            measured = list(asked)
-            assert measured
+            assert measuring not in panel.visible_files()
             file = LibraryFile(
-                path=measured[0],
+                path=measuring,
                 folder=LibraryFolder(str(sounds), CATEGORY_SOUND_EFFECT),
-                size=measured[0].stat().st_size,
-                modified_ns=measured[0].stat().st_mtime_ns,
+                size=measuring.stat().st_size,
+                modified_ns=measuring.stat().st_mtime_ns,
             )
-            assert book.get(file) is not None
+            assert book.get(file) is None
+            # 次に測り終えさせ、届いた物が控えに入るまで待つ
+            release.set()
+            wait_until(lambda: book.get(file) is not None, "控えに入る", step=_process)
         finally:
             release.set()
             panel.shutdown()
             panel.deleteLater()
+
+    def test_the_last_file_is_not_chosen_after_moving_elsewhere(
+        self, panel: ExplorerPanel, sounds: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、前回の場所を読んでいる間に分類の根へ移ると、根の一覧で前回のファイルを
+        # 勝手に選ぶ
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        gate = threading.Event()
+        original = explorer_module._listing
+
+        def held(*args: Any, **kwargs: Any) -> object:
+            gate.wait()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(explorer_module, "_listing", held)
+        try:
+            panel.restore_location(str(sounds / "爆発"), str(sounds / "爆発" / "ドカン.mp3"))
+            wait_until(lambda: panel._restoring is None, "前回の場所の確かめ", step=_process)
+            root = panel._category_root(CATEGORY_SOUND_EFFECT)
+            assert root is not None
+            panel._tree.setCurrentItem(root)
+        finally:
+            gate.set()
+        _settle(panel)
+        assert sounds / "爆発" / "ドカン.mp3" in panel.visible_files()
+        assert panel.selected_files() == []
 
     def test_a_job_asked_again_while_running_is_not_run_twice(
         self, qt_application: QApplication
@@ -1028,6 +1056,40 @@ class TestSelfReviewFive:
             release.set()
             wait_until(lambda: not worker.busy, "終わり", step=_process)
             assert started == ["x"]
+        finally:
+            release.set()
+            worker.close()
+
+    def test_a_new_version_is_taken_while_the_old_one_runs(
+        self, qt_application: QApplication, tmp_path: Path
+    ) -> None:
+        # 壊れると、測っている間に差し替えて〔読み直す〕を押しても、新しい版が測られず長さが出ない
+        del qt_application
+        worker = explorer_module._Worker(workers=2)
+        release = threading.Event()
+        started: list[str] = []
+        folder = LibraryFolder(str(tmp_path), CATEGORY_SOUND_EFFECT)
+        old = LibraryFile(path=tmp_path / "ドン.wav", folder=folder, size=1, modified_ns=1)
+        new = LibraryFile(path=tmp_path / "ドン.wav", folder=folder, size=2, modified_ns=2)
+
+        def job(name: str) -> Callable[[], object]:
+            def run() -> object:
+                started.append(name)
+                release.wait()
+                return None
+
+            return run
+
+        try:
+            worker.submit(explorer_module._job_key("measure", old), job("old"))
+            wait_until(lambda: bool(started), "走り始め", step=_process)
+            worker.forget()
+            worker.submit(explorer_module._job_key("measure", old), job("old again"))
+            worker.submit(explorer_module._job_key("measure", new), job("new"))
+            wait_until(lambda: "new" in started, "新しい版", step=_process)
+            release.set()
+            wait_until(lambda: not worker.busy, "終わり", step=_process)
+            assert sorted(started) == ["new", "old"]
         finally:
             release.set()
             worker.close()

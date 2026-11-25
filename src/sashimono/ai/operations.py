@@ -2850,10 +2850,10 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         sound = _require_media(project, str(raw_sound))
     elif raw_file:
         # 登録したフォルダの効果音（#522） 計画に出すだけで、取り込むのは人の〔付ける〕
-        sound, fresh = _library_media(host, raw_file)
-        if fresh:
-            # 取り込むのは〔付ける〕のとき その間にファイルが差し替わったら付けない
-            version = file_version(sound.path)
+        # 取り込むのは〔付ける〕のとき その間にファイルが差し替わったら付けない 版は調べる前と後の
+        # 両方で取り、同じときだけ調べた素材と組にする（調べている間に差し替わると、古い長さの
+        # 素材に新しい版を付けてしまう）
+        sound, version = _library_media_versioned(host, raw_file)
     if sound is not None:
         problem = sound_problem(sound)
         if problem is not None:
@@ -3595,6 +3595,10 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
         look = looks.get(key)
         fresh = look is None or look.done.is_set()
         if fresh:
+            # 終わった仕事は置いておかない（待っている呼び出しは仕事を直に持つので、外しても
+            # 読める） 置いたままにすると、違う名前で探すたびに見つけた一覧が窓を閉じるまで残る
+            for old in [name for name, held in looks.items() if held.done.is_set()]:
+                del looks[old]
             look = _LibraryLook()
             looks[key] = look
     assert look is not None
@@ -3772,6 +3776,31 @@ def _library_media(host: EditorHost, raw: object) -> tuple[MediaItem, bool]:
             f"登録したフォルダのファイルを開けません（{raw}） 壊れているか、読めない形式です"
             " 別の file_id を選んでください"
         ) from None
+
+
+def _library_media_versioned(
+    host: EditorHost, raw: object
+) -> tuple[MediaItem, tuple[int, int] | None]:
+    """:func:`_library_media` と、取り込みが要る素材なら調べたときのファイルの版
+
+    版は調べる前と後で取り、読めないか違えば断る（調べた長さと版が同じファイルの物と言えない）
+    作品の素材にもうある物は版を持たない（取り込まないので差し替わりの心配が無い）
+    """
+    if isinstance(raw, str) and raw:
+        known = host.material_library.find_for_ai(raw, scan=False)
+        before = file_version(known.path) if known is not None else None
+    else:
+        before = None
+    media, fresh = _library_media(host, raw)
+    if not fresh:
+        return media, None
+    after = file_version(media.path)
+    if before is None or before != after:
+        raise ToolError(
+            f"登録したフォルダのファイルが調べている間に変わりました（{raw}）"
+            " もう一度呼んでください"
+        )
+    return media, after
 
 
 def _hiding_library_names(

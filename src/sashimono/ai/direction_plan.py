@@ -446,9 +446,10 @@ def apply_items(
             if (
                 sound is not None
                 and item.sound_version is not None
-                and _held(document.project, sound) is None
                 and file_version(sound.path) != item.sound_version
             ):
+                # 後から同じ場所のファイルを取り込んでいても版で見る（置くクリップの長さは計画の
+                # ときの長さ 差し替えた長い音を取り込んだ素材へ、短い長さのまま置かない）
                 # 計画の後でファイルが差し替わった（消えた） 計画を出したときに調べた長さと流れの
                 # まま取り込むと、置いたクリップが今のファイルと合わない
                 skipped.append(

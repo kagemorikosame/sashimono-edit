@@ -258,7 +258,8 @@ class _Worker(QObject):
         #: 仕事の登録まで消さないためと、取り消した仕事を始めずに飛ばすため
         self._pending: dict[str, object] = {}
         #: 走っている仕事の名前 場所を移って取り消した後に同じ物を頼み直しても、走っている物の
-        #: 結果が届くので 2 回目は始めない（始めると同じ音を 2 回読む）
+        #: 結果が届くので 2 回目は始めない（始めると同じ音を 2 回読む） 名前にはファイルの版を
+        #: 入れる（:func:`_job_key`）ので、差し替えた後の版の頼みは走っている古い版と別に受け付ける
         self._running: set[str] = set()
         self._lock = threading.Lock()
         self._closed = False
@@ -1471,7 +1472,10 @@ class ExplorerPanel(QWidget):
         if not self._rebuilding:
             # 人が木で選んだ（作り直しで選び直したのではない） 確かめている途中の前回の場所は
             # 開かない 遅れて届いた結果で、人の選んだ場所を前回の場所に置き換えない
+            # 前回の場所の読み終えたら選ぶファイルも捨てる 残すと、移った先の一覧にそのファイルが
+            # あれば（分類の根など）勝手に選ぶ
             self._restoring = None
+            self._pending_select = []
         self._show_files()
 
     def _favorite_root(self) -> QTreeWidgetItem | None:
@@ -1768,7 +1772,7 @@ class ExplorerPanel(QWidget):
             # 物が頭に並んだ一覧で〔読み直す〕を押しても、後ろの読める物がいつまでも測られない
             unmeasured = [file for file in unmeasured if not self._book.failed(file)]
             for file in unmeasured[:_MEASURE_LIMIT]:
-                self._worker.submit(f"measure:{file.id}", _measured(measurer, file))
+                self._worker.submit(_job_key("measure", file), _measured(measurer, file))
         if self._view_mode == VIEW_ICONS:
             self._request_icons()
         self._on_selection()
@@ -1834,7 +1838,8 @@ class ExplorerPanel(QWidget):
         return [self._model.item(row, column) for column in range(len(COLUMNS))]
 
     def _on_worker(self, key: str, result: object) -> None:
-        kind, _, file_key = key.partition(":")
+        kind, _, rest = key.partition(":")
+        file_key = rest.partition("|")[0]
         file = self._files.get(file_key)
         if kind == "measure" and isinstance(result, tuple):
             asked, measure = result
@@ -1892,7 +1897,7 @@ class ExplorerPanel(QWidget):
                     return (target, cached)
                 return _kept(store, target, "peaks", sound_peaks(target.path, _PEAK_COLUMNS))
 
-            self._worker.submit(f"peaks:{file.id}", peaks)
+            self._worker.submit(_job_key("peaks", file), peaks)
             return
 
         def still(target: LibraryFile = file) -> object:
@@ -1902,7 +1907,7 @@ class ExplorerPanel(QWidget):
             tile = still_of(target.path)
             return _kept(store, target, "still", None if tile is None else _small_tile(tile))
 
-        self._worker.submit(f"still:{file.id}", still)
+        self._worker.submit(_job_key("still", file), still)
 
     # --- 表示 ---
 
@@ -2166,6 +2171,11 @@ def _favorite_listing(
     if missing:
         notes.append(f"{missing} 個が見つかりません（消えたか移った） 右クリックで外せます")
     return matched, "  ".join(notes)
+
+
+def _job_key(kind: str, file: LibraryFile) -> str:
+    """裏の仕事の名前 種類と印と版（大きさと更新時刻） 版が違えば別の仕事として受け付ける"""
+    return f"{kind}:{file.id}|{file.size}-{file.modified_ns}"
 
 
 def _stamp(file: LibraryFile) -> str:

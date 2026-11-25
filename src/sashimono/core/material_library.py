@@ -618,8 +618,15 @@ class MeasureBook:
         """控えのファイルを先に読んでおく（裏のスレッドから呼ぶ） 初めて一覧を並べるときに、
         画面のスレッドで数万行の控えを読まない
         """
+        # 読むのは錠の外 錠の内で読むと、初めての先読みの間に窓を閉じたときに、終わりの保存
+        # （:meth:`save`）が読み終えるまで待つ 読み終えたときに、その間に測って入れた物が
+        # あれば（:meth:`put` が先に読んだ）読んだ物は捨てる（新しい測った値を上書きしない）
+        if self._entries is not None:
+            return
+        entries = _read_book(self.path)
         with self._lock:
-            self._load()
+            if self._entries is None:
+                self._entries = entries
 
     def failed(self, file: LibraryFile) -> bool:
         """少し前に測れなかったファイルか（変わっておらず :data:`FAILURE_SECONDS` の内）"""
@@ -673,8 +680,11 @@ class MeasureBook:
 
         2 つの窓が同時に書くと後の方が残る 消し合っても測り直すだけなので錠では守らない
         """
+        # 何も測っていなければ錠を待たずに抜ける（先読みの途中でも窓をすぐ閉じられる）
+        if self.path is None or not self._dirty:
+            return
         with self._lock:
-            if self.path is None or not self._dirty or self._entries is None:
+            if not self._dirty or self._entries is None:
                 return
             text = json.dumps(
                 {"version": _BOOK_VERSION, "files": self._entries}, ensure_ascii=False
@@ -687,20 +697,25 @@ class MeasureBook:
             return
 
     def _load(self) -> dict[str, dict[str, object]]:
-        if self._entries is not None:
-            return self._entries
-        entries: dict[str, dict[str, object]] = {}
-        if self.path is not None:
-            try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                data = None
-            if isinstance(data, dict) and data.get("version") == _BOOK_VERSION:
-                files = data.get("files")
-                if isinstance(files, dict):
-                    entries = {str(key): row for key, row in files.items() if isinstance(row, dict)}
-        self._entries = entries
-        return entries
+        if self._entries is None:
+            self._entries = _read_book(self.path)
+        return self._entries
+
+
+def _read_book(path: Path | None) -> dict[str, dict[str, object]]:
+    """控えのファイルを読む 無い・壊れている・版が違うときは空"""
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != _BOOK_VERSION:
+        return {}
+    files = data.get("files")
+    if not isinstance(files, dict):
+        return {}
+    return {str(key): row for key, row in files.items() if isinstance(row, dict)}
 
 
 #: 測れなかったファイルを測り直さない間（秒） 呼び直すたびに同じ物で測る数を使い切らず、

@@ -249,6 +249,10 @@ class PreviewPlayer:
         #: 終わりを時計で決めるか 音の無い素材と、音を鳴らせなかった動画（絵だけで続ける）
         #: 音の仕事が鳴らしている間は音の仕事が決める（:meth:`_settle`）
         self._by_clock = False
+        #: 音の仕事が出口へ書き終えた所（秒） 一時停止の再開はこれより先へ進めない
+        #: 時計は出口を開いた時から進むので、最初の読み込みが遅いと、まだ 1 つも書いていないのに
+        #: 末尾まで進み、そこから再開すると何も鳴らない
+        self._written = 0.0
         self._frame: np.ndarray | None = None
         self._frame_number = 0
         #: 止まっている間に頼んだ絵（シークした先の 1 コマ）を読んでいる途中か
@@ -359,6 +363,7 @@ class PreviewPlayer:
             self._position = start
             self._still_pending = False
             self._by_clock = not info.has_audio
+            self._written = start
             if info.has_audio:
                 # 時計は音の出口を開き終えてから進める（:meth:`_play_sound`）
                 self._starting = True
@@ -374,7 +379,9 @@ class PreviewPlayer:
         with self._lock:
             if self._anchor is None and not self._starting:
                 return
-            self._position = self._now()
+            now = self._now()
+            # 音を鳴らしている間は、出口へ書いた所より先へ進めない（書いていない所から再開しない）
+            self._position = now if self._by_clock else min(now, self._written)
             self._anchor = None
             self._starting = False
             self._generation += 1
@@ -536,14 +543,22 @@ class PreviewPlayer:
                         break
                     sink.write(block)
                     cursor += count
+                    with self._lock:
+                        if generation == self._generation:
+                            self._written = cursor / _RATE
                 # 自分の書いた分を最後まで書いたときだけ鳴らし切る 止めた・飛んだ（頼みの番号が
                 # 変わった）ときは、止めた位置がどこでも捨てる
                 finished = cursor >= total
             if finished and sink is not None:
-                # 鳴らし切ってから止まった形にする（止めるまでの間も〔一時停止〕を受け付ける）
+                # 鳴らし切るのを、時計が終わりへ着くまで待つ 待つ間も止めた・飛んだ（頼みの番号が
+                # 変わった）ら、出口に残った分を捨てて抜ける 出口の鳴らし切り（`stop`）は残りを
+                # 鳴らし終えるまで返らず、その間に〔一時停止〕を押しても音が止まらない
+                while self._same(generation) and not self._clock_reached_end():
+                    time.sleep(_FRAME_POLL)
                 closing, sink = sink, None
+                stopped = not self._same(generation)
                 with contextlib.suppress(Exception):
-                    closing.close(drain=True)
+                    closing.close(drain=not stopped)
                 with self._lock:
                     if generation == self._generation:
                         self._ended()
@@ -557,6 +572,11 @@ class PreviewPlayer:
             if sink is not None:
                 with contextlib.suppress(Exception):
                     sink.close(drain=finished)
+
+    def _clock_reached_end(self) -> bool:
+        with self._lock:
+            info = self._info
+            return info is None or self._anchor is None or self._now() >= info.duration
 
     def _fail(self, generation: int, message: str) -> None:
         with self._lock:
