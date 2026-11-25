@@ -17,7 +17,7 @@ import pytest
 
 from sashimono.ai.direction_plan import SOUND_TRACK_NAME, proposal_for
 from sashimono.ai.host import ToolError
-from sashimono.ai.operations import LIBRARY_MEASURE_PER_CALL, find_operation
+from sashimono.ai.operations import LIBRARY_MEASURE_PER_CALL, Pending, find_operation
 from sashimono.ai.outbound import Outbound
 from sashimono.ai.safety import Safety
 from sashimono.core.commands import AddMedia
@@ -43,6 +43,7 @@ from sashimono.core.model import (
     TrackKind,
 )
 from tests.ai.conftest import FakeHost
+from tests.ai.pending import settle
 from tests.ai.test_operations import run
 from tests.conftest import RATE_30
 
@@ -126,8 +127,13 @@ def work(
     return host
 
 
+def _search(host: FakeHost, **arguments: Any) -> Any:
+    """search_library を呼んで、裏で測り終えるのを待ってから答えを読む（ブリッジと同じ）"""
+    return settle(run(host, "search_library", **arguments))
+
+
 def _file(work: _LibraryHost, name: str) -> dict[str, Any]:
-    rows = run(work, "search_library", query=name)["files"]
+    rows = _search(work, query=name)["files"]
     return next(row for row in rows if row["name"] == name)
 
 
@@ -151,13 +157,13 @@ class TestSearch:
     def test_without_folders_it_says_so_and_finds_nothing(self, video_media: MediaItem) -> None:
         # 壊れると、登録が無いのに AI が手持ちの音を探し回るか、黙って効果音を付けずに終わる
         host = FakeHost(Project.create(ProjectSettings(frame_rate=RATE_30)))
-        result = run(host, "search_library")
+        result = _search(host)
         assert result["files"] == []
         assert "登録されていません" in result["note"]
 
     def test_only_the_allowed_categories_are_seen(self, work: _LibraryHost) -> None:
         # 壊れると、本人が AI に使わせないと決めた動画のフォルダの物を AI が選んで置く
-        result = run(work, "search_library")
+        result = _search(work)
         names = {row["name"] for row in result["files"]}
         assert names == {"ドン.wav", "拍手大.wav", "のんびり.mp3", "短いジングル.mp3"}
         assert {row["category"] for row in result["files"]} == {
@@ -165,19 +171,19 @@ class TestSearch:
             CATEGORY_MUSIC,
         }
         with pytest.raises(ToolError, match="使わせない"):
-            run(work, "search_library", category=CATEGORY_VIDEO)
+            _search(work, category=CATEGORY_VIDEO)
 
     def test_the_folder_name_is_a_clue(self, work: _LibraryHost) -> None:
         # 下のフォルダの名前（拍手）で引けないと、名前の付け方がまちまちな効果音集で選べない
-        rows = run(work, "search_library", query="拍手")["files"]
+        rows = _search(work, query="拍手")["files"]
         assert [row["name"] for row in rows] == ["拍手大.wav"]
         assert rows[0]["folder"] == "拍手"
 
     def test_length_filters_pick_short_effects_and_long_music(self, work: _LibraryHost) -> None:
         # 長さの手がかりが効かないと、効果音の所に 95 秒の曲を置く
-        short = run(work, "search_library", max_seconds=10)["files"]
+        short = _search(work, max_seconds=10)["files"]
         assert {row["name"] for row in short} == {"ドン.wav", "拍手大.wav", "短いジングル.mp3"}
-        long = run(work, "search_library", category=CATEGORY_MUSIC, min_seconds=30)["files"]
+        long = _search(work, category=CATEGORY_MUSIC, min_seconds=30)["files"]
         assert [row["name"] for row in long] == ["のんびり.mp3"]
         assert long[0]["seconds"] == 95.0
         assert long[0]["loudness_lufs"] == -20.0
@@ -192,11 +198,11 @@ class TestSearch:
             (many / f"音{number:02}.wav").write_bytes(b"x")
             lengths[f"音{number:02}.wav"] = 1.0
         calls = work.measured_calls
-        first = run(work, "search_library", category=CATEGORY_SOUND_EFFECT)
+        first = _search(work, category=CATEGORY_SOUND_EFFECT)
         assert len(calls) == LIBRARY_MEASURE_PER_CALL
         assert first["not_measured"] == 7
         assert "測っていません" in first["note"]
-        second = run(work, "search_library", category=CATEGORY_SOUND_EFFECT)
+        second = _search(work, category=CATEGORY_SOUND_EFFECT)
         assert second["not_measured"] == 0
         assert len(calls) == LIBRARY_MEASURE_PER_CALL + 7
         assert len(set(calls)) == len(calls)
@@ -207,7 +213,7 @@ class TestSearch:
         # 壊れると、外付けのドライブを外しただけで道具が落ちる
         gone = LibraryFolder(str(folders[CATEGORY_MUSIC] / "無い"), CATEGORY_MUSIC)
         work.material = replace(work.material, folders=(*work.material.folders, gone))
-        result = run(work, "search_library")
+        result = _search(work)
         assert result["folders_missing"] == 1
         assert "見つからない" in result["note"]
 
@@ -288,6 +294,27 @@ class TestDirectionPlan:
         work.document.undo()
         assert work.document.project == before
 
+    def test_a_file_read_in_after_the_plan_is_reused(self, work: _LibraryHost) -> None:
+        # 壊れると、計画の後で同じ音を取り込んでいたとき、〔付ける〕でもう 1 つ素材が増える
+        row = _file(work, "ドン.wav")
+        run(work, "propose_direction", cues=_cues(), sound_file_id=row["file_id"])
+        run(work, "import_media", library_file_ids=[row["file_id"]], pool_only=True)
+        result = proposal_for(work.document).apply(work.document)
+        assert result is not None and result.skipped == ()
+        assert sum(m.path.name == "ドン.wav" for m in work.document.project.media) == 1
+
+    def test_a_sound_no_longer_allowed_is_not_read_in(self, work: _LibraryHost) -> None:
+        # 壊れると、計画の後で本人が AI に使わせないと決めた音まで〔付ける〕で作品に入る
+        before = work.document.project
+        row = _file(work, "ドン.wav")
+        items = run(work, "propose_direction", cues=_cues(), sound_file_id=row["file_id"])["items"]
+        sounds = {item["number"] for item in items if item["kind"] == SOUND}
+        result = proposal_for(work.document).apply(work.document, allowed=lambda _media: False)
+        assert result is not None
+        assert {number for number, _reason in result.skipped} == sounds
+        assert all(m.path.name != "ドン.wav" for m in work.document.project.media)
+        assert len(work.document.project.media) == len(before.media)
+
     def test_long_music_is_not_an_effect(self, work: _LibraryHost) -> None:
         # 壊れると、効果音の所に 95 秒の曲が何本も重なる
         row = _file(work, "のんびり.mp3")
@@ -356,8 +383,33 @@ class TestFavorites:
             work.material,
             favorites=(str(effects / "拍手"), str(folders[CATEGORY_VIDEO] / "隠し.wav")),
         )
-        rows = run(work, "search_library", favorites_only=True)["files"]
+        rows = _search(work, favorites_only=True)["files"]
         assert [row["name"] for row in rows] == ["拍手大.wav"]
         assert rows[0]["favorite"] is True
-        every = run(work, "search_library")["files"]
+        every = _search(work)["files"]
         assert {row["name"] for row in every if not row["favorite"]} >= {"ドン.wav"}
+
+
+class TestMeasuringInTheBackground:
+    def test_measuring_does_not_hold_the_editor(self, work: _LibraryHost) -> None:
+        # 壊れると、測っていない音が 20 本あるだけで、道具が画面のスレッドで数秒止まる
+        result = run(work, "search_library")
+        assert isinstance(result, Pending)
+        done = settle(result)
+        assert {row["name"] for row in done["files"]} >= {"ドン.wav"}
+        # 測り終えた後は待たずに答える
+        assert not isinstance(run(work, "search_library"), Pending)
+
+    def test_no_next_page_while_some_are_unmeasured(
+        self, work: _LibraryHost, folders: dict[str, Path], lengths: dict[str, float]
+    ) -> None:
+        # 壊れると、長さで絞った頼みの続きで、後で測れた物を飛ばし同じ行を 2 度読む
+        many = folders[CATEGORY_SOUND_EFFECT] / "たくさん"
+        many.mkdir()
+        for number in range(LIBRARY_MEASURE_PER_CALL + 5):
+            (many / f"音{number:02}.wav").write_bytes(b"x")
+            lengths[f"音{number:02}.wav"] = 1.0
+        page = _search(work, category=CATEGORY_SOUND_EFFECT, max_seconds=5, limit=3)
+        assert page["not_measured"] > 0
+        assert "next_offset" not in page
+        assert "頭から呼び直して" in page["note"]

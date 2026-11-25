@@ -222,8 +222,21 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
+def _junction(entry: os.DirEntry[str]) -> bool:
+    """Windows のジャンクションか（``is_dir(follow_symlinks=False)`` はジャンクションにも真を返す）
+
+    辿ると登録したフォルダの外の普通のファイルに届き、リンクの実体の照らしも通らない
+    """
+    check = getattr(entry, "is_junction", None)
+    return bool(check()) if callable(check) else False
+
+
 def scan_folder(
-    folder: LibraryFolder, limit: int = SCAN_LIMIT, *, skip: Sequence[str] = ()
+    folder: LibraryFolder,
+    limit: int = SCAN_LIMIT,
+    *,
+    skip: Sequence[str] = (),
+    accept: Callable[[LibraryFile], bool] | None = None,
 ) -> FolderScan:
     """``folder`` の中（下のフォルダも）を見て回り、分類に合うファイルを拾う
 
@@ -234,13 +247,18 @@ def scan_folder(
 
     ``skip`` は入らないフォルダ（別に登録したフォルダ） 親を効果音・子を動画として登録した
     ときに、親から子の音を効果音として拾うと、子の分類の決まり（AI に使わせるか）が効かない
+
+    ``accept`` を渡すと、合う物だけを拾い、``limit`` も合う物で数える 名前で絞るときに
+    頭の 2 万個で打ち切ってから絞ると、2 万個より後ろにしか無い名前がいつまでも出ない
     """
     root = Path(folder.path)
     present, problem = reachable_dir(root)
     if not present:
         return FolderScan(folder, missing=True, error=problem)
     skipped = {_folder_key(entry) for entry in skip}
-    others = [Path(entry) for entry in skip]
+    # リンクの実体の照らしに使うのは、自分の中にある別の登録だけ（実体を含む登録のうち一番深い
+    # 物で分類を決める） 自分を含む親の登録まで見ると、子の登録が持つリンクを子自身の走査でも捨てる
+    others = [Path(entry) for entry in skip if _inside(Path(entry), root)]
     suffixes = _SUFFIXES.get(folder.category, _SUFFIXES[CATEGORY_OTHER])
     found: list[LibraryFile] = []
     pending = [root]
@@ -258,7 +276,7 @@ def scan_folder(
         for entry in listed:
             try:
                 if entry.is_dir(follow_symlinks=False):
-                    if _folder_key(entry.path) not in skipped:
+                    if _folder_key(entry.path) not in skipped and not _junction(entry):
                         folders.append(Path(entry.path))
                     continue
                 if Path(entry.name).suffix.lower() not in suffixes:
@@ -270,7 +288,10 @@ def scan_folder(
                 stat = entry.stat()
             except OSError:
                 continue
-            found.append(LibraryFile(Path(entry.path), folder, stat.st_size, stat.st_mtime_ns))
+            file = LibraryFile(Path(entry.path), folder, stat.st_size, stat.st_mtime_ns)
+            if accept is not None and not accept(file):
+                continue
+            found.append(file)
             if len(found) >= limit:
                 return FolderScan(folder, tuple(found), truncated=True, error=error)
         # 後で取り出す順が名前の順になるよう逆に積む
@@ -308,7 +329,8 @@ def list_folder(folder: LibraryFolder, directory: Path, limit: int = SCAN_LIMIT)
     for entry in listed:
         try:
             if entry.is_dir(follow_symlinks=False):
-                folders.append(Path(entry.path))
+                if not _junction(entry):
+                    folders.append(Path(entry.path))
                 continue
             if Path(entry.name).suffix.lower() not in suffixes or not entry.is_file():
                 continue
@@ -491,6 +513,9 @@ class Measure:
     width: int = 0
     height: int = 0
     fps: float = 0.0
+    #: 音を読めずに大きさを測れなかった（音の無い素材・本当に無音の音とは別） 長さは使えるが、
+    #: 控えのファイルには書かず、しばらくしたら測り直す（ドライブが一時だけ応えなかった物を戻す）
+    audio_failed: bool = False
 
 
 #: 測る関数 測れない（開けない・壊れた）ときは ``None``
@@ -516,10 +541,19 @@ class MeasureBook:
     #: 測れなかったファイル 印 → （大きさ, 更新時刻, 覚えた時計） 控えのファイルには書かない
     #: ドライブが一時だけ応えなかった物まで書くと、挿し直して起動し直しても測り直さない
     _failures: dict[str, tuple[int, int, float]] = field(default_factory=dict, repr=False)
+    #: 音を読めなかった測った物（:attr:`Measure.audio_failed`） 失敗と同じく記憶の中だけに持つ
+    _passing: dict[str, tuple[int, int, float, Measure]] = field(default_factory=dict, repr=False)
 
     def get(self, file: LibraryFile) -> Measure | None:
         with self._lock:
+            passing = self._passing.get(file.id)
             row = self._load().get(file.id)
+        if passing is not None:
+            size, mtime, at, measure = passing
+            if (size, mtime) == (file.size, file.modified_ns) and (
+                time.monotonic() - at < FAILURE_SECONDS
+            ):
+                return measure
         if row is None or row.get("size") != file.size or row.get("mtime") != file.modified_ns:
             return None
         return _measure_from(row)
@@ -544,6 +578,17 @@ class MeasureBook:
             self._failures[file.id] = (file.size, file.modified_ns, time.monotonic())
 
     def put(self, file: LibraryFile, measure: Measure) -> None:
+        if measure.audio_failed:
+            # 長さは使うが控えのファイルには書かない 書くと、一時だけ読めなかった音の大きさを
+            # 大きさと更新時刻が同じ限り測り直さない
+            with self._lock:
+                self._passing[file.id] = (
+                    file.size,
+                    file.modified_ns,
+                    time.monotonic(),
+                    measure,
+                )
+            return
         row: dict[str, object] = {
             "size": file.size,
             "mtime": file.modified_ns,

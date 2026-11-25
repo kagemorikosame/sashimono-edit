@@ -26,6 +26,7 @@ from sashimono.core.material_library import (
     add_folder,
     file_id,
     is_favorite,
+    list_folder,
     match_files,
     parse_categories,
     parse_folders,
@@ -155,7 +156,8 @@ class TestScan:
     def test_the_id_does_not_depend_on_the_spelling(self, tmp_path: Path) -> None:
         # 壊れると、同じファイルが書き方で別の印になり、AI が選んだ物を指せない
         path = tmp_path / "ドン.wav"
-        assert file_id(path) == file_id(tmp_path / "." / "ドン.wav")
+        # 書き方の違う場所（.. を含む）でも同じ印になる 同じ書き方を比べても正規化は確かめられない
+        assert file_id(path) == file_id(tmp_path / "sub" / ".." / "ドン.wav")
         assert file_id(path).startswith("lib_")
         assert file_id(path) != file_id(tmp_path / "ドン2.wav")
 
@@ -344,3 +346,63 @@ class TestReviewFixes:
         )
         names = [file.name for scan in library.scan_for_ai() for file in scan.files]
         assert "リンク.wav" not in names
+
+    def test_a_junction_is_not_followed(self, tmp_path: Path) -> None:
+        # 壊れると、登録の下のジャンクションを辿って、登録の外の普通のファイルを AI が選ぶ
+        if os.name != "nt":
+            pytest.skip("ジャンクションは Windows だけ")
+        import _winapi
+
+        outside = _touch(tmp_path / "外" / "外の音.wav")
+        _touch(tmp_path / "SE" / "ドン.wav")
+        _winapi.CreateJunction(str(outside.parent), str(tmp_path / "SE" / "抜け道"))
+        scan = scan_folder(LibraryFolder(str(tmp_path / "SE"), CATEGORY_SOUND_EFFECT))
+        assert [file.name for file in scan.files] == ["ドン.wav"]
+        listing = list_folder(
+            LibraryFolder(str(tmp_path / "SE"), CATEGORY_SOUND_EFFECT), tmp_path / "SE"
+        )
+        assert listing.folders == ()
+
+    def test_names_are_matched_before_the_limit(self, tmp_path: Path) -> None:
+        # 壊れると、上限より後ろにしか無い名前は、名前を詳しくしても見つからない
+        for number in range(12):
+            (tmp_path / f"{number:02}.wav").write_bytes(b"")
+        (tmp_path / "zz目当て.wav").write_bytes(b"")
+        scan = scan_folder(
+            LibraryFolder(str(tmp_path), CATEGORY_SOUND_EFFECT),
+            limit=5,
+            accept=lambda file: "目当て" in file.name,
+        )
+        assert [file.name for file in scan.files] == ["zz目当て.wav"]
+
+    def test_a_link_owned_by_an_allowed_child_is_kept(self, tmp_path: Path) -> None:
+        # 壊れると、効果音として許した子の登録の中のリンクを、親の登録の中だからと捨てる
+        real = _touch(tmp_path / "動画" / "SE" / "ドン.wav")
+        link = tmp_path / "動画" / "SE" / "リンク.wav"
+        try:
+            link.symlink_to(real)
+        except OSError:
+            pytest.skip("この機械ではリンクを作れない（Windows の開発者モードが要る）")
+        library = MaterialLibrary(
+            folders=(
+                LibraryFolder(str(tmp_path / "動画"), CATEGORY_VIDEO),
+                LibraryFolder(str(tmp_path / "動画" / "SE"), CATEGORY_SOUND_EFFECT),
+            )
+        )
+        names = sorted(file.name for scan in library.scan_for_ai() for file in scan.files)
+        assert names == ["ドン.wav", "リンク.wav"]
+
+    def test_a_sound_that_could_not_be_read_is_not_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、一時だけ読めなかった音の「大きさ無し」を控えに書き、直っても測り直さない
+        sound = _touch(tmp_path / "SE" / "ドン.wav")
+        file = scan_folder(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT)).files[0]
+        book = MeasureBook(tmp_path / "measures.json")
+        partial = Measure(seconds=1.0, has_audio=True, has_video=False, audio_failed=True)
+        book.put(file, partial)
+        assert book.get(file) == partial
+        book.save()
+        assert MeasureBook(tmp_path / "measures.json").get(file) is None
+        monkeypatch.setattr(material_library, "FAILURE_SECONDS", 0)
+        assert book.get(file) is None

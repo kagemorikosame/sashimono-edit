@@ -108,6 +108,7 @@ def measure_library_file(path: Path) -> Measure | None:
             width=width,
             height=height,
             fps=fps,
+            audio_failed=True,
         )
     loudness = meter.integrated()
     peak = meter.peak
@@ -466,6 +467,9 @@ class PreviewPlayer:
                             return
                         if self._anchor is not None:
                             break
+                        if not self._starting:
+                            # 開く間に鳴り終えた（短い動画） 時計はもう進まないので待たずに抜ける
+                            return
                     time.sleep(_FRAME_POLL)
                 while self._running(generation):
                     with self._lock:

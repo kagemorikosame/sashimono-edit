@@ -185,6 +185,8 @@ _FAV = Qt.ItemDataRole.UserRole + 4
 _NODE = Qt.ItemDataRole.UserRole
 #: 下のフォルダをまだ読んでいない印の子 開いたときに読む（数万のフォルダを先に読まない）
 _PLACEHOLDER = "…"
+#: 下のフォルダを裏で読んでいる間の印の子
+_LOADING = "読んでいます…"
 
 #: 1 つの場所を開いたときに裏で測る数の上限 一覧を開くたびに数千を測り続けない
 _MEASURE_LIMIT = 400
@@ -530,7 +532,7 @@ class _PreviewPane(QWidget):
 
     message = Signal(str)
     #: 裏で調べ終えた（ファイル, 素材か断りの文） 裏のスレッドから送り、画面のスレッドで受ける
-    _probed = Signal(object, object)
+    _probed = Signal(int, object, object)
 
     def __init__(
         self,
@@ -546,6 +548,8 @@ class _PreviewPane(QWidget):
         self._last_error: str | None = None
         #: 調べている（まだ開いていない）ファイルと、開いたらすぐ鳴らすか
         self._wanted: Path | None = None
+        #: 調べる頼みの番号 同じファイルを選び直したときに、前の頼みの古い結果を使わないため
+        self._probe_number = 0
         self._peaks_for_wanted: np.ndarray | None = None
         self._play_when_open = False
         self._probed.connect(self._on_probed)
@@ -633,8 +637,10 @@ class _PreviewPane(QWidget):
             return
         self._title.setText(f"{path.name}（調べています）")
         self._set_enabled(False)
+        self._probe_number += 1
+        number = self._probe_number
         threading.Thread(
-            target=lambda: self._probed.emit(path, probe(path)),
+            target=lambda: self._probed.emit(number, path, probe(path)),
             name="explorer-probe",
             daemon=True,
         ).start()
@@ -644,8 +650,8 @@ class _PreviewPane(QWidget):
         """調べている途中か"""
         return self._wanted is not None
 
-    def _on_probed(self, path: Path, item: object) -> None:
-        if path != self._wanted:
+    def _on_probed(self, number: int, path: Path, item: object) -> None:
+        if number != self._probe_number or path != self._wanted:
             # 調べている間に別のファイルを選んだ 古い結果は使わない
             return
         self._wanted = None
@@ -847,6 +853,8 @@ class ExplorerPanel(QWidget):
         self._double_click = DOUBLE_CLICK_PREVIEW
         #: 今の場所の行のファイル 印で引く（裏の知らせが来たときに行を探す）
         self._files: dict[str, LibraryFile] = {}
+        #: 今の場所の行の名前の欄 印で引く
+        self._name_items: dict[str, QStandardItem] = {}
         #: 作った見本の絵 印で引く
         self._icons: dict[str, QIcon] = {}
         self._peaks: dict[str, np.ndarray] = {}
@@ -858,6 +866,10 @@ class ExplorerPanel(QWidget):
         # 中身を読むのは別の 1 本 測る・見本を作る仕事の後ろに並ぶと、開いた場所が出るまで待つ
         self._lister = _Worker(self, workers=1)
         self._lister.finished.connect(self._on_listed)
+        # 木の下のフォルダを読むのも別の 1 本 中身を読む仕事の後ろに並ぶと、木が開くまで待つ
+        self._tree_lister = _Worker(self, workers=1)
+        self._tree_lister.finished.connect(self._on_tree_listed)
+        self._tree_number = 0
         self._listing_number = 0
         self._listed_number = 0
         #: 前回の場所から開いたときに、読み終えたら選ぶファイル
@@ -1146,6 +1158,7 @@ class ExplorerPanel(QWidget):
         self._preview.close_player()
         self._worker.close()
         self._lister.close()
+        self._tree_lister.close()
 
     def visible_files(self) -> list[Path]:
         """中身に出ている行のファイル（今の並びで）"""
@@ -1283,6 +1296,8 @@ class ExplorerPanel(QWidget):
     def _fill_tree(self) -> None:
         """木を作り直す 選んでいた所は場所で選び直す"""
         current = self._node()
+        # 作り直す前に頼んだ下のフォルダの結果は使わない（項目がもう無い）
+        self._tree_number += 1
         self._tree.blockSignals(True)
         self._tree.clear()
         if self._favorites:
@@ -1327,11 +1342,23 @@ class ExplorerPanel(QWidget):
                 root.addChild(item)
             root.setExpanded(True)
         self._tree.blockSignals(False)
-        if current is not None and current[1]:
+        if current == (_FAVORITE_NODE, ""):
+            # お気に入りの根を見ていた（外した後の残りを続けて整理する） 根が残っていれば選び直す
+            favorites_root = self._favorite_root()
+            if favorites_root is not None:
+                self._tree.setCurrentItem(favorites_root)
+        elif current is not None and current[1]:
             found = self._find_node(os.path.normcase(os.path.normpath(current[1])))
             if found is not None:
                 self._tree.setCurrentItem(found)
         self._show_files()
+
+    def _favorite_root(self) -> QTreeWidgetItem | None:
+        for top in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(top)
+            if item is not None and item.data(0, _NODE) == (_FAVORITE_NODE, ""):
+                return item
+        return None
 
     def _find_node(self, target: str) -> QTreeWidgetItem | None:
         """場所の木の項目 まだ開いていない下のフォルダは、辿りながら開く
@@ -1360,21 +1387,37 @@ class ExplorerPanel(QWidget):
             return item
         if not target.startswith(here.rstrip(os.sep) + os.sep):
             return None
+        # 下のフォルダを読み終えるのを待たずに、目当ての場所までの項目をその場で作って辿る
+        # （読むのは裏 前回の場所を開くたびに、応答の遅い登録先を画面のスレッドで待たない）
         self._expand(item)
         item.setExpanded(True)
+        step = Path(target).relative_to(here).parts[0] if here != target else ""
         for index in range(item.childCount()):
             child = item.child(index)
             found = self._descend(child, target) if child is not None else None
             if found is not None:
                 return found
-        return None
+        if not step:
+            return None
+        child = self._folder_item(node[0], Path(node[1]) / step)
+        item.addChild(child)
+        return self._descend(child, target)
+
+    def _folder_item(self, owner: str, directory: Path) -> QTreeWidgetItem:
+        child = QTreeWidgetItem([directory.name])
+        child.setToolTip(0, str(directory))
+        child.setData(0, _NODE, (owner, str(directory)))
+        child.addChild(QTreeWidgetItem([_PLACEHOLDER]))
+        return child
 
     def _expand(self, item: QTreeWidgetItem) -> None:
-        """開いたときに下のフォルダを 1 段だけ読む"""
-        first = item.child(0) if item.childCount() == 1 else None
+        """開いたときに下のフォルダを 1 段だけ読む 読むのは裏 読み終えたら足す
+
+        読むのを画面のスレッドで待つと、応答の遅い登録先で木を開くたびに画面が止まる
+        """
+        first = item.child(0) if item.childCount() >= 1 else None
         if first is None or first.text(0) != _PLACEHOLDER:
             return
-        item.takeChild(0)
         node = item.data(0, _NODE)
         if not isinstance(node, tuple):
             return
@@ -1383,13 +1426,55 @@ class ExplorerPanel(QWidget):
         )
         if folder is None:
             return
-        listing = list_folder(folder, Path(node[1]), limit=0)
-        for directory in listing.folders:
-            child = QTreeWidgetItem([directory.name])
-            child.setToolTip(0, str(directory))
-            child.setData(0, _NODE, (node[0], str(directory)))
-            child.addChild(QTreeWidgetItem([_PLACEHOLDER]))
-            item.addChild(child)
+        first.setText(0, _LOADING)
+        self._tree_lister.submit(
+            f"tree:{self._tree_number}:{node[0]}|{node[1]}",
+            partial(_subfolders, folder, Path(node[1])),
+        )
+
+    def _on_tree_listed(self, key: str, result: object) -> None:
+        """下のフォルダを読み終えた 木を作り直した後に届いた古い結果は使わない"""
+        _kind, number, place = key.split(":", 2)
+        if int(number) != self._tree_number or not isinstance(result, list):
+            return
+        owner, _, where = place.partition("|")
+        item = self._item_at(owner, where)
+        if item is None:
+            return
+        for index in reversed(range(item.childCount())):
+            child = item.child(index)
+            if child is not None and child.text(0) in (_PLACEHOLDER, _LOADING):
+                item.takeChild(index)
+        have: dict[str, QTreeWidgetItem] = {}
+        for index in range(item.childCount()):
+            child = item.child(index)
+            node = child.data(0, _NODE) if child is not None else None
+            if child is not None and isinstance(node, tuple):
+                have[os.path.normcase(str(node[1]))] = child
+        for directory in result:
+            known = have.get(os.path.normcase(str(directory)))
+            if known is None:
+                item.addChild(self._folder_item(owner, directory))
+            else:
+                # 前回の場所を開くときに先に作った項目は、場所を小文字にそろえた名前のことがある
+                # 本当の名前に直す（名前の大文字と小文字を区別しない Windows の場所の決まり）
+                known.setText(0, directory.name)
+                known.setToolTip(0, str(directory))
+                known.setData(0, _NODE, (owner, str(directory)))
+        item.sortChildren(0, Qt.SortOrder.AscendingOrder)
+
+    def _item_at(self, owner: str, where: str) -> QTreeWidgetItem | None:
+        """（登録の場所か印, 場所）の木の項目 無ければ ``None``"""
+        pending = [self._tree.topLevelItem(top) for top in range(self._tree.topLevelItemCount())]
+        while pending:
+            item = pending.pop()
+            if item is None:
+                continue
+            node = item.data(0, _NODE)
+            if isinstance(node, tuple) and node[0] == owner and same_place(node[1], where):
+                return item
+            pending.extend(item.child(index) for index in range(item.childCount()))
+        return None
 
     def _registered(self, path: str) -> LibraryFolder | None:
         return next((folder for folder in self._folders if folder.path == path), None)
@@ -1512,13 +1597,16 @@ class ExplorerPanel(QWidget):
         self._table.setSortingEnabled(False)
         self._model.removeRows(0, self._model.rowCount())
         self._files = {}
+        self._name_items = {}
         unmeasured: list[LibraryFile] = []
         for file in files:
             self._files[file.id] = file
             measure = self._book.get(file)
             if measure is None:
                 unmeasured.append(file)
-            self._model.appendRow(self._row(file, measure))
+            cells = self._row(file, measure)
+            self._name_items[file.id] = cells[_NAME]
+            self._model.appendRow(cells)
         self._table.setSortingEnabled(True)
         self._table.resizeColumnToContents(_NAME)
         # 1 つずつ選ぶと前の選びが外れ、最後の 1 つしか残らない まとめて選び直す
@@ -1584,10 +1672,12 @@ class ExplorerPanel(QWidget):
             cells[_FPS].setData(measure.fps, _SORT)
 
     def _row_of(self, key: str) -> list[QStandardItem] | None:
-        for row in range(self._model.rowCount()):
-            if self._model.item(row, _NAME).data(_ID) == key:
-                return [self._model.item(row, column) for column in range(len(COLUMNS))]
-        return None
+        """印の行 名前の欄を印で覚えておいて引く（数千の行を頭から探さない）"""
+        item = self._name_items.get(key)
+        if item is None:
+            return None
+        row = item.row()
+        return [self._model.item(row, column) for column in range(len(COLUMNS))]
 
     def _on_worker(self, key: str, result: object) -> None:
         kind, _, file_key = key.partition(":")
@@ -1635,23 +1725,23 @@ class ExplorerPanel(QWidget):
     def _request_picture(self, file: LibraryFile) -> None:
         kind = kind_of(file.path)
         store = self._thumbs
+        # 控えを読むのも裏の仕事 数千の行でアイコン表示へ切り替えたときに、控えのファイルを
+        # 画面のスレッドで 1 つずつ開くと、作り終えている表示でも止まる
         if kind == KIND_SOUND:
-            cached = store.load(file, "peaks")
-            if cached is not None:
-                self._on_worker(f"peaks:{file.id}", (file, cached))
-                return
 
             def peaks(target: LibraryFile = file) -> object:
+                cached = store.load(target, "peaks")
+                if cached is not None:
+                    return (target, cached)
                 return _kept(store, target, "peaks", sound_peaks(target.path, _PEAK_COLUMNS))
 
             self._worker.submit(f"peaks:{file.id}", peaks)
             return
-        cached = store.load(file, "still")
-        if cached is not None:
-            self._on_worker(f"still:{file.id}", (file, cached))
-            return
 
         def still(target: LibraryFile = file) -> object:
+            cached = store.load(target, "still")
+            if cached is not None:
+                return (target, cached)
             tile = still_of(target.path)
             return _kept(store, target, "still", None if tile is None else _small_tile(tile))
 
@@ -1807,10 +1897,22 @@ def _measured(job: Callable[[Path], Measure | None], file: LibraryFile) -> Calla
 def _listing(
     pairs: Sequence[tuple[LibraryFolder, Path]], deep: bool, query: str, kind: str
 ) -> tuple[list[LibraryFile], str]:
-    """場所の中身と状態の文（裏のスレッドで呼ぶ）"""
+    """場所の中身と状態の文（裏のスレッドで呼ぶ）
+
+    登録が重なる（親と子を同じ分類で登録した）ときは、深い登録から読んで同じファイルを 1 つに
+    まとめる 子の分類とフォルダの物を残す 重ねたまま出すと同じ行が 2 つ並び、両方を選んで
+    置くと同じ音が 2 回置かれる
+    """
+
+    def accept(file: LibraryFile) -> bool:
+        # 名前と種類は見て回る途中で当てる 先に上限で打ち切ってから絞ると、上限より後ろに
+        # しか無い名前がいつまでも出ない
+        return bool(match_files([file], query)) and (not kind or kind_of(file.path) == kind)
+
     notes: list[str] = []
-    files: list[LibraryFile] = []
-    for folder, directory in pairs:
+    files: dict[str, LibraryFile] = {}
+    ordered = sorted(pairs, key=lambda pair: len(Path(pair[1]).parts), reverse=True)
+    for folder, directory in ordered:
         present, problem = reachable_dir(Path(folder.path))
         if not present:
             notes.append(
@@ -1821,7 +1923,7 @@ def _listing(
             continue
         if deep:
             # 名前で絞るときと分類の根では下まで探す 場所は登録したフォルダのまま数える
-            scan = scan_folder(LibraryFolder(str(directory), folder.category))
+            scan = scan_folder(LibraryFolder(str(directory), folder.category), accept=accept)
             if scan.missing:
                 notes.append(f"{directory.name} が見つかりません（消えたか移った）")
             if scan.truncated:
@@ -1829,16 +1931,22 @@ def _listing(
             if scan.error:
                 # 下のフォルダの 1 つが読めなかった 読めた分は出し、全部ではないと知らせる
                 notes.append(f"{folder.label}: {scan.error}")
-            files.extend(
-                LibraryFile(file.path, folder, file.size, file.modified_ns) for file in scan.files
-            )
+            for file in scan.files:
+                files.setdefault(
+                    os.path.normcase(str(file.path)),
+                    LibraryFile(file.path, folder, file.size, file.modified_ns),
+                )
         else:
             listed = list_folder(folder, directory)
             if listed.missing:
                 # 開いていた下のフォルダが消えた 空のフォルダと見分けが付くように知らせる
                 notes.append(f"{directory.name} が見つかりません（消えたか移った）")
-            files.extend(listed.files)
-    matched = [file for file in match_files(files, query) if not kind or kind_of(file.path) == kind]
+            for file in listed.files:
+                files.setdefault(os.path.normcase(str(file.path)), file)
+    # 並びは名前の順（深い登録から読んだ順のままにしない）
+    matched = sorted(
+        (file for file in files.values() if accept(file)), key=lambda file: file.relative.casefold()
+    )
     count = f"{len(matched)} 個"
     if len(matched) > DISPLAY_LIMIT:
         count += f"（頭の {DISPLAY_LIMIT} 個を表示 名前で絞り込んでください）"
@@ -1896,3 +2004,27 @@ def _kept(
         return None
     store.save(file, kind, data)
     return (file, data)
+
+
+def _subfolders(folder: LibraryFolder, directory: Path) -> list[Path]:
+    """``directory`` の下のフォルダ（裏のスレッドで呼ぶ） ファイルは開かない（``stat`` しない）
+
+    リンクとジャンクションの先には入らない（中身の一覧と同じ決まり）
+    """
+    del folder
+    found: list[Path] = []
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    junction = getattr(entry, "is_junction", None)
+                    if callable(junction) and junction():
+                        continue
+                except OSError:
+                    continue
+                found.append(Path(entry.path))
+    except OSError:
+        return []
+    return sorted(found, key=lambda path: path.name.casefold())

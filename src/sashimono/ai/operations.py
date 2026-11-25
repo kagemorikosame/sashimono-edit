@@ -306,6 +306,7 @@ from sashimono.core.material_library import (
 )
 from sashimono.core.material_library import (
     CATEGORY_MUSIC,
+    LibraryFile,
     MaterialLibrary,
     match_files,
 )
@@ -3517,8 +3518,16 @@ def _library_category(library: MaterialLibrary, arguments: dict[str, Any]) -> st
     return str(raw)
 
 
+#: 測り終えるのを待つ上限（秒） 越えたら測れた分だけで答える（残りは次の呼び出しで測る）
+LIBRARY_MEASURE_WAIT = 60.0
+
+
 def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
-    """登録したフォルダから、AI が使ってよい分類の素材を名前と長さで探す（#522）"""
+    """登録したフォルダから、AI が使ってよい分類の素材を名前と長さで探す（#522）
+
+    まだ測っていないファイルは裏のスレッドで測り、測り終えてから答える（:class:`Pending`）
+    道具は画面のスレッドで動くので、ここで 20 本をデコードすると数秒のあいだ画面が止まる
+    """
     library = host.material_library
     category = _library_category(library, arguments)
     query = arguments.get("query", "")
@@ -3543,21 +3552,52 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
         return head | {"files_total": 0, "files": [], "note": _NO_LIBRARY}
     scans = [scan for scan in library.scan_for_ai() if scan.folder in folders]
     head["folders_missing"] = sum(1 for scan in scans if scan.missing)
-    matched = match_files((file for scan in scans for file in scan.files), query)
+    matched = [
+        file
+        for file in match_files((file for scan in scans for file in scan.files), query)
+        if not favorites_only or library.is_favorite(file)
+    ]
+    # 前に測れなかったファイルは、変わるまで測る数を使わずに飛ばす 飛ばさないと、読めない
+    # ファイルが頭に並んだときに、呼び直すたびに同じ物で数を使い切り、後ろが測られない
+    wanted = [
+        file
+        for file in matched
+        if library.measured(file, allow_measure=False) is None and not library.tried(file)
+    ][:LIBRARY_MEASURE_PER_CALL]
+
+    def finish() -> object:
+        return _library_rows(host, library, head, matched, shortest, longest, arguments)
+
+    if not wanted or library.measure is None:
+        return finish()
+    done = threading.Event()
+
+    def measure_all() -> None:
+        try:
+            for file in wanted:
+                library.measured(file, allow_measure=True)
+        finally:
+            done.set()
+
+    threading.Thread(target=measure_all, name="search-library", daemon=True).start()
+    return Pending(wait=done.wait, seconds=LIBRARY_MEASURE_WAIT, then=finish)
+
+
+def _library_rows(
+    host: EditorHost,
+    library: MaterialLibrary,
+    head: dict[str, Any],
+    matched: Sequence[LibraryFile],
+    shortest: float | None,
+    longest: float | None,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """測った物で行を作る（測らない 測るのは :func:`_search_library` の裏の仕事）"""
     used = {os.path.normcase(str(media.path)): media.id for media in _project(host).media}
-    budget = LIBRARY_MEASURE_PER_CALL
     rows: list[dict[str, Any]] = []
     unmeasured = 0
     for file in matched:
-        favorite = library.is_favorite(file)
-        if favorites_only and not favorite:
-            continue
         known = library.measured(file, allow_measure=False)
-        # 前に測れなかったファイルは、変わるまで測る数を使わずに飛ばす 飛ばさないと、読めない
-        # ファイルが頭に並んだときに、呼び直すたびに同じ物で数を使い切り、後ろが測られない
-        if known is None and budget > 0 and not library.tried(file):
-            budget -= 1
-            known = library.measured(file, allow_measure=True)
         if known is None:
             unmeasured += 1
             if shortest is not None or longest is not None:
@@ -3572,7 +3612,7 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
             "name": file.name,
             "folder": file.subfolder,
             "category": file.category,
-            "favorite": favorite,
+            "favorite": library.is_favorite(file),
             "measured": known is not None,
         }
         if known is not None:
@@ -3584,6 +3624,7 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
             row["media_id"] = str(media_id)
         rows.append(row)
     # 測った物を書くのは窓（閉じるとき） 道具のコードはファイルを書かない（#327 の決まり）
+    head = dict(head)
     head["files_total"] = len(rows)
     head["not_measured"] = unmeasured
     note = (
@@ -3593,6 +3634,7 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
         "長さ（seconds）・頭の 1 分の大きさ（loudness_lufs）だけで、曲の雰囲気は分かりません"
         " 使った素材の名前とフォルダは返事に書きます"
     )
+    filtered = shortest is not None or longest is not None
     if unmeasured:
         note += (
             f" {unmeasured} 個はまだ測っていません（measured が false 1 回に"
@@ -3602,7 +3644,17 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
         note += " 見つからない登録のフォルダがあります（消えたか移った） 本人に伝えます"
     if CATEGORY_MUSIC in library.ai_categories and not library.auto_bgm:
         note += " BGM は頼まれたときだけ付けます（本人の設定）"
-    return _paged_after(head, rows, arguments, "files", note)
+    result = _paged_after(head, rows, arguments, "files", note)
+    if filtered and unmeasured and "next_offset" in result:
+        # 長さで絞るときは、後で測れた物が返した行より前に入ることがある offset で続きを
+        # 読むと、その物を飛ばして同じ行を 2 度読む 測り終えるまでは続きを出さず、頭から呼び直させる
+        del result["next_offset"]
+        result["note"] = (
+            str(result.get("note", ""))
+            + " まだ測っていない物があるので続き（next_offset）は出していません offset を付けずに"
+            "頭から呼び直してください"
+        )
+    return result
 
 
 def _library_media(host: EditorHost, raw: object) -> tuple[MediaItem, bool]:

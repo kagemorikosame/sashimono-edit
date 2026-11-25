@@ -630,3 +630,67 @@ class TestWhileReading:
         _settle(panel)
         assert panel.preview.player.path == path
         assert not panel.preview.player.playing
+
+
+class TestThirdReview:
+    def test_removing_a_favorite_keeps_the_favorites_open(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、お気に入りの根で 1 つ外すたびに既定の一覧へ戻り、残りを整理しづらい
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        panel.set_favorite([sounds / "ドン.wav", sounds / "長い.wav"], True)
+        _settle(panel)
+        root = panel._tree.topLevelItem(0)
+        assert root is not None
+        panel._tree.setCurrentItem(root)
+        _settle(panel)
+        panel.set_favorite([sounds / "ドン.wav"], False)
+        _settle(panel)
+        assert panel.location_text() == FAVORITES
+        assert [p.name for p in panel.visible_files()] == ["長い.wav"]
+
+    def test_overlapping_registrations_show_a_file_once(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、親と子を同じ分類で登録したとき、分類の根で同じ行が 2 つ並ぶ
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        panel.register(str(sounds / "爆発"), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        root = panel._tree.topLevelItem(0)
+        assert root is not None
+        panel._tree.setCurrentItem(root)
+        _settle(panel)
+        names = [p.name for p in panel.visible_files()]
+        assert names.count("ドカン.mp3") == 1
+
+    def test_the_settings_copy_hides_places_inside_hidden_categories(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、AI に使わせない分類のフォルダの中の場所が、お気に入りと前回の場所から外へ出る
+        del qt_application
+        monkeypatch.setattr(PreferenceStore, "save", lambda _self, _prefs: None)
+        window = MainWindow(Project.create(), confirm_unsaved=False)
+        try:
+            movie = str(tmp_path / "動画" / "空.mp4")
+            sound = str(tmp_path / "SE" / "ドン.wav")
+            window._apply_preferences(
+                Preferences(
+                    explorer_folders=(
+                        LibraryFolder(str(tmp_path / "動画"), "video"),
+                        LibraryFolder(str(tmp_path / "SE"), CATEGORY_SOUND_EFFECT),
+                    ),
+                    explorer_favorite_paths=(movie, sound),
+                    explorer_last_folder=str(tmp_path / "動画"),
+                    explorer_last_file=movie,
+                )
+            )
+            copied = window.app_settings()["preferences"]
+            assert isinstance(copied, dict)
+            assert copied["explorer_favorite_paths"] == [sound]
+            assert copied["explorer_last_folder"] == ""
+            assert copied["explorer_last_file"] == ""
+        finally:
+            window.close()
+            window.deleteLater()

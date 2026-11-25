@@ -174,7 +174,12 @@ from sashimono.core.io.library import Library
 from sashimono.core.io.media_memory import MediaMemory, fingerprint, with_remembered
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
-from sashimono.core.material_library import LibraryFolder, MaterialLibrary, MeasureBook
+from sashimono.core.material_library import (
+    LibraryFolder,
+    MaterialLibrary,
+    MeasureBook,
+    is_favorite,
+)
 from sashimono.core.mixing import (
     DuckShape,
     gain_commands,
@@ -5508,6 +5513,15 @@ class MainWindow(QMainWindow):
             for folder in preferences["explorer_folders"]
             if folder["category"] in self._preferences.explorer_ai_categories
         ]
+        # お気に入りと前回の場所も、AI に使わせない分類の登録したフォルダの中の物は載せない
+        # 登録の行だけを除いても、その中の場所がここから外へ出る
+        hidden = self._hidden_from_ai
+        preferences["explorer_favorite_paths"] = [
+            place for place in self._preferences.explorer_favorite_paths if not hidden(place)
+        ]
+        for key in ("explorer_last_folder", "explorer_last_file"):
+            if hidden(str(preferences[key])):
+                preferences[key] = ""
         # 新しい作品の編集の方針（#343）は本人の文 アプリの設定は同意なしで送るので、ここに
         # 載せると字幕と文字を送らないと決めた人の文まで外へ出る 有る無しだけを残す
         # （作品の方針は get_style_guide が字幕と文字として同意を取って読む）
@@ -5534,6 +5548,23 @@ class MainWindow(QMainWindow):
                 "読むだけです 変えるのは人だけです（表示 → 設定… / ショートカットの設定… など）"
             ),
         }
+
+    def _hidden_from_ai(self, place: str) -> bool:
+        """``place`` が AI に使わせない分類の登録したフォルダの中か
+
+        中に別の登録があれば、場所を含む登録のうち一番深い物の分類で決める（AI の見て回り方と同じ）
+        """
+        if not place:
+            return False
+        owners = [
+            folder
+            for folder in self._preferences.explorer_folders
+            if is_favorite([folder.path], place)
+        ]
+        if not owners:
+            return False
+        deepest = max(owners, key=lambda folder: len(Path(folder.path).parts))
+        return deepest.category not in self._preferences.explorer_ai_categories
 
     def view_state(self) -> ViewState:
         """人が画面で見ている表示の状態（#352 :class:`EditorHost` を参照） 読むだけ"""

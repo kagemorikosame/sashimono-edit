@@ -78,6 +78,7 @@ from sashimono.ai.session import (
     system_prompt,
 )
 from sashimono.core.commands import Author
+from sashimono.core.material_library import file_id
 from sashimono.ui.chat.direction_box import DirectionPlanBox
 from sashimono.ui.chat.parts_updater import PartsUpdater
 from sashimono.ui.chat.plan_box import PlanBox, plan_progress
@@ -1852,7 +1853,12 @@ class ChatPanel(QWidget):
         """
         if self._queued:
             return
-        result = proposal_for(self._host.document).apply(self._host.document)
+        library = self._host.material_library
+        # 登録したフォルダから取り込む効果音は、付ける今の設定でも AI に使ってよい物だけ
+        result = proposal_for(self._host.document).apply(
+            self._host.document,
+            allowed=lambda media: library.find_for_ai(file_id(media.path)) is not None,
+        )
         if result is not None:
             note = f"演出を {len(result.applied)} 個付けました（取り消し 1 回で全部戻ります）"
             if result.skipped:
