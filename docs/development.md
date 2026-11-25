@@ -5170,19 +5170,23 @@ gh release upload <タグ> dist\sources\sources-SHA256SUMS.txt dist\sources\sour
   新しい依存は足していない
 - 名前に版を入れない 公開した後に `releases/latest/download/` の決まった URL で前の版の一覧を読む
   （目録 `update.json` と同じ置き方）
-- 作るのは `tools/sbom.py` 読むのは配る zip だけで、zip の中の使用許諾の一覧（`THIRD_PARTY_NOTICES.txt`）
-  の表から名前・版・使用許諾を引き、zip に入っている写しのフォルダと DLL に突き合わせる DLL が
-  どの部品の物かは `build_package.NATIVE_LICENSES`（組み立ての確かめと同じ表） zip の中の DLL・拡張・
-  exe はどれも、表の部品の置き場か積んだ包みのフォルダの下になければ止める `_internal` の直下の DLL は
-  Python 本体と実行時の部品（`python3*` `libssl-*` `libcrypto-*` `libffi-*` `sqlite3` `VCRUNTIME140*`
-  `MSVCP140*`）だけを許す
+- 作るのは `tools/sbom.py` 読むのは配る zip だけ 何を積んだかは、組み立て（`build_package.py`）が
+  zip に入れる出どころの記録 `bundled-files.json`（`bundle_record`）から読む 積んだファイル 1 つずつに、
+  どの包みから来たか・Python 本体か・本体（sashimono）か・組み立てが作った物かと、積んだ包みの版が
+  書いてある 出どころは組み立ての記録（PyInstaller の TOC）と包みのファイルの表で、組み立てるときにだけ
+  正しく分かる 初めは zip の中身からフォルダの名前や拡張子で推していたが、当てはめの漏れが PR #548 の
+  レビューで 3 度続いたので、推すのをやめた
+- zip のファイルと記録は 1 対 1 で合わなければ止める（記録に無いファイル・記録にあるが zip に無い
+  ファイル・出どころの分からないファイル） 包みの名前と版は zip の中の使用許諾の一覧
+  （`THIRD_PARTY_NOTICES.txt`）の表と照らし、表に無い・版が違えば止める av.libs と lupa の DLL は
+  `build_package.NATIVE_LICENSES`（組み立ての確かめと同じ表）で 1 つずつ部品へ当て、当たらなければ止める
+- 記録の無い zip（0.2.6 までの zip）からは作らない 0.2.2 の組み立ての残り（TOC と組み立てたフォルダ）
+  から記録を作って 0.2.2 の zip に足し、全部のファイルが記録で合って同じ 39 の部品が出ることを確かめた
 - Python の包みには purl、脆弱性の照合に使う名前が決まっている部品（Python・Qt・FFmpeg・zlib・
   libwebp・libvpx・libiconv・dav1d・Opus）には CPE を書く Python は表の「3.14」ではなく、zip の
   DLL から読んだ修正版まで書く 推測の CPE は書かない（照合で別の製品に当たる）
 - DLL ごとの SHA-256 と、zip そのものの SHA-256（一覧の頭 `metadata.component`）も書く
 - 同じ zip からは同じ一覧ができる（時刻を入れない 通し番号は zip の SHA-256 から決める）
-  0.1.0・0.2.1・0.2.2 の手元の zip で作れること、0.2.2 は作り直して同じになること、0.2.1 → 0.2.2 の違いが
-  Python 3.14.7 → 3.14.9 だけと出ることを確かめた
 
 ```
 .venv\Scripts\python.exe tools\sbom.py write
@@ -5195,7 +5199,7 @@ gh release upload <タグ> dist\sources\sources-SHA256SUMS.txt dist\sources\sour
 
 | 段 | 止める | 止めない |
 | --- | --- | --- |
-| 組み立て（`package.yml` の build） | 積んだ DLL の部品が決まっていない（一覧への足し忘れ） 写しのフォルダと一覧の表の版が違う 表に無い写しのフォルダがある 書き付け・使用許諾の一覧・Python の DLL が無い このときは一覧を書かず、ジョブが落ちて zip も上げない | 表にあるが積んでいない物（表は積む候補を広めに書いてある 載せずに名前を出す） |
+| 組み立て（`package.yml` の build） | zip のファイルと出どころの記録が合わない 積んだ包みが一覧の表に無い・版が違う av.libs と lupa の DLL の部品が決まっていない 積んだ包みに当たらない写しのフォルダがある 書き付け・出どころの記録・使用許諾の一覧・Python の DLL が無い このときは一覧を書かず、ジョブが落ちて zip も上げない | 表にあるが積んでいない物（表は積む候補を広めに書いてある 載せずに名前を出す） |
 | 下書きへ上げる（`release.yml` の publish） | 一覧が無い 一覧に書いた zip の SHA-256 が組み立てた zip と違う | ─ |
 | `release.py` の 4 | 下書きの一覧が、落とした zip から作り直した物と違う 作り直せない | 下書きに一覧が無い（一覧を作る前の run で上げた下書き）ときは、手元で作って上げて進む |
 | `release.py` の 8 | ─ | 前に公開した版の一覧と比べた違い（足した・外した・版が変わった・版が同じで中身が違う）を要約に出す 前の一覧が読めなくても止めない |

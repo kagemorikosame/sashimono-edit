@@ -89,7 +89,8 @@ def _history(
         "version": version,
         "label": version,
         "commit": "a" * 40,
-        "taken": taken,
+        # 日付だけの書き方は、記録と同じ時差付きの日時にそろえる
+        "taken": taken if "T" in taken else f"{taken}T00:00:00+09:00",
         "machine": {**MACHINE, **machine},
         "repeat": 5,
         "benches": {
@@ -298,12 +299,45 @@ class TestCompare:
 
         付けた名前で引けないと、残した記録を比べられない
         """
-        data = _history("0.2.6", "2026-11-01", {"seek": _runs([10.0] * 5)})
+        data = _history("0.2.6", "2026-11-01T00:00:00+09:00", {"seek": _runs([10.0] * 5)})
         data["label"] = "手元 測り"
         path = tmp_path / "____.json"
         path.write_text(json.dumps(data), encoding="utf-8")
         _, found = tool.pick(tool.history_files(tmp_path), None, "手元 測り")
         assert found is not None and found["label"] == "手元 測り"
+
+    def test_different_labels_never_share_a_file(self, tool: ModuleType) -> None:
+        """日本語の名前を全部 _ にすると「変更前」と「変更後」が同じファイルになり、後が前を消す"""
+        names = {tool._safe_name(label) for label in ("変更前", "変更後", "変更 前", "変更_前")}
+        assert len(names) == 4
+        assert tool._safe_name("0.2.7") == "0.2.7"
+        assert tool._safe_name("変更 前") == tool._safe_name("変更 前")
+
+    def test_times_are_compared_with_their_offsets(self, tool: ModuleType, tmp_path: Path) -> None:
+        """夏時間の終わりのように時差が変わる前後では、文字の順と時刻の順が逆になる"""
+        earlier = _history("前", "2026-11-01T01:50:00-04:00", {"seek": _runs([10.0] * 5)})
+        later = _history("後", "2026-11-01T01:10:00-05:00", {"seek": _runs([10.0] * 5)})
+        for data in (earlier, later):
+            (tmp_path / f"{data['version']}.json").write_text(json.dumps(data), encoding="utf-8")
+        base, target = tool.pick(tool.history_files(tmp_path), None, None)
+        assert target is not None and target["version"] == "後"
+        assert base is not None and base["version"] == "前"
+
+    @pytest.mark.parametrize(
+        "benches",
+        [[], {"seek": []}, {"seek": {"runs": [None]}}, {"seek": {"runs": [{"status": "ok"}]}}],
+    )
+    def test_a_broken_history_is_skipped(
+        self, tool: ModuleType, tmp_path: Path, benches: object
+    ) -> None:
+        """形だけ正しい壊れた記録が最新になると、既定の show と compare がそこで落ちる"""
+        good = _history("0.2.6", "2026-11-01T00:00:00+09:00", {"seek": _runs([10.0] * 5)})
+        broken = {**_history("0.2.7", "2026-11-24T00:00:00+09:00", {}), "benches": benches}
+        for data in (good, broken):
+            (tmp_path / f"{data['version']}.json").write_text(json.dumps(data), encoding="utf-8")
+        found = tool.history_files(tmp_path)
+        assert [data["version"] for _, data in found] == ["0.2.6"]
+        assert "0.2.6" in tool.describe(found[-1][1])
 
 
 class TestRun:

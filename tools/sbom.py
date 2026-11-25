@@ -11,16 +11,21 @@ DLL には SHA-256 を付ける zip そのものの SHA-256 は一覧の頭（``
 
 **読むのは配る zip だけ**（と、どの DLL がどの部品かの表 ``build_package.NATIVE_LICENSES``）
 組み立てた機械の Python 環境は見ない 開発用の .venv と配る zip の部品は版が違うことがある
-（0.2.3 で collect_sources.py が正しい zip を NG にした） 部品の名前・版・使用許諾は zip に
-入れた使用許諾の一覧（``THIRD_PARTY_NOTICES.txt``）の表から引き、zip に実際に入っている物
-（``licenses`` の写しのフォルダと DLL）と突き合わせる
+（0.2.3 で collect_sources.py が正しい zip を NG にした）
+
+何を積んだかは、組み立てが zip に入れた出どころの記録（``bundled-files.json``
+``build_package.bundle_record``）から読む 積んだファイル 1 つずつに、どの包みから来たか・
+Python 本体か・本体（sashimono）か・組み立てが作った物かが書いてある zip の中身からフォルダの
+名前や拡張子で推すと当てはめに漏れが出た（PR #548 のレビューで 3 度続いた）ので、推さない
+部品の名前・版・使用許諾は zip に入れた使用許諾の一覧（``THIRD_PARTY_NOTICES.txt``）の表から引く
 
 次のどれかがあれば一覧を書かずに止まる（誤った一覧を配らない）
 
-- zip に入っている DLL が、どの部品の物か決まっていない（一覧への足し忘れ）
-- 写しのフォルダの版と、一覧の表の版が違う（版違い）
-- 写しのフォルダが、一覧の表のどの包みにも、リポジトリの写しにも当たらない
-- 書き付け（``build-info.json``）・使用許諾の一覧・Python の DLL が無い
+- zip のファイルが出どころの記録に無い・記録の出どころが分からない・記録にあるが zip に無い
+- 積んだ包みが一覧の表に無い（一覧への足し忘れ） 包みの版と一覧の表の版が違う（版違い）
+- av.libs・lupa の DLL が、どの部品の物か決まっていない
+- 写しのフォルダが、積んだ包みにもリポジトリの写しにも当たらない
+- 書き付け（``build-info.json``）・出どころの記録・使用許諾の一覧・Python の DLL が無い
 
 止めないのは「一覧の表にあるが zip に入っていない」物だけ（表は積む候補を広めに書いてある）
 表にあっても積んでいない物は一覧に載せず、何を外したかを出す
@@ -76,15 +81,15 @@ _APP = build_package.APP_NAME
 _LICENSES = f"{_APP}/{build_package.LICENSES_DIR}/"
 _INTERNAL = f"{_APP}/_internal/"
 
-#: 使用許諾の写しを持たない包みの、zip の中の置き場（``WITHOUT_LICENSE_FILES`` の分）
-#: 写しのフォルダが無いので、ここに中身があることで積んだと見る
-IMPORT_FOLDERS: dict[str, str] = {"pyopengl": "OpenGL"}
-
-#: Python 本体と一緒に入る DLL（``_internal`` の直下）
-#: 表の「Python と同梱の OpenSSL・libffi など」の分
-PYTHON_RUNTIME = ("python3*.dll", "libcrypto-*.dll", "libssl-*.dll", "libffi-*.dll", "sqlite3.dll")
-#: ``_internal`` の直下に置かれてよい DLL の型 これ以外の DLL が直下にあれば、出どころの分からない物
-ROOT_DLLS = (*PYTHON_RUNTIME, "vcruntime140*.dll", "msvcp140*.dll")
+#: 組み立ての記録に載らないが :func:`build_package.assemble` などが置く物
+#: （``Sashimono`` からの相対）
+ASSEMBLED_FILES = frozenset(
+    (
+        *build_package.ASSEMBLED,
+        *build_package.ASSEMBLED_INFO,
+    )
+)
+ASSEMBLED_FOLDERS = tuple(f"{folder}/" for folder in build_package.ASSEMBLED_FOLDERS)
 
 #: 脆弱性の照合に使う名前（CPE の作り手と製品） NVD で名前が決まっていると確かめた物だけ
 #: 推測で書くと、照合で別の製品に当たるか、当たるはずの物を外す 部品の名前の頭の語で引く
@@ -285,50 +290,102 @@ def _digest(archive: zipfile.ZipFile, name: str) -> str:
     return hashlib.sha256(archive.read(name)).hexdigest()
 
 
-def _python_packages(
-    names: list[str], rows: dict[str, PackageRow], copies: set[str], problems: list[str]
-) -> tuple[list[Found], set[str]]:
-    """写しのフォルダから、積んだ Python の包みを数える 戻り値の 2 つ目は当てた包み"""
-    found: list[Found] = []
-    used: set[str] = set()
-    folders = sorted(
-        {
-            PurePosixPath(name[len(_LICENSES) :]).parts[0]
-            for name in names
-            if name.startswith(_LICENSES) and name.count("/") >= 3
+@dataclass
+class Record:
+    """組み立てが書いた出どころの記録（``bundled-files.json``）"""
+
+    #: 配布名（PEP 503 でそろえた物）→（表記どおりの名前, 版）
+    packages: dict[str, tuple[str, str]]
+    #: ``Sashimono`` からの相対の場所 → 出どころ（包みの配布名か python・sashimono・build）
+    files: dict[str, str]
+
+
+def read_record(archive: zipfile.ZipFile) -> Record:
+    """出どころの記録を読む 無い・形が違うなら :class:`BomError`
+
+    記録の無い zip（一覧を作る前の組み立て）からは作らない 中身から推して作ると、
+    推し方の漏れがそのまま一覧の欠けになる
+    """
+    name = f"{_APP}/{build_package.BUNDLED_FILES_NAME}"
+    try:
+        data = json.loads(archive.read(name))
+        packages = {
+            str(key): (str(value["name"]), str(value["version"]))
+            for key, value in data["packages"].items()
         }
-    )
-    for folder in folders:
-        if folder in copies or folder == "Python":
+        files = {str(key): str(value) for key, value in data["files"].items()}
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
+        raise BomError(
+            [f"zip に読める {build_package.BUNDLED_FILES_NAME}（出どころの記録）が無い（{exc!r}）"]
+        ) from exc
+    return Record(packages, files)
+
+
+def coverage(names: list[str], record: Record) -> list[str]:
+    """zip のファイルと出どころの記録が 1 対 1 で合うか 合わない所を返す"""
+    problems: list[str] = []
+    inside = {name[len(_APP) + 1 :] for name in names if name.startswith(f"{_APP}/")}
+    for name in names:
+        if not name.startswith(f"{_APP}/") and name != build_package.INSTALL_NOTE_NAME:
+            problems.append(f"{name} は組み立ての記録に無い")
+    for relative in sorted(inside):
+        if relative in record.files:
+            if record.files[relative] == build_package.OWNER_UNKNOWN:
+                problems.append(f"{relative} の出どころが分からない")
             continue
-        matched = re.fullmatch(r"(.+)-([^-]+)", folder)
-        row = rows.get(canonical_name(matched.group(1))) if matched else None
-        if matched is None or row is None:
-            problems.append(f"licenses/{folder} が使用許諾の一覧の表に無い（一覧への足し忘れ）")
+        if relative in ASSEMBLED_FILES or relative.startswith(ASSEMBLED_FOLDERS):
             continue
-        if row.version != matched.group(2):
-            problems.append(
-                f"licenses/{folder} は {matched.group(2)} だが、使用許諾の一覧の表は {row.version}"
-            )
-            continue
-        key = canonical_name(row.name)
-        if key in used:
-            # 表記だけ違う写しのフォルダが 2 つあると、同じ部品が 2 度載り bom-ref が重なる
-            problems.append(f"licenses/{folder} は {row.name} の写しのフォルダと重なる")
-            continue
-        used.add(key)
-        found.append(_package(row, f"{_LICENSES}{folder}"))
-    for key in sorted(build_package.WITHOUT_LICENSE_FILES):
-        folder = IMPORT_FOLDERS.get(key, key)
-        if not any(name.startswith(f"{_INTERNAL}{folder}/") for name in names):
-            continue
+        problems.append(f"{relative} は組み立ての記録に無い（どの部品の物か決まっていない）")
+    owners = set(record.packages) | {
+        build_package.OWNER_OWN,
+        build_package.OWNER_BUILD,
+        build_package.OWNER_PYTHON,
+    }
+    for relative, owner in sorted(record.files.items()):
+        if relative not in inside:
+            problems.append(f"{relative} は組み立ての記録にあるが zip に無い")
+        elif owner not in owners and owner != build_package.OWNER_UNKNOWN:
+            problems.append(f"{relative} の出どころ {owner} が積んだ包みの記録に無い")
+    return problems
+
+
+def _python_packages(
+    names: list[str],
+    record: Record,
+    rows: dict[str, PackageRow],
+    copies: set[str],
+    problems: list[str],
+) -> list[Found]:
+    """積んだ Python の包み 出どころの記録の包みを、一覧の表と写しのフォルダに照らす"""
+    folders = {
+        PurePosixPath(name[len(_LICENSES) :]).parts[0]
+        for name in names
+        if name.startswith(_LICENSES) and name.count("/") >= 3
+    }
+    expected: set[str] = set()
+    found: list[Found] = []
+    for key, (name, version) in sorted(record.packages.items()):
         row = rows.get(key)
         if row is None:
-            problems.append(f"{key} を積んでいるが、使用許諾の一覧の表に無い")
+            problems.append(f"{name} {version} を積んでいるが、使用許諾の一覧の表に無い")
             continue
-        used.add(key)
-        found.append(_package(row, f"{_INTERNAL}{folder}"))
-    return found, used
+        if row.version != version:
+            problems.append(
+                f"{name} は {version} を積んでいるが、使用許諾の一覧の表は {row.version}"
+            )
+            continue
+        folder = f"{name}-{version}"
+        expected.add(folder)
+        if folder in folders:
+            evidence = f"{_LICENSES}{folder}"
+        else:
+            placed = sorted(path for path, owner in record.files.items() if owner == key)
+            evidence = f"{_APP}/{PurePosixPath(placed[0]).parent}" if placed else ""
+        found.append(_package(row, evidence))
+    for folder in sorted(folders - expected - copies - {"Python"}):
+        # 前の組み立ての写しや、積んでいない包みの写しを配らない
+        problems.append(f"licenses/{folder} が積んだ包みにもリポジトリの写しにも当たらない")
+    return found
 
 
 def _package(row: PackageRow, evidence: str) -> Found:
@@ -344,9 +401,14 @@ def _package(row: PackageRow, evidence: str) -> Found:
     )
 
 
+#: lupa の中の Lua 5.x の拡張 lupa の包みの物で、使用許諾も lupa の dist-info にある
+_LUPA_OWN = re.compile(r"lua5\d\.[^/]*\.pyd", re.IGNORECASE)
+
+
 def _parts(
     archive: zipfile.ZipFile,
     names: list[str],
+    record: Record,
     rows: list[PartRow],
     python: str | None,
     problems: list[str],
@@ -375,28 +437,31 @@ def _parts(
             )
         return reached[index]
 
-    for folder in build_package.NATIVE_FOLDERS:
-        prefix = f"{_INTERNAL}{folder}/"
-        for name in names:
-            if not name.startswith(prefix) or "/" in name[len(prefix) :]:
-                continue
-            if PurePosixPath(name).suffix.lower() not in (".dll", ".pyd"):
-                continue
-            filename = PurePosixPath(name).name
-            base = build_package.native_base_name(filename)
-            if folder == "lupa" and not base.startswith("luajit"):
-                continue
-            copy = build_package.NATIVE_LICENSES.get(base)
-            if copy is None:
-                problems.append(f"{folder}/{filename} がどの部品の物か決まっていない")
-                continue
-            row = by_copy.get(copy)
-            if row is None:
-                problems.append(f"{folder}/{filename} の部品（{copy}）が使用許諾の一覧の表に無い")
-                continue
-            if not any(other.startswith(f"{_LICENSES}{copy}/") for other in names):
-                problems.append(f"{folder}/{filename} の写し licenses/{copy} が zip に無い")
-            entry(row).files[name[len(_APP) + 1 :]] = _digest(archive, name)
+    # av.libs と lupa の DLL は 1 つずつ部品へ当てる 下のフォルダの物も含め、当たらない物は止める
+    for relative in sorted(record.files):
+        parts = PurePosixPath(relative).parts
+        if (
+            len(parts) < 3
+            or parts[0] != "_internal"
+            or parts[1] not in build_package.NATIVE_FOLDERS
+        ):
+            continue
+        if PurePosixPath(relative).suffix.lower() not in (".dll", ".pyd"):
+            continue
+        filename = parts[-1]
+        if parts[1] == "lupa" and len(parts) == 3 and _LUPA_OWN.fullmatch(filename):
+            continue
+        copy = build_package.NATIVE_LICENSES.get(build_package.native_base_name(filename))
+        if copy is None or len(parts) != 3:
+            problems.append(f"{'/'.join(parts[1:])} がどの部品の物か決まっていない")
+            continue
+        row = by_copy.get(copy)
+        if row is None:
+            problems.append(f"{parts[1]}/{filename} の部品（{copy}）が使用許諾の一覧の表に無い")
+            continue
+        if not any(other.startswith(f"{_LICENSES}{copy}/") for other in names):
+            problems.append(f"{parts[1]}/{filename} の写し licenses/{copy} が zip に無い")
+        entry(row).files[relative] = _digest(archive, f"{_APP}/{relative}")
 
     left: list[str] = []
     for row in rows:
@@ -405,68 +470,25 @@ def _parts(
             if rows.index(row) not in reached:
                 left.append(row.name)
             continue
-        place = f"{_APP}/{row.place}"
-        inside = [name for name in names if row.place and name.startswith(place)]
+        inside = [path for path in record.files if row.place and path.startswith(row.place)]
         if not inside:
             left.append(row.name)
             continue
         found = entry(row)
-        patterns = list(row.patterns)
-        if found.name.lower().startswith("python"):
-            patterns += list(PYTHON_RUNTIME)
-        for name in inside:
-            filename = PurePosixPath(name).name
-            if any(fnmatch.fnmatch(filename.lower(), pattern.lower()) for pattern in patterns):
-                found.files[name[len(_APP) + 1 :]] = _digest(archive, name)
+        is_python = found.name.lower().startswith("python")
+        for relative in inside:
+            filename = PurePosixPath(relative).name.lower()
+            if is_python:
+                # Python 本体と一緒に入った DLL（OpenSSL・libffi・sqlite など）は
+                # 出どころの記録で決まる
+                hit = record.files[relative] == build_package.OWNER_PYTHON and filename.endswith(
+                    ".dll"
+                )
+            else:
+                hit = any(fnmatch.fnmatch(filename, pattern.lower()) for pattern in row.patterns)
+            if hit:
+                found.files[relative] = _digest(archive, f"{_APP}/{relative}")
     return list(reached.values()), left
-
-
-def unclaimed(names: list[str], used: set[str], parts: list[Found]) -> list[str]:
-    """どの部品の物とも決まらない DLL・拡張・exe 一覧に載らないまま配る物を見つける
-
-    表の部品の置き場（av.libs・PySide6 など）と、積んだ Python の包みのフォルダの下は、その部品の
-    物と見る ``_internal`` の直下の DLL は Python 本体と実行時の部品の名前の型（:data:`ROOT_DLLS`）
-    だけを許す 直下の ``.pyd`` は標準ライブラリと包みの拡張で、Python が読む物
-    """
-    tops: set[str] = set()
-    # DLL を 1 つずつ部品へ当てるフォルダ（av.libs と lupa）は、当てたファイルだけを許す
-    # 頭のフォルダで許すと、当てる走査が見ない下のフォルダの DLL が、部品もハッシュも無いまま通る
-    assigned = {f"{_APP}/{path}" for part in parts for path in part.files}
-    for part in parts:
-        # 置き場の頭のフォルダ（``_internal/OpenGL/DLLS/`` なら OpenGL） 直下（Python）は数えない
-        if part.evidence.startswith(_INTERNAL):
-            top = part.evidence[len(_INTERNAL) :].split("/", 1)[0]
-            if top:
-                tops.add(top)
-    found: list[str] = []
-    for name in names:
-        suffix = PurePosixPath(name).suffix.lower()
-        if suffix not in (".dll", ".pyd", ".exe") or name == f"{_APP}/{_APP}.exe":
-            continue
-        if not name.startswith(_INTERNAL):
-            found.append(f"{name} がどの部品の物か決まっていない")
-            continue
-        inner = name[len(_INTERNAL) :]
-        if "/" not in inner:
-            if suffix == ".pyd" or any(
-                fnmatch.fnmatch(inner.lower(), pattern) for pattern in ROOT_DLLS
-            ):
-                continue
-            found.append(f"_internal/{inner} がどの部品の物か決まっていない")
-            continue
-        top = inner.split("/", 1)[0]
-        if top in build_package.NATIVE_FOLDERS:
-            # lupa の直下の Lua 5.x の拡張は lupa の包みの物（写しは lupa の dist-info にある）
-            lupa_own = top == "lupa" and inner.count("/") == 1 and "lupa" in used
-            if name in assigned or lupa_own:
-                continue
-            found.append(f"_internal/{inner} がどの部品の物か決まっていない")
-            continue
-        imported = {IMPORT_FOLDERS.get(key, key) for key in used}
-        if top in tops or top in imported or canonical_name(top) in used:
-            continue
-        found.append(f"_internal/{inner} がどの部品の物か決まっていない")
-    return found
 
 
 @dataclass
@@ -501,6 +523,8 @@ def generate(path: Path) -> Bom:
         except KeyError as exc:
             raise BomError([f"zip に {build_package.NOTICES_NAME} が無い"]) from exc
         packages, parts = notice_rows(notices)
+        record = read_record(archive)
+        problems += coverage(names, record)
         python = build_package.zip_python_version(path)
         if python is None:
             problems.append("zip に Python の DLL が無いか、版を読めない")
@@ -509,18 +533,18 @@ def generate(path: Path) -> Bom:
             for name in build_package.repository_license_files()
             if len(PurePosixPath(name).parts) > 1
         }
-        found, used = _python_packages(names, packages, copies, problems)
+        found = _python_packages(names, record, packages, copies, problems)
         native, left = _parts(
             archive,
             names,
+            record,
             parts,
             build_package.version_text(python) if python else None,
             problems,
         )
-    problems += unclaimed(names, used, native)
     if problems:
         raise BomError(problems)
-    left_out = [packages[key].name for key in sorted(set(packages) - used)] + left
+    left_out = [packages[key].name for key in sorted(set(packages) - set(record.packages))] + left
     components = [
         item.component()
         for item in sorted(found, key=lambda item: canonical_name(item.name))

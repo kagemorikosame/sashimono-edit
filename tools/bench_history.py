@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -57,7 +58,15 @@ TOOLS = Path(__file__).resolve().parent
 ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
 
-from bench_results import FAILED, MACHINE_KEYS, OK, SKIPPED, machine, read_record  # noqa: E402
+from bench_results import (  # noqa: E402
+    FAILED,
+    MACHINE_KEYS,
+    OK,
+    SKIPPED,
+    check_run,
+    machine,
+    read_record,
+)
 
 #: 版ごとの記録の形 中身の意味を変えたら数を上げる
 SCHEMA = "sashimono-bench-history/1"
@@ -523,7 +532,32 @@ def read_history(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path} を読めない: {exc}") from exc
     if not isinstance(data, dict) or data.get("schema") != SCHEMA:
         raise ValueError(f"{path} は {SCHEMA} の記録ではない")
+    # 中まで見る 形だけ正しい壊れた記録が最新になると、既定の show と compare がそこで落ち、
+    # ほかの正しい記録まで見られなくなる
+    benches = data.get("benches")
+    if not isinstance(benches, dict) or not isinstance(data.get("machine"), dict):
+        raise ValueError(f"{path} の中身が欠けている")
+    for name, entry in benches.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("runs"), list):
+            raise ValueError(f"{path} の {name} の中身が欠けている")
+        for run in entry["runs"]:
+            check_run(run, f"{path} の {name}")
+    taken(data, path)
     return data
+
+
+def taken(data: dict[str, Any], path: Path | None = None) -> datetime.datetime:
+    """測った時刻 時差の付いた日時として読む
+
+    文字のまま並べると、夏時間の終わりのように時差が変わる前後で順が逆になる
+    """
+    try:
+        found = datetime.datetime.fromisoformat(str(data.get("taken", "")))
+    except ValueError as exc:
+        raise ValueError(f"{path or label_of(data)} の測った時刻を読めない（{exc}）") from exc
+    if found.tzinfo is None:
+        raise ValueError(f"{path or label_of(data)} の測った時刻に時差が無い")
+    return found
 
 
 def history_files(folder: Path) -> list[tuple[Path, dict[str, Any]]]:
@@ -534,7 +568,7 @@ def history_files(folder: Path) -> list[tuple[Path, dict[str, Any]]]:
             found.append((path, read_history(path)))
         except ValueError as exc:
             print(f"[--] {exc}")
-    return sorted(found, key=lambda pair: str(pair[1].get("taken", "")))
+    return sorted(found, key=lambda pair: taken(pair[1]))
 
 
 def pick(
@@ -560,14 +594,22 @@ def pick(
         for _, data in records
         if data is not chosen
         # 同じ秒に測った物も前と見る（測り直しを続けて回したとき 時刻は秒までしか残さない）
-        and str(data.get("taken", "")) <= str(chosen.get("taken", ""))
+        and taken(data) <= taken(chosen)
         and same_machine(data.get("machine"), chosen.get("machine"))
     ]
     return (earlier[-1] if earlier else None), chosen
 
 
 def _safe_name(label: str) -> str:
-    return re.sub(r"[^0-9A-Za-z._+-]", "_", label)
+    """記録のファイル名 日本語などの字はそのまま使い、使えない字だけを _ にする
+
+    置き換えた名前には元の名前の要約を付ける 付けないと「変更 前」と「変更_前」のように違う名前が
+    同じファイルになり、後の測りが前の記録を黙って置き換える 同じ名前の測り直しは同じファイル
+    """
+    safe = re.sub(r"[^\w.+-]", "_", label)
+    if safe == label:
+        return safe
+    return f"{safe}-{hashlib.sha256(label.encode('utf-8')).hexdigest()[:8]}"
 
 
 def main(argv: list[str] | None = None, *, call: Execute = execute) -> int:

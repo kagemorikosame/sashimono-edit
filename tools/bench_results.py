@@ -171,16 +171,31 @@ def read_record(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path.name} を読めない: {exc}") from exc
     if not isinstance(data, dict) or data.get("schema") != SCHEMA:
         raise ValueError(f"{path.name} は {SCHEMA} の記録ではない")
-    if data.get("status") not in (OK, SKIPPED, FAILED) or not isinstance(data.get("items"), list):
-        raise ValueError(f"{path.name} の中身が欠けている")
-    # 項目の形も見る 壊れた項目を通すと、比べる道具が数える所で落ち、残した記録ごと読めなくなる
+    check_run(data, path.name)
+    return data
+
+
+def check_run(data: Any, where: str) -> None:
+    """1 回の走りの記録の形を見る 崩れていれば ``ValueError``
+
+    壊れた項目を通すと、比べる道具が数える所で落ち、残した記録ごと読めなくなる
+    版ごとの記録（bench_history）も、回ごとにこれで見る
+    """
+    if not isinstance(data, dict) or data.get("status") not in (OK, SKIPPED, FAILED):
+        raise ValueError(f"{where} の中身が欠けている")
+    if "items" not in data:
+        # 記録を書けずに落ちた回（bench_history が理由だけを残す）
+        if data.get("status") != FAILED:
+            raise ValueError(f"{where} の中身が欠けている")
+        return
+    if not isinstance(data["items"], list) or not isinstance(data.get("machine"), dict):
+        raise ValueError(f"{where} の中身が欠けている")
     for item in data["items"]:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-            raise ValueError(f"{path.name} に読めない項目がある")
+            raise ValueError(f"{where} に読めない項目がある")
         if item.get("status") == OK and not (
             isinstance(item.get("median"), (int, float))
             and isinstance(item.get("samples"), list)
             and item["samples"]
         ):
-            raise ValueError(f"{path.name} の {item['name']} に値が無い")
-    return data
+            raise ValueError(f"{where} の {item['name']} に値が無い")
