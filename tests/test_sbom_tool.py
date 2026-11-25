@@ -352,6 +352,12 @@ class TestGenerate:
             }
         assert binaries <= hashed
         assert listed["numpy"] == found["numpy"]["version"]
+        # 組み立てのログだけで載り方を確かめられる 載らない物があれば名前が出る
+        summary = tool.hash_summary(archive, data)
+        assert summary[0].endswith(f"{len(binaries)} 個（zip の中 {len(binaries)} 個）")
+        assert "OpenBLAS 1" in summary[-1]
+        del data["metadata"]["component"]["components"]
+        assert "Sashimono.exe" in tool.hash_summary(archive, data)[1]
 
     def test_parts_bundled_with_python_get_their_own_versions(
         self, tool: ModuleType, tmp_path: Path

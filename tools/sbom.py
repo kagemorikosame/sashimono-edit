@@ -797,6 +797,38 @@ def mismatches(archive: Path, published: dict[str, Any]) -> list[str]:
     return found or ["中身の並びや書き方が、作り直した物と違う"]
 
 
+def hash_summary(archive: Path, data: dict[str, Any]) -> list[str]:
+    """zip の DLL・拡張・exe のうちハッシュを載せた数と、部品ごとの載せた数
+
+    一覧を作り直さずに、ハッシュの載らない物が出ていないかを人とログで見られるようにする
+    """
+    with zipfile.ZipFile(archive) as opened:
+        binaries = {
+            name[len(_APP) + 1 :]
+            for name in opened.namelist()
+            if name.startswith(f"{_APP}/") and _is_binary(name)
+        }
+    holders = [
+        *_list(data.get("components")),
+        _table(_table(data.get("metadata")).get("component")),
+    ]
+    counts = {
+        str(_table(item).get("name")): {
+            str(_table(inner).get("name")) for inner in _list(_table(item).get("components"))
+        }
+        for item in holders
+    }
+    hashed = set().union(*counts.values()) if counts else set()
+    done = len(binaries & hashed)
+    lines = [f"ハッシュを載せた DLL・拡張・exe {done} 個（zip の中 {len(binaries)} 個）"]
+    missing = sorted(binaries - hashed)
+    if missing:
+        lines.append(f"ハッシュの載っていない物: {'、'.join(missing)}")
+    shown = "、".join(f"{name} {len(files)}" for name, files in counts.items() if files)
+    lines.append(f"部品ごとのハッシュの数: {shown}")
+    return lines
+
+
 def _print(lines: Iterable[str], lead: str = "") -> None:
     for line in lines:
         print(f"{lead}{line}")
@@ -845,6 +877,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"できた: {out}（部品 {count} 個 zip の SHA-256 {zip_digest(bom.data)}）")
         if bom.left_out:
             print(f"表にあるが積んでいないので載せていない: {'、'.join(bom.left_out)}")
+        # 組み立ての記録（CI のログ）だけで、ハッシュの載り方を確かめられるようにする
+        for line in hash_summary(archive, bom.data):
+            print(line)
         return 0
 
     if args.command == "check":
