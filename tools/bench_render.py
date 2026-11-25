@@ -46,7 +46,10 @@ _base = Path(tempfile.mkdtemp(prefix="sashimono-bench-"))
 atexit.register(shutil.rmtree, _base, True)
 os.environ["APPDATA"] = str(_base / "roaming")
 os.environ["LOCALAPPDATA"] = str(_base / "local")
+# 結果の形は隣の道具の物を使う 試験が importlib で読むときは tools が探す所に無い
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from bench_results import BenchRecord  # noqa: E402
 from OpenGL import GL  # noqa: E402
 
 from sashimono.core.commands import (  # noqa: E402
@@ -393,8 +396,16 @@ def percentile95(times: list[float]) -> float:
     return statistics.quantiles(times, n=20, method="inclusive")[18]
 
 
-def report(name: str, measured: tuple[list[float], list[float]]) -> bool:
+def report(
+    name: str,
+    measured: tuple[list[float], list[float]],
+    record: BenchRecord | None = None,
+    key: str = "",
+) -> bool:
+    """表へ 1 行出す ``record`` があれば ``key`` の項目として記録にも足す"""
     times, scans = measured
+    if record is not None:
+        record.add(key, times, label=name)
     worst = max(times)
     p95 = percentile95(times)
     ok = p95 <= BUDGET_MS
@@ -423,6 +434,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="書き出しと同じ道（GPU から CPU へ読み戻す）を測る 既定はプレビューと同じ道",
     )
+    parser.add_argument(
+        "--json", type=Path, default=None, help="版ごとに比べる記録の形（bench_results）でも書く"
+    )
     arguments = parser.parse_args(argv)
 
     for name in ("width", "height", "depth", "tracks", "effects", "texts", "frames"):
@@ -435,11 +449,20 @@ def main(argv: list[str] | None = None) -> int:
         width=arguments.width, height=arguments.height, frame_rate=FrameRate(30)
     )
     length = max(arguments.frames + 1, 30)
+    conditions = {key: value for key, value in vars(arguments).items() if key != "json"}
     try:
         context = OffscreenGLContext()
     except GLContextError as error:
         print(f"OpenGL コンテキストを作れないので測れない: {error}")
+        skipped = BenchRecord("render", conditions)
+        skipped.skip(f"OpenGL コンテキストを作れない: {error}")
+        skipped.write(arguments.json)
         return 0
+    with context:
+        # 機械の鍵に GPU を入れる 同じ CPU でも GPU が違えば合成の速さは比べられない
+        found = GL.glGetString(GL.GL_RENDERER)
+    gpu = found.decode("ascii", "replace") if isinstance(found, bytes) else None
+    record = BenchRecord("render", conditions, gpu=gpu)
 
     if arguments.readback:
         path_name = f"書き出しと同じ道（{arguments.width}x{arguments.height} を CPU へ読み戻す）"
@@ -461,11 +484,15 @@ def main(argv: list[str] | None = None) -> int:
             passed &= report(
                 f"シーン {depth} 段",
                 measure(project, context, arguments.frames, readback=arguments.readback),
+                record,
+                f"scene-depth-{depth}",
             )
         project = busy_project(settings, arguments.tracks, arguments.effects, length)
         passed &= report(
             f"{arguments.tracks} 本 × エフェクト {arguments.effects}",
             measure(project, context, arguments.frames, readback=arguments.readback),
+            record,
+            "busy",
         )
         # グラデーション（#312）の有る無しを、止まった字と毎フレーム組み直す字で並べる
         for moving in (False, True):
@@ -477,23 +504,36 @@ def main(argv: list[str] | None = None) -> int:
                 name += " グラデーション" if gradient else " 単色"
                 if moving:
                     name += " 大きさが動く"
+                key = "text-" + ("gradient" if gradient else "solid")
                 passed &= report(
-                    name, measure(project, context, arguments.frames, readback=arguments.readback)
+                    name,
+                    measure(project, context, arguments.frames, readback=arguments.readback),
+                    record,
+                    key + ("-moving" if moving else ""),
                 )
         if arguments.videos:
             source = make_video(_base, arguments.width, arguments.height, length / 30 + 1)
             if source is None:
                 print("ffmpeg（libx264）で素材を作れないので、動画の場面は測らない")
+                # 動画の項目だけが欠ける 記録全体を飛ばした扱いにはしない（残りは測れている）
+                record.reason = "ffmpeg（libx264）で素材を作れず、動画の場面を測っていない"
             else:
                 for effects in (0, arguments.effects):
                     project = video_project(settings, source, arguments.videos, effects, length)
                     passed &= report(
                         f"動画 {arguments.videos} 本 × エフェクト {effects}",
                         measure(project, context, arguments.frames, readback=arguments.readback),
+                        record,
+                        f"video-fx{effects}",
                     )
+    except Exception as error:
+        # 測れた所までを残す 何も書かずに落ちると、比べる道具には「記録が無い」としか見えない
+        record.fail(f"{type(error).__name__}: {error}")
+        raise
     finally:
         SCAN.uninstall()
         context.release()
+        record.write(arguments.json)
     # 読み戻しの道は比べるための表示 予算はプレビューのものなので合否に使わない
     return 0 if passed or arguments.readback else 1
 
