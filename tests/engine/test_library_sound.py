@@ -11,12 +11,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from sashimono.engine.audio import library_sound
 from sashimono.engine.audio.library_sound import (
     PreviewPlayer,
     measure_library_file,
     sound_peaks,
     still_of,
 )
+from sashimono.engine.decode.probe import ProbeError
 from tests.check_media import tone, write_tone, write_video
 from tests.waiting import wait_until
 
@@ -242,3 +244,30 @@ class TestPreviewPlayer:
         player.play()
         wait_until(lambda: len(sinks) == 2 and sinks[1].closed.is_set(), "鳴らし切り")
         assert sinks[1].drained is True
+
+    def test_a_broken_picture_does_not_silence_the_sound(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、音の出口を開く間に絵の読み込みが失敗すると、鳴らせたはずの音まで鳴らない
+        path = write_video(tmp_path / "動画.mp4", 2.0, tone_db=-20.0)
+        opened = threading.Event()
+        sinks: list[_Sink] = []
+
+        def slow(_rate: int, _channels: int) -> _Sink:
+            opened.wait()
+            sinks.append(_Sink())
+            return sinks[-1]
+
+        player = PreviewPlayer(sink=slow, clock=_Clock())
+        assert player.open(path) is not None
+
+        def broken(*_args: object, **_kwargs: object) -> object:
+            raise ProbeError("絵が壊れている")
+
+        monkeypatch.setattr(library_sound, "VideoDecoder", broken)
+        player.play()
+        wait_until(lambda: player.error is not None, "絵の失敗")
+        opened.set()
+        wait_until(lambda: bool(sinks) and sinks[0].samples > 0, "音")
+        assert "絵を読めません" in (player.error or "")
+        player.close()

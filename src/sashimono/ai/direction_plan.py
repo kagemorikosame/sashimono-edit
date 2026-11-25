@@ -119,6 +119,9 @@ class ApplyResult:
 
     applied: tuple[int, ...]
     skipped: tuple[tuple[int, str], ...] = ()
+    #: 付けた効果音の項目が実際に使った素材（項目の番号, 素材） 計画の後で同じファイルを取り込んで
+    #: いたときは、計画の素材でなくその素材を使うので、計画の返事にはこちらを出す
+    media: tuple[tuple[int, MediaId], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +419,7 @@ def apply_items(
     """
     applied: list[int] = []
     skipped: list[tuple[int, str]] = []
+    used: list[tuple[int, MediaId]] = []
     if not items:
         return ApplyResult((), ())
     with document.checkpoint(APPLY_LABEL, by=Author.AI):
@@ -452,7 +456,13 @@ def apply_items(
             for command in commands:
                 document.execute(command)
             applied.append(item.number)
-    return ApplyResult(tuple(applied), tuple(skipped))
+            if item.action == ACTION_SOUND:
+                used.extend(
+                    (item.number, command.clip.media_id)
+                    for command in commands
+                    if isinstance(command, AddClip) and command.clip.media_id is not None
+                )
+    return ApplyResult(tuple(applied), tuple(skipped), tuple(used))
 
 
 def _held(project: Project, sound: MediaItem) -> MediaItem | None:

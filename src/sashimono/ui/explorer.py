@@ -97,6 +97,7 @@ from sashimono.core.material_library import (
     KIND_VIDEO,
     LibraryFile,
     LibraryFolder,
+    MaterialLibrary,
     Measure,
     MeasureBook,
     add_folder,
@@ -772,9 +773,9 @@ class _PreviewPane(QWidget):
         frame = player.frame()
         # 止まっている間にシークした先の絵をまだ読んでいれば、届くまで描き直しを続ける
         # （前の絵を出し終えたからといって止めると、後で届いた絵を出さない）
-        waiting = player.still_pending or (
-            (info.has_video or info.is_still) and (frame is None or frame[0] != self._shown_frame)
-        )
+        # 読んでいる途中か、届いたのにまだ出していない絵があるときだけ待つ 絵が読めなかった
+        # （届かない）ときまで待つと、別の素材を選ぶまで 30 回/秒起き続ける
+        waiting = player.still_pending or (frame is not None and frame[0] != self._shown_frame)
         if not waiting:
             # 止まっていて絵も出し終えた（音だけの素材は絵を待たない） 何もしないのに
             # 30 回/秒起きないよう、描き直しを止める
@@ -870,6 +871,13 @@ class ExplorerPanel(QWidget):
         self._tree_lister = _Worker(self, workers=1)
         self._tree_lister.finished.connect(self._on_tree_listed)
         self._tree_number = 0
+        #: 登録とお気に入りを確かめた結果 そろえた場所 → "file"・"dir"・"missing"
+        self._kinds: dict[str, str] = {}
+        #: 確かめている途中の木の番号
+        self._checking: int | None = None
+        #: 前回の場所を確かめている途中の（番号, フォルダ, ファイル）
+        self._restore_number = 0
+        self._restoring: tuple[int, str, str] | None = None
         self._listing_number = 0
         self._listed_number = 0
         #: 前回の場所から開いたときに、読み終えたら選ぶファイル
@@ -1109,23 +1117,47 @@ class ExplorerPanel(QWidget):
     def is_favorite(self, path: Path | str) -> bool:
         return any(same_place(entry, path) for entry in self._favorites)
 
-    def restore_location(self, folder: str, file: str) -> bool:
+    def restore_location(self, folder: str, file: str) -> None:
         """前回の場所から開く そのフォルダが消えていれば何もしない（先頭から開く）
 
-        選んでいたファイルは中身を読み終えてから選ぶ（中身は裏で読む）
+        あるかを確かめるのは裏（応答しない登録先で起動を止めない） 確かめ終えてから開き、
+        選んでいたファイルは中身を読み終えてから選ぶ
         """
-        if not folder or not reachable_dir(Path(folder))[0]:
-            return False
+        if not folder:
+            return
+        self._restore_number += 1
+        self._restoring = (self._restore_number, folder, file)
+        self._tree_lister.submit(
+            f"restore:{self._restore_number}", partial(_reachable, Path(folder))
+        )
+
+    def _on_restore_checked(self, number: int, result: object) -> None:
+        restoring = self._restoring
+        if restoring is None or restoring[0] != number:
+            return
+        self._restoring = None
+        _number, folder, file = restoring
+        if result is not True:
+            return
         wanted = [Path(file)] if file else []
         self._pending_select = wanted
         if not self.open_folder(folder):
             self._pending_select = []
-            return False
+            return
         if not self.listing and self._pending_select:
             # もう開いていた場所（木の選びが変わらず、読み直しが起きない） その場で選ぶ
             self._pending_select = []
             self.select_files(wanted)
-        return True
+
+    @property
+    def busy(self) -> bool:
+        """裏で何かを読んでいる途中か（中身・下見の調べ・登録の確かめ・前回の場所）"""
+        return (
+            self.listing
+            or self._preview.opening
+            or self._restoring is not None
+            or self._checking is not None
+        )
 
     def set_preview_volume(self, percent: int) -> None:
         self._preview.set_volume(percent)
@@ -1293,8 +1325,13 @@ class ExplorerPanel(QWidget):
         self._fill_tree()
         self.folders_changed.emit(self._folders)
 
-    def _fill_tree(self) -> None:
-        """木を作り直す 選んでいた所は場所で選び直す"""
+    def _fill_tree(self, *, check: bool = True) -> None:
+        """木を作り直す 選んでいた所は場所（分類の根は分類）で選び直す
+
+        登録したフォルダとお気に入りがあるか・ファイルかフォルダかは裏で確かめる（``check``）
+        画面のスレッドで確かめると、応答しないネットワークの登録先が残っているだけで、起動するたびに
+        木が出るまで止まる 確かめる前は前に確かめた結果で出し、確かめ終えたら作り直す
+        """
         current = self._node()
         # 作り直す前に頼んだ下のフォルダの結果は使わない（項目がもう無い）
         self._tree_number += 1
@@ -1306,20 +1343,12 @@ class ExplorerPanel(QWidget):
             root.setData(0, _NODE, (_FAVORITE_NODE, ""))
             self._tree.addTopLevelItem(root)
             for entry in self._favorites:
-                place = Path(entry)
-                if _is_file(place):
+                kind = self._kinds.get(os.path.normcase(entry))
+                if kind in (None, "file"):
                     # ファイルは根を選んだときの中身に出す 木にはフォルダだけを並べる
+                    # まだ確かめていない物は、確かめ終えてから出す
                     continue
-                missing = not reachable_dir(place)[0]
-                label = place.name or entry
-                item = QTreeWidgetItem([f"{label}（見つかりません）" if missing else label])
-                item.setToolTip(0, entry)
-                item.setData(0, _NODE, (_FAVORITE_NODE, entry))
-                if missing:
-                    item.setForeground(0, Colors.TEXT_MUTED)
-                else:
-                    item.addChild(QTreeWidgetItem([_PLACEHOLDER]))
-                root.addChild(item)
+                root.addChild(self._top_item(_FAVORITE_NODE, entry, missing=kind == "missing"))
             root.setExpanded(True)
         for key, name in CATEGORIES.items():
             members = [folder for folder in self._folders if folder.category == key]
@@ -1329,17 +1358,8 @@ class ExplorerPanel(QWidget):
             root.setData(0, _NODE, ("", key))
             self._tree.addTopLevelItem(root)
             for folder in members:
-                directory = Path(folder.path)
-                missing = not reachable_dir(directory)[0]
-                label = directory.name or folder.path
-                item = QTreeWidgetItem([f"{label}（見つかりません）" if missing else label])
-                item.setToolTip(0, folder.path)
-                item.setData(0, _NODE, (folder.path, folder.path))
-                if missing:
-                    item.setForeground(0, Colors.TEXT_MUTED)
-                else:
-                    item.addChild(QTreeWidgetItem([_PLACEHOLDER]))
-                root.addChild(item)
+                missing = self._kinds.get(os.path.normcase(folder.path)) == "missing"
+                root.addChild(self._top_item(folder.path, folder.path, missing=missing))
             root.setExpanded(True)
         self._tree.blockSignals(False)
         if current == (_FAVORITE_NODE, ""):
@@ -1347,11 +1367,46 @@ class ExplorerPanel(QWidget):
             favorites_root = self._favorite_root()
             if favorites_root is not None:
                 self._tree.setCurrentItem(favorites_root)
+        elif current is not None and not current[0]:
+            # 分類の根は分類で選び直す（場所ではない）
+            category_root = self._category_root(current[1])
+            if category_root is not None:
+                self._tree.setCurrentItem(category_root)
         elif current is not None and current[1]:
             found = self._find_node(os.path.normcase(os.path.normpath(current[1])))
             if found is not None:
                 self._tree.setCurrentItem(found)
         self._show_files()
+        if check:
+            places = [folder.path for folder in self._folders] + list(self._favorites)
+            self._checking = self._tree_number
+            self._tree_lister.submit(f"check:{self._tree_number}", partial(_kinds_of, places))
+
+    def _top_item(self, owner: str, place: str, *, missing: bool) -> QTreeWidgetItem:
+        label = Path(place).name or place
+        item = QTreeWidgetItem([f"{label}（見つかりません）" if missing else label])
+        item.setToolTip(0, place)
+        item.setData(0, _NODE, (owner, place))
+        if missing:
+            item.setForeground(0, Colors.TEXT_MUTED)
+        else:
+            item.addChild(QTreeWidgetItem([_PLACEHOLDER]))
+        return item
+
+    def _category_root(self, key: str) -> QTreeWidgetItem | None:
+        for top in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(top)
+            if item is not None and item.data(0, _NODE) == ("", key):
+                return item
+        return None
+
+    def _on_checked(self, result: object) -> None:
+        """登録とお気に入りを確かめ終えた 結果が前と違えば木を作り直す（確かめ直しはしない）"""
+        self._checking = None
+        if not isinstance(result, dict) or result == self._kinds:
+            return
+        self._kinds = result
+        self._fill_tree(check=False)
 
     def _favorite_root(self) -> QTreeWidgetItem | None:
         for top in range(self._tree.topLevelItemCount()):
@@ -1433,9 +1488,19 @@ class ExplorerPanel(QWidget):
         )
 
     def _on_tree_listed(self, key: str, result: object) -> None:
-        """下のフォルダを読み終えた 木を作り直した後に届いた古い結果は使わない"""
-        _kind, number, place = key.split(":", 2)
-        if int(number) != self._tree_number or not isinstance(result, list):
+        """下のフォルダを読み終えた・登録を確かめ終えた・前回の場所を確かめ終えた
+        木を作り直した後に届いた古い結果は使わない
+        """
+        kind, number, place = [*key.split(":", 2), ""][:3]
+        if kind == "restore":
+            self._on_restore_checked(int(number), result)
+            return
+        if int(number) != self._tree_number:
+            return
+        if kind == "check":
+            self._on_checked(result)
+            return
+        if not isinstance(result, list):
             return
         owner, _, where = place.partition("|")
         item = self._item_at(owner, where)
@@ -1479,14 +1544,15 @@ class ExplorerPanel(QWidget):
     def _registered(self, path: str) -> LibraryFolder | None:
         return next((folder for folder in self._folders if folder.path == path), None)
 
-    def _owner(self, path: Path) -> LibraryFolder:
-        """お気に入りの物が入っている登録したフォルダ 登録の外（登録を外した後など）なら、
-        その場所を「その他」として扱う（お気に入りは登録と別に覚えるので、外しても残る）
+    def _owner(self, directory: Path) -> LibraryFolder:
+        """フォルダ ``directory`` を含む登録のうち一番深い物 登録の外（登録を外した後の
+        お気に入りなど）なら、その場所を「その他」として扱う
+
+        ファイルやフォルダを開かない（画面のスレッドから呼ぶ） 一番深い登録で決めるのは、
+        親と子を別の分類で登録したときに子の中を親の分類で見ないため
         """
-        for folder in self._folders:
-            if is_favorite([folder.path], path):
-                return folder
-        return LibraryFolder(str(path if reachable_dir(path)[0] else path.parent), CATEGORY_OTHER)
+        owner = MaterialLibrary(folders=self._folders).owner_of(directory)
+        return owner if owner is not None else LibraryFolder(str(directory), CATEGORY_OTHER)
 
     def _show_tree_menu(self, position: QPoint) -> None:
         item = self._tree.itemAt(position)
@@ -1518,10 +1584,11 @@ class ExplorerPanel(QWidget):
         if not registered:
             members = [folder for folder in self._folders if folder.category == where]
             return [(folder, Path(folder.path)) for folder in members], [CATEGORIES[where]]
-        folder = self._registered(registered)
-        if folder is None:
+        if self._registered(registered) is None:
             return [], []
         directory = Path(where)
+        # 開いた場所を含む一番深い登録で見る（登録の下に別の分類で登録した子があれば子の分類）
+        folder = self._owner(directory)
         crumbs = [folder.category_name, Path(folder.path).name or folder.path]
         with contextlib.suppress(ValueError):
             crumbs.extend(directory.relative_to(folder.path).parts)
@@ -1561,7 +1628,9 @@ class ExplorerPanel(QWidget):
             )
         else:
             deep = bool(query) if favorite_place else (bool(query) or node is None or not node[0])
-            job = partial(_listing, pairs, deep, query, kind)
+            # 登録したフォルダを開いて下まで探すときは、中の別の登録もその登録の分類で見る
+            nested = node is not None and bool(node[0]) and not favorite_place
+            job = partial(_listing, pairs, deep, query, kind, self._folders, nested)
         self._lister.forget()
         # 読み終えるまで前の一覧を触れなくする 場所の表示はもう新しい場所なので、残った前の
         # 一覧の物を置くと、見ている場所と違う素材が置かれる 選びは残し、読み終えたら戻す
@@ -1598,6 +1667,11 @@ class ExplorerPanel(QWidget):
         self._model.removeRows(0, self._model.rowCount())
         self._files = {}
         self._name_items = {}
+        # 見本の絵と波形は今の一覧の分だけ持つ 開いた場所の累計を持つと、窓を閉じるまで増え続ける
+        # （また開いたら控えのファイルから裏で読み直す）
+        keep = {_stamp(file) for file in files}
+        self._icons = {key: icon for key, icon in self._icons.items() if key in keep}
+        self._peaks = {key: peaks for key, peaks in self._peaks.items() if key in keep}
         unmeasured: list[LibraryFile] = []
         for file in files:
             self._files[file.id] = file
@@ -1613,6 +1687,9 @@ class ExplorerPanel(QWidget):
         self.select_files(selected)
         measurer = self._measure
         if measurer is not None:
+            # 前に測れなかった物は飛ばす（変わるか時間が経てば測り直す） 飛ばさないと、読めない
+            # 物が頭に並んだ一覧で〔読み直す〕を押しても、後ろの読める物がいつまでも測られない
+            unmeasured = [file for file in unmeasured if not self._book.failed(file)]
             for file in unmeasured[:_MEASURE_LIMIT]:
                 self._worker.submit(f"measure:{file.id}", _measured(measurer, file))
         if self._view_mode == VIEW_ICONS:
@@ -1689,7 +1766,10 @@ class ExplorerPanel(QWidget):
             asked, measure = result
             # 頼んだときのファイルと今の行のファイルが同じ（大きさと更新時刻まで）ときだけ使う
             # 差し替わった後の行に前のファイルの長さを出さない
-            if asked != file or not isinstance(measure, Measure):
+            if asked != file:
+                return
+            if not isinstance(measure, Measure):
+                self._book.put_failure(asked)
                 return
             self._book.put(asked, measure)
             cells = self._row_of(file_key)
@@ -1798,8 +1878,8 @@ class ExplorerPanel(QWidget):
         files = self.selected_files()
         self._place_button.setEnabled(bool(files) and not self.listing)
         if len(files) != 1:
-            if not files:
-                self._preview.show_file(None)
+            # 選んでいない物を下見に残さない 残すと Space で選んでいない音が鳴る
+            self._preview.show_file(None)
             return
         path = files[0]
         file = next((f for f in self._files.values() if f.path == path), None)
@@ -1895,7 +1975,12 @@ def _measured(job: Callable[[Path], Measure | None], file: LibraryFile) -> Calla
 
 
 def _listing(
-    pairs: Sequence[tuple[LibraryFolder, Path]], deep: bool, query: str, kind: str
+    pairs: Sequence[tuple[LibraryFolder, Path]],
+    deep: bool,
+    query: str,
+    kind: str,
+    registered: Sequence[LibraryFolder] = (),
+    nested: bool = False,
 ) -> tuple[list[LibraryFile], str]:
     """場所の中身と状態の文（裏のスレッドで呼ぶ）
 
@@ -1911,6 +1996,15 @@ def _listing(
 
     notes: list[str] = []
     files: dict[str, LibraryFile] = {}
+    pairs = list(pairs)
+    if deep and nested:
+        # 開いたフォルダの中に別に登録したフォルダがあれば、その登録自身の分類で見て回る
+        for inner in registered:
+            if any(
+                is_favorite([str(directory)], inner.path) and not same_place(directory, inner.path)
+                for _folder, directory in pairs
+            ) and not any(same_place(folder.path, inner.path) for folder, _ in pairs):
+                pairs.append((inner, Path(inner.path)))
     ordered = sorted(pairs, key=lambda pair: len(Path(pair[1]).parts), reverse=True)
     for folder, directory in ordered:
         present, problem = reachable_dir(Path(folder.path))
@@ -1923,7 +2017,18 @@ def _listing(
             continue
         if deep:
             # 名前で絞るときと分類の根では下まで探す 場所は登録したフォルダのまま数える
-            scan = scan_folder(LibraryFolder(str(directory), folder.category), accept=accept)
+            # 中の別の登録には入らない（その登録の物は、その登録の分類で別に見る） 入ると、親の
+            # 分類では拾うが子の分類では拾わない物（子を画像で登録した中の音など）が出る
+            inside = [
+                other.path
+                for other in registered
+                if is_favorite([str(directory)], other.path)
+                and not same_place(other.path, directory)
+                and not same_place(other.path, folder.path)
+            ]
+            scan = scan_folder(
+                LibraryFolder(str(directory), folder.category), accept=accept, skip=inside
+            )
             if scan.missing:
                 notes.append(f"{directory.name} が見つかりません（消えたか移った）")
             if scan.truncated:
@@ -1972,7 +2077,7 @@ def _favorite_listing(
             # 消えた・移った物も外さずに残す 数だけ知らせる
             missing += 1
             continue
-        files.append(LibraryFile(place, owner(place), stat.st_size, stat.st_mtime_ns))
+        files.append(LibraryFile(place, owner(place.parent), stat.st_size, stat.st_mtime_ns))
     matched = [file for file in match_files(files, query) if not kind or kind_of(file.path) == kind]
     if not favorites:
         return [], "お気に入りはありません"
@@ -2028,3 +2133,21 @@ def _subfolders(folder: LibraryFolder, directory: Path) -> list[Path]:
     except OSError:
         return []
     return sorted(found, key=lambda path: path.name.casefold())
+
+
+def _kinds_of(places: Sequence[str]) -> dict[str, str]:
+    """場所ごとに file・dir・missing のどれか（裏のスレッドで呼ぶ） 見られない場所は missing"""
+    kinds: dict[str, str] = {}
+    for place in places:
+        path = Path(place)
+        if _is_file(path):
+            kinds[os.path.normcase(place)] = "file"
+        elif reachable_dir(path)[0]:
+            kinds[os.path.normcase(place)] = "dir"
+        else:
+            kinds[os.path.normcase(place)] = "missing"
+    return kinds
+
+
+def _reachable(path: Path) -> bool:
+    return reachable_dir(path)[0]

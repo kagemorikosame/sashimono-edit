@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QModelIndex, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 
@@ -71,7 +71,9 @@ def _touch(path: Path) -> Path:
 
 
 def _lengths(path: Path) -> Measure:
-    seconds = {"ドン.wav": 0.8, "ドカン.mp3": 3.0, "長い.wav": 95.0}.get(path.name, 1.0)
+    seconds = {"ドン.wav": 0.8, "ドカン.mp3": 3.0, "長い.wav": 95.0, "中.wav": 3.0}.get(
+        path.name, 1.0
+    )
     return Measure(seconds=seconds, has_audio=True, has_video=False, loudness=-20.0 + seconds)
 
 
@@ -80,6 +82,7 @@ def sounds(tmp_path: Path) -> Path:
     root = tmp_path / "効果音"
     _touch(root / "ドン.wav")
     _touch(root / "長い.wav")
+    _touch(root / "中.wav")
     _touch(root / "爆発" / "ドカン.mp3")
     _touch(root / "説明.txt")
     return root
@@ -91,7 +94,7 @@ def _process() -> None:
 
 def _settle(panel: ExplorerPanel) -> None:
     """裏で読む中身と下見の調べが終わるまで待つ（どちらも画面のスレッドを止めずに裏で行う）"""
-    wait_until(lambda: not panel.listing and not panel.preview.opening, "中身と下見", step=_process)
+    wait_until(lambda: not panel.busy, "中身と下見", step=_process)
 
 
 @pytest.fixture
@@ -116,7 +119,7 @@ class TestTheTreeAndTheContents:
         panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
         _settle(panel)
         assert told == [(LibraryFolder(str(sounds), CATEGORY_SOUND_EFFECT),)]
-        assert sorted(p.name for p in panel.visible_files()) == ["ドン.wav", "長い.wav"]
+        assert sorted(p.name for p in panel.visible_files()) == ["ドン.wav", "中.wav", "長い.wav"]
         assert panel.location_text() == "効果音 › 効果音"
         assert panel.open_folder(str(sounds / "爆発"))
         _settle(panel)
@@ -166,7 +169,9 @@ class TestTheTreeAndTheContents:
         _settle(panel)
         # 測る仕事は 2 本で並ぶので、どちらが先に届くかは決まらない 両方を待つ
         wait_until(
-            lambda: all(panel.cell(sounds / name, _LENGTH) for name in ("長い.wav", "ドン.wav")),
+            lambda: all(
+                panel.cell(sounds / name, _LENGTH) for name in ("長い.wav", "中.wav", "ドン.wav")
+            ),
             "長さの列",
             step=_process,
         )
@@ -174,7 +179,8 @@ class TestTheTreeAndTheContents:
         assert panel.cell(sounds / "長い.wav", _LENGTH) == "1:35"
         assert panel.cell(sounds / "長い.wav", _LOUDNESS) == "75.0 LUFS"
         panel._table.sortByColumn(_LENGTH, Qt.SortOrder.DescendingOrder)
-        assert [p.name for p in panel.visible_files()] == ["長い.wav", "ドン.wav"]
+        # 95 秒・3 秒・0.8 秒 文字の順（「1:35」「3.0 秒」「0.8 秒」）とは違う並びになる
+        assert [p.name for p in panel.visible_files()] == ["長い.wav", "中.wav", "ドン.wav"]
 
     def test_icons_get_waveforms_made_in_the_background(
         self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -580,8 +586,13 @@ class TestLastPlace:
         # 壊れると、前回のフォルダが消えていたときに空の場所が開くか落ちる
         panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
         _settle(panel)
-        assert not panel.restore_location(str(tmp_path / "無い"), "")
-        assert panel.restore_location(str(sounds / "爆発"), "")
+        before = panel.location_text()
+        panel.restore_location(str(tmp_path / "無い"), "")
+        _settle(panel)
+        assert panel.location_text() == before
+        panel.restore_location(str(sounds / "爆発"), "")
+        _settle(panel)
+        assert panel.location_text().endswith("› 爆発")
 
 
 class TestWhileReading:
@@ -611,7 +622,7 @@ class TestWhileReading:
         # 壊れると、もう開いていた場所の前回のファイルが選ばれず、次の読み直しまで残る
         panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
         _settle(panel)
-        assert panel.restore_location(str(sounds), str(sounds / "長い.wav"))
+        panel.restore_location(str(sounds), str(sounds / "長い.wav"))
         _settle(panel)
         assert panel.selected_files() == [sounds / "長い.wav"]
 
@@ -691,6 +702,115 @@ class TestThirdReview:
             assert copied["explorer_favorite_paths"] == [sound]
             assert copied["explorer_last_folder"] == ""
             assert copied["explorer_last_file"] == ""
+        finally:
+            window.close()
+            window.deleteLater()
+
+
+class TestFourthReview:
+    def test_a_category_root_stays_chosen_after_marking(
+        self, panel: ExplorerPanel, sounds: Path, tmp_path: Path
+    ) -> None:
+        # 壊れると、分類の根で印を付けるたびに選びが外れ、すべてのフォルダの一覧に戻る
+        music = tmp_path / "曲"
+        _touch(music / "のんびり.wav")
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        panel.register(str(music), CATEGORY_MUSIC)
+        _settle(panel)
+        root = panel._category_root(CATEGORY_SOUND_EFFECT)
+        assert root is not None
+        panel._tree.setCurrentItem(root)
+        _settle(panel)
+        panel.set_favorite([sounds / "ドン.wav"], True)
+        _settle(panel)
+        assert panel.location_text() == "効果音"
+        assert all(p.parent != music for p in panel.visible_files())
+
+    def test_several_chosen_files_clear_the_preview(
+        self, panel: ExplorerPanel, tmp_path: Path
+    ) -> None:
+        # 壊れると、1 つを下見した後に別の 2 つを選んで Space を押すと、選んでいない音が鳴る
+        root = tmp_path / "音"
+        a = write_tone(_touch(root / "a.wav"), tone(1.0, -12.0))
+        b = write_tone(_touch(root / "b.wav"), tone(1.0, -12.0))
+        c = write_tone(_touch(root / "c.wav"), tone(1.0, -12.0))
+        panel.register(str(root), CATEGORY_MUSIC)
+        _settle(panel)
+        panel.select_file(a)
+        _settle(panel)
+        assert panel.preview.player.path == a
+        panel.select_files([b, c])
+        _settle(panel)
+        assert panel.preview.player.path is None
+
+    def test_a_nested_registration_lists_with_its_own_category(
+        self, panel: ExplorerPanel, sounds: Path
+    ) -> None:
+        # 壊れると、親を効果音・子を画像で登録したとき、子の中の音が親の効果音として出る
+        _touch(sounds / "絵" / "隠れた音.wav")
+        _touch(sounds / "絵" / "青.png")
+        panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+        _settle(panel)
+        panel.register(str(sounds / "絵"), "image")
+        _settle(panel)
+        # すべてのフォルダ（木で何も選ばない）
+        panel._tree.setCurrentIndex(QModelIndex())
+        _settle(panel)
+        names = [p.name for p in panel.visible_files()]
+        assert "隠れた音.wav" not in names
+        assert "青.png" in names
+
+    def test_files_that_cannot_be_measured_are_skipped_next_time(
+        self, qt_application: QApplication, sounds: Path
+    ) -> None:
+        # 壊れると、測れない物が頭に並ぶ一覧で〔読み直す〕を押しても、同じ物をまた測りに行く
+        del qt_application
+        asked: list[Path] = []
+
+        def broken(path: Path) -> Measure | None:
+            asked.append(path)
+            return None
+
+        panel = ExplorerPanel(player=_quiet_player(), measure=broken)
+        try:
+            panel.register(str(sounds), CATEGORY_SOUND_EFFECT)
+            _settle(panel)
+            wait_until(lambda: len(asked) >= 3, "測る仕事", step=_process)
+            wait_until(lambda: not panel._worker.busy, "測り終わり", step=_process)
+            _process()
+            count = len(asked)
+            panel.rescan()
+            _settle(panel)
+            _process()
+            assert len(asked) == count
+        finally:
+            panel.shutdown()
+            panel.deleteLater()
+
+    def test_a_dotted_registration_is_judged_by_its_real_depth(
+        self, qt_application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、`..` を含む書き方の親が子より深いと数えられ、使わせない子の中の場所が外へ出る
+        del qt_application
+        monkeypatch.setattr(PreferenceStore, "save", lambda _self, _prefs: None)
+        window = MainWindow(Project.create(), confirm_unsaved=False)
+        try:
+            parent = tmp_path / "親"
+            dotted = str(parent / "a" / "b" / ".." / "..")
+            movie = str(parent / "動画" / "空.mp4")
+            window._apply_preferences(
+                Preferences(
+                    explorer_folders=(
+                        LibraryFolder(dotted, CATEGORY_SOUND_EFFECT),
+                        LibraryFolder(str(parent / "動画"), "video"),
+                    ),
+                    explorer_favorite_paths=(movie,),
+                )
+            )
+            copied = window.app_settings()["preferences"]
+            assert isinstance(copied, dict)
+            assert copied["explorer_favorite_paths"] == []
         finally:
             window.close()
             window.deleteLater()

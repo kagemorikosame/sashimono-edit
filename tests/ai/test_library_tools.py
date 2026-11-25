@@ -397,8 +397,10 @@ class TestMeasuringInTheBackground:
         assert isinstance(result, Pending)
         done = settle(result)
         assert {row["name"] for row in done["files"]} >= {"ドン.wav"}
-        # 測り終えた後は待たずに答える
-        assert not isinstance(run(work, "search_library"), Pending)
+        # 見て回るのも裏で行うので、いつも待つ形で返る 測り終えた物は測り直さない
+        count = len(work.measured_calls)
+        settle(run(work, "search_library"))
+        assert len(work.measured_calls) == count
 
     def test_no_next_page_while_some_are_unmeasured(
         self, work: _LibraryHost, folders: dict[str, Path], lengths: dict[str, float]
@@ -413,3 +415,45 @@ class TestMeasuringInTheBackground:
         assert page["not_measured"] > 0
         assert "next_offset" not in page
         assert "頭から呼び直して" in page["note"]
+
+
+class TestFourthReview:
+    def test_settings_changed_while_measuring_are_followed(self, work: _LibraryHost) -> None:
+        # 壊れると、測るのを待つ間に本人が BGM を使わせない設定にしても、その名前を返す
+        pending = run(work, "search_library")
+        assert isinstance(pending, Pending)
+        work.material = replace(work.material, ai_categories=(CATEGORY_SOUND_EFFECT,))
+        done = settle(pending)
+        assert {row["category"] for row in done["files"]} == {CATEGORY_SOUND_EFFECT}
+
+    def test_the_same_path_read_twice_is_one_media(
+        self, work: _LibraryHost, folders: dict[str, Path]
+    ) -> None:
+        # 壊れると、同じ場所を別の呼び出しで 2 度読み込むと、同じ音が素材一覧に 2 つ並ぶ
+        path = str(folders[CATEGORY_SOUND_EFFECT] / "ドン.wav")
+        run(work, "import_media", paths=[path], pool_only=True)
+        run(work, "import_media", paths=[path], pool_only=True)
+        assert sum(m.path.name == "ドン.wav" for m in work.document.project.media) == 1
+
+    def test_the_plan_reports_the_media_it_used(self, work: _LibraryHost) -> None:
+        # 壊れると、計画の後で取り込んだ素材を使ったのに、計画の返事は作品に無い素材の ID を出す
+        row = _file(work, "ドン.wav")
+        planned = run(work, "propose_direction", cues=_cues(), sound_file_id=row["file_id"])
+        first = next(item for item in planned["items"] if item["kind"] == SOUND)
+        run(work, "import_media", library_file_ids=[row["file_id"]], pool_only=True)
+        proposal_for(work.document).apply(work.document)
+        state = run(work, "get_direction_plan")
+        used = next(item for item in state["items"] if item["number"] == first["number"])
+        media = {str(m.id) for m in work.document.project.media}
+        assert used["media_id"] in media
+        assert used["media_id"] != first["media_id"]
+
+    def test_without_reuse_the_plan_keeps_its_media(self, work: _LibraryHost) -> None:
+        # 壊れると、ふつうに取り込んだときまで計画の素材の ID が変わり、AI が計画と作品を照らせない
+        row = _file(work, "ドン.wav")
+        planned = run(work, "propose_direction", cues=_cues(), sound_file_id=row["file_id"])
+        first = next(item for item in planned["items"] if item["kind"] == SOUND)
+        proposal_for(work.document).apply(work.document)
+        state = run(work, "get_direction_plan")
+        used = next(item for item in state["items"] if item["number"] == first["number"])
+        assert used["media_id"] == first["media_id"]

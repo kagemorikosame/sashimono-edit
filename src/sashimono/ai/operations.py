@@ -2906,6 +2906,9 @@ def _proposal_result(view: ProposalView, arguments: dict[str, Any], note: str) -
         head["skipped"] = [
             {"number": number, "reason": reason} for number, reason in view.result.skipped
         ]
+    # 付けた後は実際に使った素材を出す 計画の後で同じファイルを取り込んでいれば計画の素材は
+    # 作品に無く、そのまま返すと作品に無い素材の ID を AI が使いに行く
+    used = dict(view.result.media) if view.result is not None else {}
     rows = [
         {
             "number": item.number,
@@ -2916,7 +2919,9 @@ def _proposal_result(view: ProposalView, arguments: dict[str, Any], note: str) -
             "end_frame": item.end_frame,
             "amount": item.amount,
             "clip_id": str(item.clip_id) if item.clip_id is not None else None,
-            "media_id": str(item.media_id) if item.media_id is not None else None,
+            "media_id": str(used.get(item.number, item.media_id))
+            if item.media_id is not None
+            else None,
             "excluded": item.number in view.excluded,
         }
         for item in view.items
@@ -3558,36 +3563,48 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
     ]
     if not folders:
         return head | {"files_total": 0, "files": [], "note": _NO_LIBRARY}
-    scans = [scan for scan in library.scan_for_ai() if scan.folder in folders]
-    head["folders_missing"] = sum(1 for scan in scans if scan.missing)
-    matched = [
-        file
-        for file in match_files((file for scan in scans for file in scan.files), query)
-        if not favorites_only or library.is_favorite(file)
-    ]
-    # 前に測れなかったファイルは、変わるまで測る数を使わずに飛ばす 飛ばさないと、読めない
-    # ファイルが頭に並んだときに、呼び直すたびに同じ物で数を使い切り、後ろが測られない
-    wanted = [
-        file
-        for file in matched
-        if library.measured(file, allow_measure=False) is None and not library.tried(file)
-    ][:LIBRARY_MEASURE_PER_CALL]
-
-    def finish() -> object:
-        return _library_rows(host, library, head, matched, shortest, longest, arguments)
-
-    if not wanted or library.measure is None:
-        return finish()
+    found: list[LibraryFile] = []
+    missing: list[int] = []
     done = threading.Event()
 
-    def measure_all() -> None:
+    def look_and_measure() -> None:
+        """見て回るのも測るのも裏（大きな登録先で画面のスレッドを止めない）"""
         try:
+            scans = [scan for scan in library.scan_for_ai() if scan.folder in folders]
+            missing.append(sum(1 for scan in scans if scan.missing))
+            found.extend(
+                file
+                for file in match_files((file for scan in scans for file in scan.files), query)
+                if not favorites_only or library.is_favorite(file)
+            )
+            # 前に測れなかったファイルは、変わるまで測る数を使わずに飛ばす 飛ばさないと、読めない
+            # ファイルが頭に並んだときに、呼び直すたびに同じ物で数を使い切り、後ろが測られない
+            wanted = [
+                file
+                for file in found
+                if library.measured(file, allow_measure=False) is None and not library.tried(file)
+            ][:LIBRARY_MEASURE_PER_CALL]
             for file in wanted:
                 library.measured(file, allow_measure=True)
         finally:
             done.set()
 
-    threading.Thread(target=measure_all, name="search-library", daemon=True).start()
+    def finish() -> object:
+        # 待っている間に本人が登録や AI に使わせる分類を変えていれば、今の設定で絞り直す
+        # 待つ前の範囲のまま返すと、使わせないと決めた分類の名前とフォルダが外へ出る
+        now = host.material_library
+        allowed = [
+            file
+            for file in found
+            if (owner := now.owner_of(file.path)) is not None
+            and owner.category in now.ai_categories
+            and (category is None or owner.category == category)
+            and (not favorites_only or now.is_favorite(file))
+        ]
+        summary = head | {"folders_missing": missing[0] if missing else 0}
+        return _library_rows(host, now, summary, allowed, shortest, longest, arguments)
+
+    threading.Thread(target=look_and_measure, name="search-library", daemon=True).start()
     return Pending(wait=done.wait, seconds=LIBRARY_MEASURE_WAIT, then=finish)
 
 
@@ -5479,10 +5496,13 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     pool_only = _flag_argument(arguments, "pool_only", False)
 
     sources: list[tuple[MediaItem, bool]] = []
+    held = {os.path.normcase(Path(media.path).absolute()): media for media in _project(host).media}
     for path in paths:
         if not path.exists():
             raise ToolError(f"ファイルがありません: {path}")
-        sources.append((host.probe(path), True))
+        # 前に読み込んだ同じファイルはその素材を使う 開き直すと別の ID になり、素材一覧に増える
+        existing = held.get(os.path.normcase(path.absolute()))
+        sources.append((existing, False) if existing is not None else (host.probe(path), True))
     sources.extend(_library_media(host, entry) for entry in ids)
     # 同じファイルは場所で 1 つにまとめる（同じ印の 2 度・場所と印の両方で渡した物）
     # 未取り込みのファイルを 2 度開くと、どちらも前の文書を見て「まだ無い」と決め、

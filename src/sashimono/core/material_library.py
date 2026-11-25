@@ -215,10 +215,14 @@ def _linked_inside(path: Path, root: Path, others: Sequence[Path]) -> bool:
 
 
 def _inside(path: Path, root: Path) -> bool:
-    """``path`` の実体が ``root`` の中か（リンクを解いて比べる）"""
+    """``path`` の実体が ``root`` の中か（リンクを解いて比べる）
+
+    解けないリンク（自分を指す循環のリンク）は中でないと扱う ``Path.resolve`` は循環で
+    ``RuntimeError`` を投げ、捕まえないと 1 つの登録の壊れたリンクでほかの登録まで見て回れない
+    """
     try:
         return path.resolve().is_relative_to(root.resolve())
-    except OSError:
+    except (OSError, RuntimeError):
         return False
 
 
@@ -541,22 +545,49 @@ class MeasureBook:
     #: 測れなかったファイル 印 → （大きさ, 更新時刻, 覚えた時計） 控えのファイルには書かない
     #: ドライブが一時だけ応えなかった物まで書くと、挿し直して起動し直しても測り直さない
     _failures: dict[str, tuple[int, int, float]] = field(default_factory=dict, repr=False)
+    #: 見て回って見つけたファイル 印 → 場所（:meth:`remember_found`）
+    _found: dict[str, Path] = field(default_factory=dict, repr=False)
     #: 音を読めなかった測った物（:attr:`Measure.audio_failed`） 失敗と同じく記憶の中だけに持つ
     _passing: dict[str, tuple[int, int, float, Measure]] = field(default_factory=dict, repr=False)
 
     def get(self, file: LibraryFile) -> Measure | None:
+        """覚えた物 同じファイルの完全に測れた物を、音を読めなかった一時の物より先に返す
+
+        画面と AI が同じ素材を同時に測って片方だけ音を読めなかったとき、一時の物を先に見ると
+        完全に測れた物があっても大きさの無い物を返し続ける
+        """
         with self._lock:
             passing = self._passing.get(file.id)
             row = self._load().get(file.id)
+        if (
+            row is not None
+            and row.get("size") == file.size
+            and row.get("mtime") == file.modified_ns
+        ):
+            whole = _measure_from(row)
+            if whole is not None:
+                return whole
         if passing is not None:
             size, mtime, at, measure = passing
             if (size, mtime) == (file.size, file.modified_ns) and (
                 time.monotonic() - at < FAILURE_SECONDS
             ):
                 return measure
-        if row is None or row.get("size") != file.size or row.get("mtime") != file.modified_ns:
-            return None
-        return _measure_from(row)
+        return None
+
+    def remember_found(self, files: Iterable[LibraryFile]) -> None:
+        """見て回って見つけたファイルの印と場所を覚える（記憶の中だけ）
+
+        AI が印で指したファイルを、登録したフォルダを全部見て回り直さずに引くため 置く道具は
+        画面のスレッドで動くので、見て回り直すと大きな登録先で画面が止まる
+        """
+        with self._lock:
+            for file in files:
+                self._found[file.id] = file.path
+
+    def found(self, wanted: str) -> Path | None:
+        with self._lock:
+            return self._found.get(wanted)
 
     def failed(self, file: LibraryFile) -> bool:
         """少し前に測れなかったファイルか（変わっておらず :data:`FAILURE_SECONDS` の内）"""
@@ -721,21 +752,69 @@ class MaterialLibrary:
         （その登録の分類が AI に使わせる物なら、それ自身として別に見て回る）
         """
         others = [folder.path for folder in self.folders]
-        return [
+        scans = [
             scan_folder(
                 folder,
                 skip=[path for path in others if not same_place(path, folder.path)],
             )
             for folder in self.ai_folders
         ]
+        for scan in scans:
+            self.book.remember_found(scan.files)
+        return scans
+
+    def owner_of(self, path: str | Path) -> LibraryFolder | None:
+        """``path`` を含む登録のうち一番深い物（そろえた場所の深さで比べる） 無ければ ``None``"""
+        owners = [folder for folder in self.folders if is_favorite([folder.path], path)]
+        if not owners:
+            return None
+        return max(owners, key=lambda folder: len(Path(_folder_key(folder.path)).parts))
 
     def find_for_ai(self, wanted: str) -> LibraryFile | None:
-        """AI が渡した印のファイル AI に使わせない分類のフォルダからは探さない"""
+        """AI が渡した印のファイル AI に使わせない分類のフォルダからは探さない
+
+        前に見て回って覚えた場所があれば、それが今も AI に使わせる登録の物かだけを確かめて返す
+        （見て回り直さない） 覚えていなければ見て回る
+        """
+        known = self.book.found(wanted)
+        if known is not None:
+            quick = self._check(known)
+            if quick is not None and quick.id == wanted:
+                return quick
         for scan in self.scan_for_ai():
             for file in scan.files:
                 if file.id == wanted:
                     return file
         return None
+
+    def _check(self, path: Path) -> LibraryFile | None:
+        """覚えた場所が今も AI に使わせる登録の、分類に合うファイルか（見て回るのと同じ決まり）"""
+        owner = self.owner_of(path)
+        if owner is None or owner.category not in self.ai_categories:
+            return None
+        if path.suffix.lower() not in _SUFFIXES.get(owner.category, _SUFFIXES[CATEGORY_OTHER]):
+            return None
+        root = Path(owner.path)
+        others = [
+            Path(folder.path)
+            for folder in self.folders
+            if not same_place(folder.path, owner.path) and _inside(Path(folder.path), root)
+        ]
+        try:
+            if path.is_symlink() and not _linked_inside(path, root, others):
+                return None
+            # 途中のフォルダがジャンクションやリンクなら、見て回るときは入らない
+            for parent in path.parents:
+                if same_place(parent, root):
+                    break
+                if parent.is_symlink() or getattr(parent, "is_junction", lambda: False)():
+                    return None
+            stat = path.stat()
+        except OSError:
+            return None
+        if not path.is_file():
+            return None
+        return LibraryFile(path, owner, stat.st_size, stat.st_mtime_ns)
 
     def measured(self, file: LibraryFile, *, allow_measure: bool) -> Measure | None:
         """覚えた手がかり 無ければ ``allow_measure`` のときだけ測って覚える"""

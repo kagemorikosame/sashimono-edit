@@ -402,7 +402,67 @@ class TestReviewFixes:
         partial = Measure(seconds=1.0, has_audio=True, has_video=False, audio_failed=True)
         book.put(file, partial)
         assert book.get(file) == partial
+        # 別の素材の完全な物と一緒に書いても、一時の物は書かれない（書く道を通して確かめる）
+        other = _touch(tmp_path / "SE" / "ピコン.wav")
+        whole_file = next(
+            f
+            for f in scan_folder(LibraryFolder(str(other.parent), CATEGORY_SOUND_EFFECT)).files
+            if f.path == other
+        )
+        whole = Measure(seconds=0.4, has_audio=True, has_video=False, loudness=-12.0)
+        book.put(whole_file, whole)
         book.save()
-        assert MeasureBook(tmp_path / "measures.json").get(file) is None
+        again = MeasureBook(tmp_path / "measures.json")
+        assert again.get(file) is None
+        assert again.get(whole_file) == whole
         monkeypatch.setattr(material_library, "FAILURE_SECONDS", 0)
         assert book.get(file) is None
+
+    def test_a_whole_measure_wins_over_a_partial_one(self, tmp_path: Path) -> None:
+        # 壊れると、片方だけ音を読めなかったときに、完全に測れた物があっても大きさ無しを返し続ける
+        sound = _touch(tmp_path / "SE" / "ドン.wav")
+        file = scan_folder(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT)).files[0]
+        book = MeasureBook()
+        whole = Measure(seconds=1.0, has_audio=True, has_video=False, loudness=-14.0)
+        book.put(file, whole)
+        book.put(file, Measure(seconds=1.0, has_audio=True, has_video=False, audio_failed=True))
+        assert book.get(file) == whole
+
+    def test_a_looping_link_in_another_registration_does_not_stop_the_rest(
+        self, tmp_path: Path
+    ) -> None:
+        # 壊れると、別の登録の壊れた循環リンク 1 つで、ほかの登録まで AI が見て回れない
+        _touch(tmp_path / "SE" / "ドン.wav")
+        loop = tmp_path / "SE" / "輪"
+        try:
+            loop.symlink_to(loop, target_is_directory=True)
+        except OSError:
+            pytest.skip("この機械ではリンクを作れない（Windows の開発者モードが要る）")
+        library = MaterialLibrary(
+            folders=(
+                LibraryFolder(str(tmp_path / "SE"), CATEGORY_SOUND_EFFECT),
+                LibraryFolder(str(loop), CATEGORY_VIDEO),
+            )
+        )
+        names = [file.name for scan in library.scan_for_ai() for file in scan.files]
+        assert names == ["ドン.wav"]
+
+    def test_a_remembered_file_is_found_without_scanning_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、置く道具のたびに登録したフォルダを全部見て回り直し、大きな登録先で画面が止まる
+        # 本人がその分類を使わせない設定にした後は、覚えていても返さない
+        sound = _touch(tmp_path / "SE" / "ドン.wav")
+        library = MaterialLibrary(
+            folders=(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT),)
+        )
+        library.scan_for_ai()
+
+        def no_scan(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("見て回り直した")
+
+        monkeypatch.setattr(material_library, "scan_folder", no_scan)
+        found = library.find_for_ai(file_id(sound))
+        assert found is not None and found.path == sound
+        closed = MaterialLibrary(folders=library.folders, ai_categories=(), book=library.book)
+        assert closed.find_for_ai(file_id(sound)) is None

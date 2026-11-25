@@ -480,7 +480,11 @@ class PreviewPlayer:
                     self._show(generation, tile)
                     time.sleep(_FRAME_POLL)
         except (ProbeError, OSError, ValueError) as exc:
-            self._fail(generation, f"絵を読めません: {exc}")
+            # 絵だけの失敗は訳を出すだけ 音の出口を開いている途中の段（``_starting``）を解くと、
+            # 開き終えた音の仕事が抜け、鳴らせたはずの音まで鳴らない
+            with self._lock:
+                if generation == self._generation:
+                    self._error = f"絵を読めません: {exc}"
 
     def _play_sound(self, path: Path, generation: int, start: float) -> None:
         sink: AudioSink | None = None

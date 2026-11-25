@@ -178,7 +178,6 @@ from sashimono.core.material_library import (
     LibraryFolder,
     MaterialLibrary,
     MeasureBook,
-    is_favorite,
 )
 from sashimono.core.mixing import (
     DuckShape,
@@ -5562,15 +5561,11 @@ class MainWindow(QMainWindow):
         """
         if not place:
             return False
-        owners = [
-            folder
-            for folder in self._preferences.explorer_folders
-            if is_favorite([folder.path], place)
-        ]
-        if not owners:
-            return False
-        deepest = max(owners, key=lambda folder: len(Path(folder.path).parts))
-        return deepest.category not in self._preferences.explorer_ai_categories
+        # 含むかと深さは同じそろえ方の場所で比べる（`..` を含む書き方の登録でも深さを誤らない）
+        deepest = MaterialLibrary(folders=self._preferences.explorer_folders).owner_of(place)
+        return (
+            deepest is not None and deepest.category not in self._preferences.explorer_ai_categories
+        )
 
     def view_state(self) -> ViewState:
         """人が画面で見ている表示の状態（#352 :class:`EditorHost` を参照） 読むだけ"""
