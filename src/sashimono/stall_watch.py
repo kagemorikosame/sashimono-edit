@@ -297,9 +297,11 @@ class StallWatch:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.exists() and self.path.stat().st_size > MAX_LOG_BYTES:
                 self.path.replace(self.path.with_suffix(self.path.suffix + ".1"))
-            with self.path.open("a", encoding="utf-8") as stream:
+            # 対になっていない文字（スレッドの名前など）は ``\\udcxx`` の形で書く 書けずに上がると、
+            # 見張りのスレッドごと止まり、その後の止まりを記録しない（#516 の記録の係と同じ扱い）
+            with self.path.open("a", encoding="utf-8", errors="backslashreplace") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError:
+        except (OSError, ValueError):
             # 書けない置き場（容量が尽きた・読み取り専用）でも編集は止めない 診断のために
             # 本人の作業を落とすのは本末転倒
             return

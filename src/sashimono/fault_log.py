@@ -118,6 +118,8 @@ class FaultLog:
         """記録を掛ける 置き場に書けなければ何も掛けずに偽"""
         started = datetime.now()
         mark = f"{started:%Y%m%d-%H%M%S}-{os.getpid()}"
+        path = self.sessions / f"{mark}.log"
+        stream: IO[bytes] | None = None
         try:
             self.sessions.mkdir(parents=True, exist_ok=True)
             _rotate(self.errors_path)
@@ -126,20 +128,31 @@ class FaultLog:
                 self._forget_old()
             # 持ち主がいることを錠で示す 中身（プロセス番号）では見分けない 番号は使い回される
             self._lock = try_hold(self.sessions / f"{mark}.lock")
-            path = self.sessions / f"{mark}.log"
-            stream = path.open("ab")
+            # 新しく作る（"x"） 同じ名前が先にあれば作らずに偽を返す 下の片付けで、自分が
+            # 作っていない記録を消さないため
+            stream = path.open("xb")
             stream.write(
                 f"起動 {started.isoformat(timespec='seconds')} 版 {__version__}\n".encode()
             )
             stream.flush()
         except OSError:
+            # 作りかけの記録を片付けてから錠を手放す 残すと、正しく終わったこの起動が次の診断情報で
+            # 落ちた起動に数えられる（PR #550 の指摘） 錠を先に手放すと、ほかの窓がその間に
+            # 持ち主のいない記録と見て読む
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+                with contextlib.suppress(OSError):
+                    path.unlink()
             self._release_lock()
             return False
         self._stream = stream
         self.session_path = path
         # 全部のスレッドの並びを書く 落ちたのが裏の係（先読み・書き出し）のことが多い
+        # 掛けられなくても（記録の先が使えない など）エラーの記録は掛ける
         if self._catch_faults:
-            faulthandler.enable(file=stream, all_threads=True)
+            with contextlib.suppress(OSError, RuntimeError, ValueError):
+                faulthandler.enable(file=stream, all_threads=True)
         self._previous_hook = sys.excepthook
         sys.excepthook = self._on_error
         self._previous_thread_hook = threading.excepthook
@@ -170,8 +183,11 @@ class FaultLog:
 
     def _release_lock(self) -> None:
         lock, self._lock = self._lock, None
+        # 手放せなくても上げない 終わるとき（atexit）に上げると、終わり際にエラーの並びが出る
+        # 錠はプロセスが終われば外れる
         if lock is not None:
-            lock.release()
+            with contextlib.suppress(OSError):
+                lock.release()
 
     def _forget_old(self) -> None:
         """落ちた起動の記録を、新しい :data:`KEEP_LOST` 件だけ残す"""
@@ -195,16 +211,22 @@ class FaultLog:
         error: BaseException,
         trace: TracebackType | None,
     ) -> None:
-        self.record_error(kind, error, trace)
-        if self._previous_hook is not None:
-            self._previous_hook(kind, error, trace)
+        # 書くことに何があっても、前の受け手へは必ず渡す（PR #550 の指摘） 渡さないと、
+        # 開発の環境でコマンドから起こした人にエラーが見えなくなる
+        try:
+            self.record_error(kind, error, trace)
+        finally:
+            if self._previous_hook is not None:
+                self._previous_hook(kind, error, trace)
 
     def _on_thread_error(self, args: threading.ExceptHookArgs) -> None:
-        if args.exc_value is not None:
-            name = args.thread.name if args.thread is not None else "?"
-            self.record_error(args.exc_type, args.exc_value, args.exc_traceback, thread=name)
-        if self._previous_thread_hook is not None:
-            self._previous_thread_hook(args)
+        try:
+            if args.exc_value is not None:
+                name = args.thread.name if args.thread is not None else "?"
+                self.record_error(args.exc_type, args.exc_value, args.exc_traceback, thread=name)
+        finally:
+            if self._previous_thread_hook is not None:
+                self._previous_thread_hook(args)
 
     def record_error(
         self,
@@ -216,19 +238,23 @@ class FaultLog:
     ) -> None:
         """エラーを 1 件足す
 
-        ここで上がったエラーは握る エラーを書く所で落ちると元のエラーが消える
+        ここで上がったエラーは握る（置き場に書けない・文字にできない・例外の文を作れない など）
+        エラーを書く所で落ちると元のエラーが消える 対になっていない文字（サロゲート）は
+        ``\\udcxx`` の形で書く UTF-8 にできずに書くこと自体が落ちる（PR #550 の指摘）
         """
-        head = f"=== {datetime.now().isoformat(timespec='seconds')} 版 {__version__}"
-        if thread:
-            head += f" スレッド {thread}"
-        body = "".join(traceback.format_exception(kind, error, trace))
         try:
+            head = f"=== {datetime.now().isoformat(timespec='seconds')} 版 {__version__}"
+            if thread:
+                head += f" スレッド {thread}"
+            body = "".join(traceback.format_exception(kind, error, trace))
             with self._write_lock:
                 self.folder.mkdir(parents=True, exist_ok=True)
                 _rotate(self.errors_path)
-                with self.errors_path.open("a", encoding="utf-8") as stream:
+                with self.errors_path.open(
+                    "a", encoding="utf-8", errors="backslashreplace"
+                ) as stream:
                     stream.write(f"{head}\n{body}\n")
-        except OSError:
+        except Exception:  # 記録の失敗で元のエラーを消さない どの失敗でも握る
             return
 
     # --- 読む（診断情報から） ---

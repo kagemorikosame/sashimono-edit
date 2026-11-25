@@ -151,7 +151,7 @@ class DiagnosticDialog(QDialog):
         """
         try:
             write_atomic(path, self.current_text())
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             QMessageBox.warning(self, "診断情報", f"保存できませんでした\n{exc}")
             return False
         self.saved_path = path

@@ -23,6 +23,7 @@ Qt を使わない
 from __future__ import annotations
 
 import json
+import math
 import statistics
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
@@ -148,8 +149,19 @@ def read(
 
 
 def _number(value: object) -> bool:
-    """数か（真偽は数に数えない JSON の true が 1 ms の止まりになる）"""
-    return isinstance(value, int | float) and not isinstance(value, bool)
+    """限りのある数か（真偽は数に数えない JSON の true が 1 ms の止まりになる）
+
+    限りの無い数（JSON の ``1e309`` は ``inf`` に読める）と数でない数は通さない 通すと合計・割合・
+    中央値が ``inf`` や ``nan%`` になり、同じ報告の正しい止まりの値まで読めなくなる
+    （PR #550 の指摘）
+    小数にできないほど大きな整数も通さない（数える所の ``float()`` で落ちる）
+    """
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
 
 
 def _well_formed(record: dict[str, Any]) -> bool:

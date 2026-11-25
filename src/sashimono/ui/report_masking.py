@@ -189,11 +189,17 @@ def mask_secrets(text: str) -> str:
 
 
 #: 場所の頭 置き場の印（:data:`HOME_PLACEHOLDER` など 印は残す）・ドライブ名・UNC
-_PLACE_HEAD = r"(?:((?:%[A-Z_]+%|\$XDG_[A-Z_]+))[\\/]|(?<![A-Za-z0-9])[A-Za-z]:[\\/]|\\\\)"
-#: 場所の続き 空白は含める（空白を含む素材の名前の後ろを残さないため PR #550 の指摘）
-#: 改行・引用符・括弧・文の区切りの記号で終わる 記号は ``ai/outbound.py`` と同じく番号で書く
-_PLACE_TAIL = r"[^\r\n\"'<>|*?\u3001\u3002\uff0c\uff08\uff09()\u300c\u300d]*"
-_PLACE = re.compile(_PLACE_HEAD + _PLACE_TAIL)
+_PLACE_HEAD = (
+    r"(?:(?P<folder>(?:%[A-Z_]+%|\$XDG_[A-Z_]+))[\\/]|(?<![A-Za-z0-9])[A-Za-z]:[\\/]|\\\\)"
+)
+#: 引用符で囲んだ場所 閉じる引用符（の後ろが語の続きでない所）まで 中の括弧・空白・読点も
+#: 名前の一部として伏せる（``"D:\Exports\(ClientBrief).mp4"`` PR #550 の指摘）
+_QUOTED_PLACE = re.compile(r"(?P<quote>[\"'])" + _PLACE_HEAD + r"[^\r\n]*?(?=(?P=quote)(?:\W|$))")
+#: 囲んでいない場所 Windows のファイルの名前に使えない文字（``"<>|?*``）と改行の前まで
+#: 空白・括弧・読点・アポストロフィはファイルの名前に使えるので止めない 止めると、空白や括弧を
+#: 含む名前の後ろ（`` 1 日目.mp4`` ``(ClientBrief).mp4`` ``s video.mp4``）が残る 場所の後ろに
+#: 続く文まで伏せることがあるが、伏せすぎて困るのは読めないことだけ
+_BARE_PLACE = re.compile(_PLACE_HEAD + r"[^\r\n\"<>|?*]*")
 
 
 def mask_places(text: str, mark: str) -> str:
@@ -202,17 +208,19 @@ def mask_places(text: str, mark: str) -> str:
     :func:`mask_user_folders` は利用者名の入った置き場だけを伏せ、その下のフォルダと
     ファイルの名前（``%USERPROFILE%\Videos\旅行 1 日目.mp4``）は残す 互換性レポートでは探索先の
     中を読めるよう残すが、診断情報（#516）では素材の名前になるので伏せる
-    空白で止めない 形で場所を拾う伏せ方（``ai/outbound.py``）は空白で止まり、空白を含む名前の
-    後ろ（`` 1 日目.mp4``）が残る 場所の後ろに続く文まで伏せることがあるが、伏せすぎて困るのは
-    読めないことだけで、出た名前は取り戻せない 引用符で囲んだ場所は閉じる引用符で終わる
+    形で場所を拾う伏せ方（``ai/outbound.py``）は空白や括弧で止まり、名前の後ろが残る ここでは
+    引用符で囲んだ場所は閉じる引用符まで、囲んでいない場所はファイルの名前に使えない文字まで伏せる
     印は残す どの置き場（設定・退避・ホーム）の話かは報告から読める
     """
 
     def one(found: re.Match[str]) -> str:
-        folder = found.group(1)
+        folder = found.group("folder")
         return f"{folder}\\{mark}" if folder else mark
 
-    return _PLACE.sub(one, text)
+    def quoted(found: re.Match[str]) -> str:
+        return found.group("quote") + one(found)
+
+    return _BARE_PLACE.sub(one, _QUOTED_PLACE.sub(quoted, text))
 
 
 #: 前の起動の記録を伏せる作り（#516 PR #550 の CodeRabbit の指摘が 4 回）
@@ -236,8 +244,21 @@ _EXCEPTION_SUFFIXES = ("Error", "Exception", "Warning", "Interrupt", "Exit", "It
 
 _ERROR_HEAD = re.compile(
     r"^=== (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) 版 (\d+\.\d+[0-9A-Za-z.+\-]*)"
-    r"(?: スレッド ([A-Za-z0-9_.\-]+))?"
+    r"(?: スレッド (\S+))?"
 )
+#: 記録の頭に写してよいスレッドの名前 アプリが付ける名前（``sashimono-…``）と Python が付ける
+#: 名前だけ 英数字の並びなら何でも通すと、頭の形をした本文の行の名前が写る（PR #550 の指摘と
+#: 同じ種類） 当たらない名前は写さない（スレッドの話は落とすが、伏せた印も要らない）
+_THREAD_NAME = re.compile(
+    r"MainThread|Thread-\d+|Dummy-\d+|ThreadPoolExecutor-\d+_\d+|sashimono-[A-Za-z0-9_.\-]{1,60}"
+)
+#: 例外の集まり（``ExceptionGroup``）の並びの印 枠の線の行はそのまま写し、``| `` の後ろは
+#: ふつうの行として読む 読まないと、場所と例外の種類まで伏せる（PR #550 の指摘）
+_GROUP_FIXED = re.compile(
+    r"^\s*(?:\+ Exception Group Traceback \(most recent call last\):"
+    r"|\+-[-+]*(?: (?:\d+|\.\.\.) -+)?|\+-+)$"
+)
+_GROUP_BAR = re.compile(r"^(\s*\| ?)(.*)$")
 _FIXED_ERROR_LINES = frozenset(
     {
         "Traceback (most recent call last):",
@@ -312,15 +333,17 @@ def _known_exception(kind: str) -> bool:
     作り付けの例外の名前か、頭が読み込んである部品の名前の物だけを写す 終わりの形
     （``Error`` など）だけで見ると、英字だけの本文の行（``CustomerError: …``）が種類として写る
     """
-    if "." not in kind:
-        found = getattr(builtins, kind, None)
-        return isinstance(found, type) and issubclass(found, BaseException)
-    return kind.split(".", 1)[0] in sys.modules
+    module_name, _, name = kind.rpartition(".")
+    # 部品が読み込んであるだけでは通さない その部品に本当にある例外の種類だけを写す
+    # 頭だけを見ると、``sashimono.CustomerNameError`` のような本文の行が写る（PR #550 の指摘）
+    module = sys.modules.get(module_name) if module_name else builtins
+    found = getattr(module, name, None)
+    return isinstance(found, type) and issubclass(found, BaseException)
 
 
-def _hidden(lines: list[str], line: str, mark: str) -> None:
+def _hidden(lines: list[str], line: str, mark: str, prefix: str = "") -> None:
     """伏せた印を足す 続けて伏せた行は 1 つにまとめる（何行あったかも本文の手掛かりになる）"""
-    indent = line[: len(line) - len(line.lstrip())]
+    indent = prefix + line[: len(line) - len(line.lstrip())]
     if not (lines and lines[-1] == indent + mark):
         lines.append(indent + mark)
 
@@ -332,24 +355,34 @@ def mask_error_record(text: str, mark: str) -> str:
         if not line.strip():
             lines.append("")
             continue
-        head = _ERROR_HEAD.match(line)
-        if head is not None:
-            time, version, thread = head.groups()
-            lines.append(f"=== {time} 版 {version}" + (f" スレッド {thread}" if thread else ""))
-            continue
-        if line.strip() in _FIXED_ERROR_LINES:
+        if _GROUP_FIXED.match(line):
             lines.append(line.rstrip())
             continue
-        frame = _FRAME.match(line)
-        if frame is not None:
-            lines.append(_frame_line(frame, comma=True))
-            continue
-        exception = _exception_line(line, mark)
-        if exception is not None:
-            lines.append(exception)
-            continue
-        _hidden(lines, line, mark)
+        prefix = ""
+        group = _GROUP_BAR.match(line)
+        if group is not None:
+            prefix, line = group.groups()
+        kept = _error_line(line, mark)
+        if kept is None:
+            _hidden(lines, line, mark, prefix)
+        else:
+            lines.append(prefix + kept)
     return "\n".join(lines)
+
+
+def _error_line(line: str, mark: str) -> str | None:
+    """エラーの記録の 1 行を組み直す 残してよい形でなければ ``None``"""
+    head = _ERROR_HEAD.match(line)
+    if head is not None:
+        time, version, thread = head.groups()
+        named = thread is not None and _THREAD_NAME.fullmatch(thread)
+        return f"=== {time} 版 {version}" + (f" スレッド {thread}" if named else "")
+    if line.strip() in _FIXED_ERROR_LINES:
+        return line.rstrip()
+    frame = _FRAME.match(line)
+    if frame is not None:
+        return _frame_line(frame, comma=True)
+    return _exception_line(line, mark)
 
 
 def mask_fault_record(text: str, mark: str) -> str:
@@ -399,7 +432,9 @@ def mask_fault_record(text: str, mark: str) -> str:
             items = [item.strip() for item in modules.group(1).split(",")]
             shown: list[str] = []
             for item in items:
-                if _MODULE_NAME.fullmatch(item):
+                # 形に加えて、頭の部品が今も読み込んであるかを見る 形だけだと英字の本文の語
+                # （``CustomerAlice``）が部品の名前として写る（例外の種類と同じ訳）
+                if _MODULE_NAME.fullmatch(item) and item.split(".", 1)[0] in sys.modules:
                     shown.append(item)
                 elif not shown or shown[-1] != mark:
                     shown.append(mark)

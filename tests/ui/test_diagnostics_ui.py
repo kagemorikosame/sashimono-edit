@@ -165,3 +165,22 @@ class TestTheFolder:
         kept = dialog.preferences()
         assert (kept.report_folder, kept.splash_motion) == ("D:\\報告", False)
         dialog.deleteLater()
+
+
+def test_a_folder_only_in_memory_is_written(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 壊れると、設定画面で変えて書けなかった置き場へ保存したときに「もう覚えている」と見て
+    # 書き直さず、次の起動で前の置き場に戻る（PR #550 の指摘）
+    target = tmp_path / "報告" / "診断.txt"
+    target.parent.mkdir()
+    window._preferences = replace(window._preferences, report_folder=str(target.parent))
+
+    def save(self: DiagnosticDialog) -> int:
+        assert self.save_to(target)
+        return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(DiagnosticDialog, "exec", save)
+    assert PreferenceStore().load().report_folder != str(target.parent)
+    window.create_diagnostics()
+    assert PreferenceStore().load().report_folder == str(target.parent)

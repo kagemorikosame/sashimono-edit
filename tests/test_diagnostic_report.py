@@ -473,3 +473,80 @@ def test_the_choice_fields_are_the_ones_read_as_choices() -> None:
         and keyword.value.func.id == "_choice"
     }
     assert read_as_choices == CHOICE_PREFERENCES
+
+
+class TestSixthReview:
+    """6 回目の見直し（PR #550）と、同じ種類の穴を洗って直した所"""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            r'読めない: "D:\Exports\(ClientBrief).mp4" を開く',
+            r"読めない: 'D:\Exports\Bob's (ClientBrief).mp4'",
+            r"読めない: D:\Exports\(ClientBrief).mp4",
+            r"読めない: D:\Exports\Bob's video、社外秘（ClientBrief）.mp4",
+        ],
+    )
+    def test_parentheses_and_quotes_in_a_name_are_hidden(self, text: str) -> None:
+        # 壊れると、括弧やアポストロフィの所で場所が終わり、名前の後ろ（(ClientBrief).mp4）が残る
+        masked = mask_places(text, PATH_MARK)
+        assert "ClientBrief" not in masked and "Bob" not in masked and "社外秘" not in masked
+        assert PATH_MARK in masked
+
+    def test_a_made_up_type_in_a_loaded_package_is_not_copied(self) -> None:
+        # 壊れると、部品が読み込んであるだけで、本文の行の名前（CustomerNameError）が写る
+        record = (
+            "sashimono.CustomerNameError: x\n"
+            "sashimono.core.io.serialize.ProjectFileError: x\n"
+            "=== 2026-11-24T10:00:00 版 0.2.7 スレッド CustomerA\n"
+        )
+        masked = mask_error_record(record, TEXT_MARK)
+        assert "Customer" not in masked
+        assert masked.splitlines() == [
+            TEXT_MARK,
+            f"sashimono.core.io.serialize.ProjectFileError: {TEXT_MARK}",
+            "=== 2026-11-24T10:00:00 版 0.2.7",
+        ]
+        faults = mask_fault_record("Extension modules: numpy.core, CustomerAlice (total: 2)", "印")
+        assert faults == "Extension modules: numpy.core, 印 (total: 2)"
+
+    def test_an_exception_group_keeps_its_places_and_types(self) -> None:
+        # 壊れると、例外の集まりの並びの印（|）のせいで、場所と例外の種類まで伏せる
+        import traceback
+
+        def fail() -> None:
+            raise ExceptionGroup("顧客 A", [ValueError("社長"), TypeError("社外秘")])
+
+        try:
+            fail()
+        except ExceptionGroup as group:
+            text = "".join(traceback.format_exception(group))
+        masked = mask_error_record(text, TEXT_MARK)
+        for gone in ("顧客", "社長", "社外秘"):
+            assert gone not in masked
+        assert "| ExceptionGroup:" in masked or "ExceptionGroup:" in masked
+        assert f"| ValueError: {TEXT_MARK}" in masked
+        assert f"| TypeError: {TEXT_MARK}" in masked
+        assert "in fail" in masked
+        assert "+-+----" in masked
+
+
+class TestStallNumbers:
+    def test_numbers_without_limits_are_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、限りの無い数の 1 行で合計や割合が inf や nan% になり、正しい止まりも読めない
+        stalls = tmp_path / "stalls.jsonl"
+        stalls.write_text(
+            '{"time": "2026-11-24T10:00:00", "stall_ms": 120}\n'
+            '{"time": "2026-11-24T10:00:01", "stall_ms": 1e309}\n'
+            '{"time": "2026-11-24T10:00:02", "stall_ms": NaN}\n'
+            '{"time": "2026-11-24T10:00:03", "stall_ms": ' + "9" * 400 + "}\n"
+            '{"time": "2026-11-24T10:00:04", "stall_ms": 80, "gc": [{"ms": Infinity}]}\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(diagnostic_report, "default_paths", lambda: [stalls])
+        gathered = gather(FaultLog(tmp_path, catch_faults=False))
+        assert gathered.stalls.startswith("止まり 1 回 合計 120 ms")
+        assert "inf" not in gathered.stalls and "nan" not in gathered.stalls
+        assert gathered.problems == ("画面の止まりの記録で形の違う行を 4 行飛ばした",)

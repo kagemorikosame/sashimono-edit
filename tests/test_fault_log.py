@@ -204,3 +204,65 @@ def test_a_folder_that_cannot_be_written_does_not_stop_the_start(tmp_path: Path)
     assert not log.install()
     assert sys.excepthook is before
     log.uninstall()
+
+
+def test_a_session_that_could_not_be_started_leaves_no_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 壊れると、頭の行を書けなかった（容量が尽きた など）起動の記録が残り、正しく終わっても
+    # 次の診断情報で落ちた起動に数えられる（PR #550 の指摘）
+    real_open = Path.open
+
+    class Full:
+        def __init__(self, stream: object) -> None:
+            self.stream = stream
+
+        def write(self, data: bytes) -> int:
+            raise OSError("容量が尽きた")
+
+        def flush(self) -> None:
+            raise OSError("容量が尽きた")
+
+        def close(self) -> None:
+            self.stream.close()  # type: ignore[attr-defined]
+
+    def fake_open(self: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+        stream = real_open(self, mode, *args, **kwargs)  # type: ignore[call-overload]
+        return Full(stream) if self.suffix == ".log" and "b" in mode else stream
+
+    monkeypatch.setattr(Path, "open", fake_open)
+    log = FaultLog(tmp_path, catch_faults=False)
+    assert not log.install()
+    monkeypatch.setattr(Path, "open", real_open)
+    assert list((tmp_path / "sessions").glob("*.log")) == []
+    assert list((tmp_path / "sessions").glob("*.lock")) == []
+
+
+def test_an_unwritable_message_still_reaches_the_previous_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 壊れると、対になっていない文字の入った例外で書くことが落ち、前の受け手（標準エラー）にも
+    # 渡らない 書く所がほかの理由で落ちても前の受け手へは渡す（PR #550 の指摘）
+    handed: list[BaseException] = []
+    monkeypatch.setattr(sys, "excepthook", lambda kind, error, trace: handed.append(error))
+    log = FaultLog(tmp_path, catch_faults=False)
+    log.install()
+    try:
+        try:
+            raise ValueError("壊れた字 \udcff")
+        except ValueError:
+            sys.excepthook(*sys.exc_info())
+        assert "\\udcff" in log.errors_path.read_text(encoding="utf-8")
+
+        def broken(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("書く所が落ちた")
+
+        monkeypatch.setattr(log, "record_error", broken)
+        try:
+            raise OSError("2 つ目")
+        except OSError:
+            with pytest.raises(RuntimeError):
+                sys.excepthook(*sys.exc_info())
+    finally:
+        log.uninstall()
+    assert [str(error) for error in handed] == ["壊れた字 \udcff", "2 つ目"]

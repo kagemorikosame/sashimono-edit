@@ -4251,7 +4251,10 @@ class MainWindow(QMainWindow):
         # （設定を書けなかった知らせを、保存の知らせで上書きしない）
         message = f"診断情報を保存しました: {saved}"
         folder = str(saved.parent)
-        if folder != self._preferences.report_folder:
+        # 比べるのは書けた設定（ファイルの中） 画面の中の値と比べると、設定画面で変えて書けなかった
+        # 置き場へ保存したときに「もう覚えている」と見て書き直さず、次の起動で前の置き場に戻る
+        # （PR #550 の指摘）
+        if folder != PreferenceStore().load().report_folder:
             changed = replace(self._preferences, report_folder=folder)
             try:
                 PreferenceStore().save(changed)
