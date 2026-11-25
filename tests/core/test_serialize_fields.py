@@ -33,6 +33,7 @@ from sashimono.core.model import (
     Keyframe,
     LayerMode,
     Marker,
+    MediaDefaults,
     MediaItem,
     PackedSpan,
     Project,
@@ -151,6 +152,14 @@ def _full_project() -> Project:
         transcripts=((1, Transcript((segment,), language="ja", model="small")),),
         display_name="本編の名前",
         packed=(PackedSpan(Fraction(1, 3), Fraction(7, 2)),),
+        # 置き方の既定（#524） 全部の欄を埋める
+        defaults=MediaDefaults(
+            picture=(Effect(kind="transform", params={"pos_x": AnimatedValue(12.0)}, fixed=True),),
+            opacity=0.5,
+            native_size=False,
+            sounds=((1, (Effect(kind="audio_volume", fixed=True),)),),
+            offset=Fraction(3, 2),
+        ),
     )
     scene = Scene("場面", Timeline(rate=RATE))
     filled = Clip(

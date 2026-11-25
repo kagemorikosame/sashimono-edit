@@ -791,6 +791,22 @@ class EditorHost(Protocol):
         """
         ...
 
+    def make_still_folder(self) -> Path:
+        """作品のフォルダの下の ``stills`` を用意して返す（#525） 有ればそのまま返す
+
+        ナレーションと同じく、作るのは決まった名前の 1 つだけ AI が名前を選べるフォルダを作る
+        口にしない 作れなければ :class:`ToolError` 書く場所の確かめは呼んだ側が
+        :func:`~sashimono.ai.safety.pinned_place` で行う
+        """
+        ...
+
+    @property
+    def still_frames(self) -> int:
+        """素材にした静止画をタイムラインへ置く長さ（フレーム #525）
+        （本人の設定 :attr:`~sashimono.ui.workspace.Preferences.still_seconds` を作品のフレームへ）
+        """
+        ...
+
     def make_narration_folder(self) -> Path:
         """作品のフォルダの下の ``narration`` を用意して返す（#335） 有ればそのまま返す
 

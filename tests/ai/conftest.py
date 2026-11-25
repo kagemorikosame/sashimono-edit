@@ -34,7 +34,7 @@ from sashimono.compat.aviutl.report import CompatibilityReport
 from sashimono.compat.catalog import TemplateEntry
 from sashimono.compat.subtitle_looks import LookRules, SavedLooks, saved_looks
 from sashimono.core.clipboard import ClipboardContent
-from sashimono.core.commands import AddClip, Author, Command, Document, InScene
+from sashimono.core.commands import STILLS_FOLDER, AddClip, Author, Command, Document, InScene
 from sashimono.core.direction_recipes import DirectionTaste
 from sashimono.core.emphasis import EmphasisStyle
 from sashimono.core.io.atomic import Expected, write_atomic_bytes
@@ -518,6 +518,18 @@ class FakeHost:
     @property
     def narration_settings(self) -> NarrationSettings:
         return self.narration
+
+    def make_still_folder(self) -> Path:
+        # 本物（MainWindow）と同じく、作品のフォルダの下の stills だけを作る（#525）
+        if self.saved_at is None:
+            raise ToolError("作品をまだ保存していないので、静止画を書く場所がありません")
+        folder = self.saved_at.parent / STILLS_FOLDER
+        folder.mkdir(exist_ok=True)
+        return folder
+
+    @property
+    def still_frames(self) -> int:
+        return 90
 
     def make_narration_folder(self) -> Path:
         # 本物（MainWindow）と同じく、作品のフォルダの下の narration だけを作る
