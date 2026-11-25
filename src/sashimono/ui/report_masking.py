@@ -212,61 +212,71 @@ def mask_places(text: str, mark: str) -> str:
     return _PLACE.sub(one, text)
 
 
-#: 引用符と括弧で囲んだ文 例外の文は名前や本文をここに入れる
-#: （``'旅行.mp4'`` ``「社長のあいさつ」``） 中の ``\'`` は囲みの終わりと見ない 終わりと見ると、
-#: 囲みの後ろ半分が伏せずに残る（PR #550 の CodeRabbit の指摘）
-_QUOTED = re.compile(r"""'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|\u300c[^\u300d\n]*\u300d""")
-#: 名前と拡張子の形の語 囲まずに書かれた素材の名前（``旅行.mp4 を読めない``）
-_FILE_NAME = re.compile(
-    r"(?<![\w.\\/])[^\s\"'<>|*?\\/:\u3001\u3002()\uff08\uff09]+\.[A-Za-z][A-Za-z0-9]{1,4}\b"
+#: 前の起動の記録で、そのまま残してよい行の形 どれもアプリと Python が決まった文で書く行で、
+#: 本人の文（素材の名前・字幕）は入らない ここに当たらない行は丸ごと伏せる
+_KEPT_LINES = tuple(
+    re.compile(pattern)
+    for pattern in (
+        # 記録の頭（``=== 時刻 版 0.2.7 スレッド 名前``） スレッドの名前はアプリが付ける
+        r"^=== \d{4}-\d{2}-\d{2}T[\d:]+ ",
+        r"^\s*Traceback \(most recent call last\):$",
+        r"^\s*(?:During handling of the above exception, another exception occurred"
+        r"|The above exception was the direct cause of the following exception):$",
+        # 並びの行 場所は後で本体の中の場所にし、名前は関数の名前
+        r'^\s*File "[^"]*", line \d+',
+        # 並びの印（Python 3.11 からの ``^^^^``）
+        r"^\s*[\^~]+\s*$",
+        # faulthandler が書く決まった行 致命的な例外の種類・スレッドの番号・部品の名前
+        r"^(?:Fatal Python error|Windows fatal exception): ",
+        r"^(?:Current thread|Thread) 0x[0-9a-fA-F]+ .*:$",
+        r"^\s*<no Python frame>$",
+        r"^Extension modules: ",
+    )
 )
-#: 名前の形でも伏せない拡張子 本体と部品のファイル（並びの中の場所や部品の名前）
-_PROGRAM_SUFFIXES = frozenset({"py", "pyd", "pyc", "dll", "exe", "so", "dylib", "qml"})
+#: 例外の行（``OSError: 本文``） 種類は残し、本文は伏せる 本文の頭の番号（``[Errno 2]``
+#: ``[WinError 5]``）は OS が決めた番号なので残す
+_EXCEPTION_LINE = re.compile(
+    r"^(\s*[A-Za-z_][\w.]*(?:: |:$))(\[(?:Errno|WinError) -?\d+\] )?(.*)$", re.ASCII
+)
 
 
 def mask_record_text(text: str, mark: str) -> str:
-    """前の起動の記録（エラーや落ちた時の並び）の中の、名前と本文になりうる所を伏せる
+    """前の起動の記録（エラーや落ちた時の並び）を、残してよい形の行だけ残して伏せる
 
     今の作品から作る伏せる表には、前の起動で開いた素材の名前や字幕は入っていない 表を
     起動をまたいで持つと、伏せたい物そのものを本人の置き場へ書き残すことになるので持たない
-    代わりに、例外の文が名前と本文を入れる形（引用符と括弧で囲んだ所・名前と拡張子の語）を
-    伏せる 並びの行（``File "…", line 3, in 名前``）と本体の部品の名前は残す
-    （PR #550 の CodeRabbit の指摘）
+    名前や字幕の形を探して伏せる作りは、囲みの中の ``\\'``・空白を含む名前・囲みも拡張子も
+    無い文と、レビューのたびに漏れ道が見つかった（PR #550 の CodeRabbit の指摘が 3 回）
+    探すのをやめ、アプリと Python が決まった文で書く行（:data:`_KEPT_LINES`）だけを残す
+    例外の行は種類と OS の番号だけを残して本文を伏せる 並びの行のすぐ後の字下げした行
+    （本体のソースの行）も残す それ以外の行は丸ごと伏せ、続けて伏せた行は 1 つにまとめる
     """
-    lines = []
+    lines: list[str] = []
+    after_frame = False
     for line in text.splitlines():
-        if line.lstrip().startswith('File "'):
+        if any(pattern.match(line) for pattern in _KEPT_LINES):
+            lines.append(line)
+            after_frame = line.lstrip().startswith('File "')
+            continue
+        if after_frame and line.startswith("    "):
+            # 並びの行の下のソースの行 本体のコードで、本人の文ではない
+            lines.append(line)
+            after_frame = False
+            continue
+        after_frame = False
+        found = _EXCEPTION_LINE.match(line)
+        if found is not None and not found.group(1).strip().startswith("==="):
+            head, number, body = found.group(1), found.group(2) or "", found.group(3)
+            lines.append(head + number + (mark if body.strip() else ""))
+            continue
+        if not line.strip():
             lines.append(line)
             continue
-        line = _QUOTED.sub(lambda found: found.group(0)[0] + mark + found.group(0)[-1], line)
-        lines.append(_hide_file_names(line, mark))
-    return "\n".join(lines)
-
-
-def _hide_file_names(line: str, mark: str) -> str:
-    """名前と拡張子の語を、その前の文（行の頭か ``: `` の後ろから）ごと伏せる
-
-    空白を含む名前（``社外秘 顧客名簿.csv``）は、どこから名前かを文から決められない 語だけを
-    伏せると頭（``社外秘``）が残るので、例外の種類（``OSError: ``）の後ろから語の終わりまでを
-    まとめて伏せる 伏せすぎて困るのは読めないことだけ（PR #550 の CodeRabbit の指摘）
-    本体と部品のファイル（:data:`_PROGRAM_SUFFIXES`）は伏せない
-    """
-    parts: list[str] = []
-    position = 0
-    for found in _FILE_NAME.finditer(line):
-        start, end = found.span()
-        if found.group(0).rsplit(".", 1)[1].lower() in _PROGRAM_SUFFIXES or start < position:
+        indent = line[: len(line) - len(line.lstrip())]
+        if lines and lines[-1] == indent + mark:
             continue
-        head = line[position:start]
-        colon = max(head.rfind(": "), head.rfind("\uff1a"))
-        if colon >= 0:
-            begin = position + colon + (2 if head.startswith(": ", colon) else 1)
-        else:
-            begin = position + len(head) - len(head.lstrip())
-        parts += [line[position:begin], mark]
-        position = end
-    parts.append(line[position:])
-    return "".join(parts)
+        lines.append(indent + mark)
+    return "\n".join(lines)
 
 
 def root_key(text: str) -> str:

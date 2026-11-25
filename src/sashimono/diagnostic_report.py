@@ -257,12 +257,15 @@ def mask(
     4. 場所（置き場の印の下 ``%USERPROFILE%\Videos\旅行 1 日目.mp4`` とドライブ名・UNC の場所）を
        空白で止めずに伏せる 形で拾う伏せ方は空白で止まり、名前の後ろが残る
     5. 素材の名前の表と、表に無い残りの絶対の場所
-    6. 秘密（API の鍵・トークン）
+    6. 秘密（API の鍵・トークン） 名前の表より前にも 1 度伏せる（表が鍵の名前を消すため）
     """
     text = program_paths(text)
     text = str(hide_text(text, sorted(set(texts), key=len, reverse=True), labels=False))
     text = mask_report(text, folders=folders)
     text = mask_places(text, PATH_MARK)
+    # 秘密は名前の表より先に伏せる 素材や作品の名前が鍵の名前（password など）と同じだと、
+    # 表が鍵の名前を消し、後の秘密の伏せ方が値を見つけられない（PR #550 の指摘）
+    text = mask_secrets(text)
     text = str(redact(text, names))
     return mask_secrets(text)
 

@@ -166,10 +166,48 @@ class TestPastRecords:
         masked = mask(build_report(ENV, None, gathered), folders=FOLDERS)
         assert "omega" not in masked and "alpha" not in masked
         assert "社外秘" not in masked and "顧客名簿" not in masked
-        # 並びの行・例外の種類・残す文・部品のファイルの名前は読める
+        # 並びの行と例外の種類は読める 本文は丸ごと伏せる
         assert '  File "sashimono/ui/main_window.py", line 3, in save' in masked
-        assert f"OSError: {TEXT_MARK} を読めない" in masked
-        assert "sashimono_native.pyd" in masked
+        assert f"OSError: {TEXT_MARK}\n" in masked
+        assert f"ImportError: {TEXT_MARK}\n" in masked
+
+    def test_only_the_kept_shapes_survive(self) -> None:
+        # 壊れると、囲みも拡張子も無い本文（顧客名 田中）や、例外の形でない行の字幕が残る
+        # 名前の形を探す作りは 3 回続けて漏れた（PR #550） 残してよい形だけを残す
+        record = (
+            "=== 2026-11-24T10:00:00 版 0.2.7 スレッド sashimono-encoder-probe\n"
+            "Traceback (most recent call last):\n"
+            '  File "sashimono/core/io/project.py", line 9, in load\n'
+            "    data = json.loads(text)\n"
+            "           ^^^^^^^^^^^^^^^^\n"
+            "ValueError: 顧客名 田中\n"
+            "社長のあいさつ\n"
+            "続きの字幕\n"
+            "FileNotFoundError: [Errno 2] No such file or directory: 'x'\n"
+            "Windows fatal exception: access violation\n"
+            "Current thread 0x00001a2b (most recent call first):\n"
+            '  File "sashimono/engine/gpu/context.py", line 40 in make_current\n'
+        )
+        masked = mask_record_text(record, TEXT_MARK)
+        assert "田中" not in masked and "社長" not in masked and "続きの字幕" not in masked
+        assert f"ValueError: {TEXT_MARK}" in masked
+        # 続けて伏せた行は 1 つにまとめる
+        assert f"ValueError: {TEXT_MARK}\n{TEXT_MARK}\nFileNotFoundError" in masked
+        assert f"FileNotFoundError: [Errno 2] {TEXT_MARK}" in masked
+        for kept in (
+            "スレッド sashimono-encoder-probe",
+            "    data = json.loads(text)",
+            "^^^^^^^^^^^^^^^^",
+            "Windows fatal exception: access violation",
+            "Current thread 0x00001a2b (most recent call first):",
+            '  File "sashimono/engine/gpu/context.py", line 40 in make_current',
+        ):
+            assert kept in masked
+
+    def test_a_secret_is_hidden_even_when_a_name_matches_its_key(self) -> None:
+        # 壊れると、作品の名前が password のとき、名前の表が鍵の名前を消し、値が残る
+        masked = mask("password = hunter2", names=[("password", "〔作品〕")], folders=FOLDERS)
+        assert "hunter2" not in masked
 
     def test_gathered_records_are_masked(self, tmp_path: Path) -> None:
         # 集めた所で伏せる 窓へ出る前に、表に無い名前が消えている
