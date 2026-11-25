@@ -4201,8 +4201,14 @@ class MainWindow(QMainWindow):
         self._updates.start()
 
     def update_blockers(self) -> list[str]:
-        """更新のために再起動してはいけない作業 書き出しは窓を占めるので、ここまで来ない"""
+        """更新のために再起動してはいけない作業"""
         found = []
+        person_export = self._person_export
+        if person_export is not None and person_export.export_progress is not None:
+            # 書き出しの窓は手を塞ぐので、本人が選んでここへ来ることはない ただ部品の更新を
+            # 待っていた入れ替えは、窓の exec の中で終わりの知らせを受けて進みうる（#528）
+            # 通すと、走っている書き出しを残したまま窓を閉じ、書き出しが途中で切れる
+            found.append("動画を書き出しています")
         if self._chat.responding:
             found.append("AI アシスタントが作業しています")
         if self._chat.setting_up:
