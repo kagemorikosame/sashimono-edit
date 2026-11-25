@@ -2,6 +2,7 @@ r"""キーフレームの間隔ごとに、飛んだ先の 1 コマを出すま�
 
     .venv\Scripts\python.exe tools\bench_seek.py
     .venv\Scripts\python.exe tools\bench_seek.py --gaps 2 8 50 --jumps 40
+    .venv\Scripts\python.exe tools\bench_seek.py --json 結果.json  （版ごとの記録も書く #513）
 
 1920x1080 の素材を、キーフレームの間隔だけ変えて ffmpeg で作り、ランダムな位置へ飛んで
 1 コマ出すまでを測る 一番長い間隔の素材からは :func:`create_proxy` で控えも作って同じく測る
@@ -28,6 +29,10 @@ if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# 結果の形は隣の道具の物を使う 試験が importlib で読むときは tools が探す所に無い
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from bench_results import BenchRecord
 
 from sashimono.engine.cache.proxy import (
     KEYFRAME_GAP_LIMIT,
@@ -83,30 +88,65 @@ def _make_source(directory: Path, gap: int, seconds: int) -> Path | None:
     return path
 
 
-def _measure(path: Path, seconds: int, jumps: int) -> tuple[float, float]:
-    """ランダムな ``jumps`` か所へ飛んで 1 コマ出すまで（中央値と 95 パーセンタイル ミリ秒）
+def _measure(path: Path, seconds: int, jumps: int) -> tuple[list[float], str | None]:
+    """ランダムな ``jumps`` か所へ飛んで 1 コマ出すまで（ミリ秒 小さい順）と、読めなかった理由
 
     乱数の種は固定する 素材ごとに飛ぶ先が違うと、比べた差が間隔の差なのか分からない
+    復号に失敗した（``decode_error`` が立った・絵が無い）回は数えずに止める デコーダは失敗すると
+    直前の絵を返すので、そのまま数えると読めていない時間を測れた時間として残す
     """
     rng = random.Random(0)
     times: list[float] = []
     with VideoDecoder(path) as decoder:
-        decoder.frame_at(Fraction(0))
+        if decoder.frame_at(Fraction(0)) is None or decoder.decode_error:
+            return [], decoder.decode_error or "頭の 1 コマを読めない"
         for _ in range(jumps):
             target = Fraction(rng.randrange(0, (seconds - 2) * RATE), RATE)
             start = time.perf_counter()
-            decoder.frame_at(target)
-            times.append((time.perf_counter() - start) * 1000)
+            shown = decoder.frame_at(target)
+            elapsed = (time.perf_counter() - start) * 1000
+            if shown is None or decoder.decode_error:
+                return [], decoder.decode_error or f"{float(target):.2f} 秒の絵が無い"
+            times.append(elapsed)
     times.sort()
+    return times, None
+
+
+def _report(
+    record: BenchRecord,
+    name: str,
+    label: str,
+    found: Fraction | None,
+    path: Path,
+    args: argparse.Namespace,
+) -> None:
+    """1 行出して記録に足す 読めなければ項目を落ちた扱いにし、理由を記録に残す"""
+    times, error = _measure(path, args.seconds, args.jumps)
+    seen = f"{float(found):.1f}s" if found is not None else "?"
+    if error is not None:
+        print(f"{label:<24}{seen:>10}  読めなかった: {error}")
+        record.add(name, [], label=label)
+        record.fail(f"{label} を読めなかった: {error}")
+        return
+    median, high = _summary(times)
+    print(f"{label:<24}{seen:>10}{median:>9.1f}ms{high:>8.1f}ms")
+    record.add(name, times, label=label)
+
+
+def _summary(times: list[float]) -> tuple[float, float]:
+    """中央値と 95 パーセンタイル（画面の表の値 前からの取り方のまま）"""
     return times[len(times) // 2], times[min(len(times) - 1, int(len(times) * 0.95))]
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--gaps", type=int, nargs="+", default=[1, 2, 4, 8, 16, 50])
     parser.add_argument("--seconds", type=int, default=60)
     parser.add_argument("--jumps", type=int, default=80)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--json", type=Path, default=None, help="版ごとに比べる記録の形（bench_results）でも書く"
+    )
+    args = parser.parse_args(argv)
     # 素材を作ってから落ちると、何分も待たせた後に IndexError で終わる 先に断る
     if args.jumps <= 0:
         parser.error("--jumps は 1 以上にする")
@@ -114,8 +154,13 @@ def main() -> int:
         parser.error("--seconds は 2 より大きくする（終わりの 2 秒へは飛ばない）")
     if any(gap <= 0 for gap in args.gaps):
         parser.error("--gaps は 1 以上にする")
+    record = BenchRecord(
+        "seek", {"gaps": sorted(args.gaps), "seconds": args.seconds, "jumps": args.jumps}
+    )
     if shutil.which("ffmpeg") is None:
         print("ffmpeg が無いので測らない")
+        record.skip("ffmpeg が無い")
+        record.write(args.json)
         return 0
 
     base = Path(tempfile.mkdtemp(prefix="sashimono-seek-bench-"))
@@ -129,23 +174,26 @@ def main() -> int:
     for gap in sorted(args.gaps):
         source = _make_source(base, gap, args.seconds)
         if source is None:
+            # 終了コードは前のまま 0 にする（表だけを見る使い方を変えない） 記録には落ちたと
+            # 書く 飛ばした扱いにすると、版を比べたときに ffmpeg の無い機械と見分けられない
+            record.fail("素材を作れなかった")
+            record.write(args.json)
             return 0
         longest = source
         # 線で止めずに読む 止めると 8 秒も 50 秒も「4 秒より長い」としか出ない
         found = keyframe_gap(source)
-        median, high = _measure(source, args.seconds, args.jumps)
-        seen = f"{float(found):.1f}s" if found is not None else "?"
-        print(f"{f'元 {gap} 秒間隔':<24}{seen:>10}{median:>9.1f}ms{high:>8.1f}ms")
+        _report(record, f"gop{gap}", f"元 {gap} 秒間隔", found, source, args)
 
     if longest is not None:
         proxy = create_proxy(longest, base / "proxy.mp4", height=PROXY_HEIGHT)
         if proxy is None:
             print("控えを作れなかった")
+            record.fail("控えを作れなかった")
+            record.write(args.json)
             return 0
         found = keyframe_gap(proxy)
-        median, high = _measure(proxy, args.seconds, args.jumps)
-        seen = f"{float(found):.1f}s" if found is not None else "?"
-        print(f"{f'控え {PROXY_HEIGHT}p':<24}{seen:>10}{median:>9.1f}ms{high:>8.1f}ms")
+        _report(record, f"proxy{PROXY_HEIGHT}p", f"控え {PROXY_HEIGHT}p", found, proxy, args)
+    record.write(args.json)
     return 0
 
 

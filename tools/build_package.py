@@ -842,9 +842,81 @@ def native_license_problems(internal: Path) -> list[str]:
 #: 組み立ての記録に載らないが、zip に入れてよい物（:func:`assemble` と
 #: :func:`collect_licenses` が置く物）
 ASSEMBLED = ("README.txt", "LICENSE.txt", NOTICES_NAME)
+#: 積んだファイルごとの出どころ（:func:`bundle_record`） 部品の一覧（tools/sbom.py #517）が読む
+BUNDLED_FILES_NAME = "bundled-files.json"
 #: 使用許諾ではないが :func:`assemble` が置く物（使用許諾の照合には混ぜない）
-ASSEMBLED_INFO = (BUILD_INFO_NAME, BUNDLED_SCRIPT)
+ASSEMBLED_INFO = (BUILD_INFO_NAME, BUNDLED_SCRIPT, BUNDLED_FILES_NAME)
 ASSEMBLED_FOLDERS = (PORTABLE_SCRIPTS_DIR, LICENSES_DIR)
+
+
+#: :func:`bundle_record` の出どころの名前 包みは配布名（PEP 503 でそろえた物）で書く
+OWNER_OWN = "sashimono"
+OWNER_BUILD = "build"
+OWNER_PYTHON = "python"
+OWNER_UNKNOWN = "unknown"
+
+
+def bundle_record(
+    bundle: Path,
+    record: Path,
+    *,
+    owners: Mapping[str, importlib.metadata.Distribution] | None = None,
+) -> dict[str, object]:
+    """積んだファイル 1 つずつの出どころと、積んだ包みの版（部品の一覧の元 #517）
+
+    部品の一覧を zip の中身から推して作ると、フォルダの名前や拡張子の当てはめに漏れが出る
+    （PR #548 のレビューで 3 度続いた） 出どころは組み立ての記録（PyInstaller の TOC）と
+    包みのファイルの表で、組み立てるときにだけ正しく分かる ここで書いて zip に入れ、一覧は
+    これを読む 出どころの分からないファイルは :func:`collect_licenses` が先に止める
+    外した Qt の部品のように、記録にあってもフォルダに無い物は書かない
+    """
+    owners = distribution_owners() if owners is None else owners
+    collected = ast.literal_eval((record / "COLLECT-00.toc").read_text(encoding="utf-8"))[0]
+    python_root = Path(sys.base_prefix)
+    files: dict[str, str] = {}
+    packages: dict[str, dict[str, str]] = {}
+    for entry in collected:
+        inner = PureWindowsPath(entry[0]).as_posix()
+        placed = inner if inner == f"{APP_NAME}.exe" else f"_internal/{inner}"
+        if not (bundle / placed).is_file():
+            continue
+        source = Path(entry[1])
+        distribution = owners.get(_key(source))
+        if distribution is not None:
+            name = distribution.metadata["Name"]
+            key = canonical_name(name)
+            packages[key] = {"name": name, "version": distribution.version}
+            files[placed] = key
+        elif _inside(source, ROOT / "src"):
+            files[placed] = OWNER_OWN
+        elif _inside(source, record):
+            files[placed] = OWNER_BUILD
+        elif _inside(source, python_root):
+            files[placed] = OWNER_PYTHON
+        else:
+            files[placed] = OWNER_UNKNOWN
+    # 包みは :func:`collect_licenses` と同じ数え方にする（exe の中の書庫 PYZ に入った純 Python の
+    # 包みと、外した Qt の部品の包みも数える） 数え方が違うと、写しのフォルダと記録の包みが食い違う
+    for source in bundled_sources(record):
+        distribution = owners.get(_key(source))
+        if distribution is not None:
+            name = distribution.metadata["Name"]
+            packages[canonical_name(name)] = {"name": name, "version": distribution.version}
+    # 起動部（Sashimono.exe）は作業フォルダから来るので、ファイルを辿っても包みに行き着かない
+    for name in ALWAYS_BUNDLED:
+        with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+            distribution = importlib.metadata.distribution(name)
+            packages[canonical_name(name)] = {
+                "name": distribution.metadata["Name"],
+                "version": distribution.version,
+            }
+    return {"packages": dict(sorted(packages.items())), "files": dict(sorted(files.items()))}
+
+
+def write_bundle_record(bundle: Path, data: Mapping[str, object]) -> Path:
+    path = bundle / BUNDLED_FILES_NAME
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return path
 
 
 def untracked_files(bundle: Path, record: Path) -> list[str]:
@@ -1378,6 +1450,7 @@ def main(argv: list[str] | None = None, *, dist: Path | None = None) -> int:
             print(f"[NG] {problem}")
         return 1
 
+    write_bundle_record(bundle, bundle_record(bundle, record))
     return package(bundle, target, check=not args.skip_check)
 
 

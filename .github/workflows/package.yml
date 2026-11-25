@@ -22,6 +22,7 @@ on:
       - ".github/workflows/release.yml"
       - "tools/build_package.py"
       - "tools/package_notices.py"
+      - "tools/sbom.py"
       - "tools/check_bootloader.py"
       - "tools/check_clean_machine.ps1"
       - ".github/actions/ffmpeg/**"
@@ -126,10 +127,21 @@ jobs:
         # ここで確かめると、この機械の Python と DLL を拾って通ってしまう
         run: python tools/build_package.py --skip-check
 
+      - name: 部品の一覧（SBOM）を作る
+        # 組み立てた zip だけを読んで作る（tools/sbom.py #517） ネットへは出ないので、上流の
+        # 取得元が消えても止まらない 止まるのは一覧が誤る時だけ（積んだ DLL の部品が決まって
+        # いない・写しのフォルダと使用許諾の一覧の版が違う） そのときは zip も上げない
+        # main への push でも走るので、足し忘れはリリースを待たずにここで分かる
+        run: python tools/sbom.py write
+
       - uses: actions/upload-artifact@v7
         with:
           name: package
-          path: dist/SashimonoEdit-*-windows-x64.zip
+          # 一覧は zip と同じ組み立ての物だけを一緒に上げる 名前に版を入れないのは、公開した後に
+          # releases/latest/download/ の決まった URL で前の版の一覧を読めるようにするため
+          path: |
+            dist/SashimonoEdit-*-windows-x64.zip
+            dist/SashimonoEdit-windows-x64.cdx.json
           if-no-files-found: error
           retention-days: 7
 
