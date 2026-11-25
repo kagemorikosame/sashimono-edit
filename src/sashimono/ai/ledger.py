@@ -179,6 +179,9 @@ _EXPORT_NOTE = (
     "進み具合は export_status、止めるのは cancel_export 書き出し先は作品のフォルダと"
     "書き出しの窓で前に選んだフォルダの中だけ（#350 の決定）"
 )
+#: 静止画を素材にする（#525） 書く先は作品のフォルダの stills の新しい名前だけ 人は確かめの窓を
+#: 出さない（メニューを押したことが確かめ） AI は取り消せない操作として毎回確かめる
+_STILL_NOTE = "place を真にすると再生ヘッドへ置く 書いた PNG は取り消しても残る"
 _SNAPSHOT_NOTE = "絵を見るだけなら preview_frame で足りる 保存先は作品のフォルダなどの中だけ"
 #: プリセットとエイリアスの置き場を書き換える操作（保存・名前と分類の変更・複製・削除・書き出し・
 #: 読み込み #328） 置き場は作品の外の本人の持ち物 2026-10-17 に本人が「AI は読むだけ」と
@@ -283,6 +286,18 @@ LEDGER: tuple[Entry, ...] = (
     ),
     same("メニュー/編集/貼り付け（挿入）", "paste_clips", note=_INSERT_NOTE),
     same("メニュー/編集/すべて選択", "select_all", safety=Safety.READ_ONLY),
+    same(
+        "メニュー/編集/静止画を素材にする",
+        "snapshot_to_media",
+        note=_STILL_NOTE,
+        safety=Safety.IRREVERSIBLE,
+    ),
+    same(
+        "メニュー/編集/静止画をタイムラインへ置く",
+        "snapshot_to_media",
+        note=_STILL_NOTE,
+        safety=Safety.IRREVERSIBLE,
+    ),
     same(
         "メニュー/編集/静止画をコピー",
         "copy_snapshot",
@@ -432,6 +447,13 @@ LEDGER: tuple[Entry, ...] = (
     same("タイムラインの右クリック/色を自動で整える…", "auto_color"),
     same("タイムラインの右クリック/ノイズを自動で減らす…", "reduce_noise"),
     same("タイムラインの右クリック/シーンを開く", "set_active_scene", safety=Safety.READ_ONLY),
+    same("タイムラインの右クリック/このコマで止める", "freeze_frame"),
+    same(
+        "タイムラインの右クリック/この設定を素材の既定にする",
+        "set_media_defaults",
+        note="作品の中の既定だけ ほかの作品の分（本人の置き場）は人だけ アプリ自身の設定は"
+        "AI は読むだけ（#350 の決定）",
+    ),
     same("タイムラインの右クリック/エフェクトを追加/*/*", "add_effect"),
     hidden("タイムラインの右クリック/エイリアスとして保存…", _LIBRARY),
     partial(
@@ -523,6 +545,18 @@ LEDGER: tuple[Entry, ...] = (
         safety=Safety.IRREVERSIBLE,
     ),
     same(
+        "プレビューの右クリック/静止画を素材にする",
+        "snapshot_to_media",
+        note=_STILL_NOTE,
+        safety=Safety.IRREVERSIBLE,
+    ),
+    same(
+        "プレビューの右クリック/静止画をタイムラインへ置く",
+        "snapshot_to_media",
+        note=_STILL_NOTE,
+        safety=Safety.IRREVERSIBLE,
+    ),
+    same(
         "プレビューの右クリック/静止画をコピー",
         "copy_snapshot",
         note=_OS_COPY_NOTE,
@@ -572,6 +606,11 @@ LEDGER: tuple[Entry, ...] = (
     same("素材一覧の右クリック/タイムラインへ置く", "place_media"),
     same("素材一覧の右クリック/字幕を起こす…", "transcribe"),
     hidden("素材一覧の右クリック/ファイルの場所を開く", _OUTSIDE),
+    same(
+        "素材一覧の右クリック/素材の既定を消す",
+        "set_media_defaults",
+        note="clear で消す 作品の中の既定だけ ほかの作品の分は人だけ",
+    ),
     same(
         "素材一覧の右クリック/プールから外す",
         "remove_media",

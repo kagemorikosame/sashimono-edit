@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
+from sashimono.core.model.effect import Effect
 from sashimono.core.model.ids import MediaId, new_media_id
 from sashimono.core.model.transcript import Transcript
 from sashimono.core.timebase import FrameRate
@@ -18,6 +19,7 @@ __all__ = [
     "HDR_TRANSFERS",
     "WIDE_GAMUT_PRIMARIES",
     "AudioStreamInfo",
+    "MediaDefaults",
     "MediaItem",
     "PackedSpan",
     "VideoStreamInfo",
@@ -129,6 +131,56 @@ class PackedSpan:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaDefaults:
+    """素材を置いたときの初めの値（#524） 本人が編集で決めた置き方を素材に覚えておく
+
+    同じ立ち絵や効果音を何度も置く作り方では、置くたびに同じ位置・拡大率・音量へ直していた
+    覚えるのは固定の項目（反転・配置・音量・フェード）と、不透明度・画素で置くか・素材の頭の
+    ずれだけ ふつうのエフェクトまで覚えると、一度だけ掛けたぼかしが以後ずっと付いてくる
+
+    値はどれも動かない値で持つ キーフレームは長さの違うクリップへ写すと、終わりの側が
+    クリップの外へはみ出して効かないか、短いクリップで途中までしか動かない
+    ``None`` と空は「覚えていない」 置いたときの値（絵も音も変えない値）のまま置く
+    """
+
+    #: 描画の固定の項目（反転・配置）
+    picture: tuple[Effect, ...] = ()
+    #: 不透明度（0〜1）
+    opacity: float | None = None
+    #: 拡大率 100% を素材の画素にするか（:attr:`~sashimono.core.model.Clip.native_size`）
+    native_size: bool | None = None
+    #: 音声ストリームごとの音声の固定の項目（音量とパン・フェード） 番号の昇順
+    #: ゲームの録画のように音が何本もある素材では、声とゲーム音で音量が違う
+    sounds: tuple[tuple[int, tuple[Effect, ...]], ...] = ()
+    #: 素材の頭のずれ（秒 素材の頭から） 置いたクリップの素材の中の開始位置
+    offset: Fraction | None = None
+
+    def __post_init__(self) -> None:
+        if self.opacity is not None and not 0 <= self.opacity <= 1:
+            raise ValueError(f"不透明度が範囲の外: {self.opacity}")
+        if self.offset is not None and self.offset < 0:
+            raise ValueError(f"素材の頭のずれが負: {self.offset}")
+        indexes = [index for index, _ in self.sounds]
+        if indexes != sorted(set(indexes)):
+            raise ValueError(f"音声ストリームの番号が昇順でないか重なっている: {indexes}")
+
+    @property
+    def is_empty(self) -> bool:
+        """何も覚えていないか"""
+        return (
+            not self.picture
+            and self.opacity is None
+            and self.native_size is None
+            and not any(effects for _, effects in self.sounds)
+            and self.offset is None
+        )
+
+    def sound_for(self, stream: int) -> tuple[Effect, ...]:
+        """その音声ストリームの音声の項目 覚えていなければ空"""
+        return next((effects for index, effects in self.sounds if index == stream), ())
+
+
+@dataclass(frozen=True, slots=True)
 class MediaItem:
     """メディアプールに登録された 1 つの素材"""
 
@@ -150,6 +202,8 @@ class MediaItem:
     #: 持たせないと、範囲の外へトリムを伸ばしたクリップが黙って錨の絵か何も無い所を出し、
     #: なぜ絵が出ないのかが人にも AI にも分からない
     packed: tuple[PackedSpan, ...] = ()
+    #: 置いたときの初めの値（#524） ``None`` なら覚えていない
+    defaults: MediaDefaults | None = None
 
     def __post_init__(self) -> None:
         if self.duration < 0:

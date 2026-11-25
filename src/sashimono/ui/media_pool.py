@@ -115,6 +115,8 @@ class MediaPoolWidget(QWidget):
     transcribe_requested = Signal(str)
     #: メディアプールから外すよう要求された 引数は素材 ID
     remove_requested = Signal(str)
+    #: 素材に覚えた置き方の既定（#524）を消すよう要求された 引数は素材 ID
+    defaults_clear_requested = Signal(str)
     #: 本人が表示（一覧・アイコン）を切り替えた 引数は :data:`VIEW_MODES` のどれか
     #: 覚えておくのは窓の仕事（好みの設定に書く）
     view_mode_changed = Signal(str)
@@ -325,8 +327,16 @@ class MediaPoolWidget(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, str(media.id))
             item.setData(_BASE_TEXT, _describe(media, project.rate))
             # アイコン表示でも HDR の印は名前の下に出す 補足だけにすると、指すまで気付かない
-            outside = media.color_outside_sdr
-            item.setData(_NAME_TEXT, f"{media.name}\n{outside}" if outside else media.name)
+            # 置き方の既定（#524）の印も同じく名前の下に出す 一覧表示だけだと、アイコン表示で
+            # 置いた素材がなぜ初めから位置や音量の違う形で置かれるのか分からない
+            marks = [
+                mark
+                for mark in (media.color_outside_sdr, "既定あり" if media.defaults else "")
+                if mark
+            ]
+            item.setData(
+                _NAME_TEXT, "\n".join((media.name, " / ".join(marks))) if marks else media.name
+            )
             item.setIcon(self._icon_for(media))
             self._show_note(item, media)
             self._list.addItem(item)
@@ -450,6 +460,12 @@ class MediaPoolWidget(QWidget):
         transcribe.setEnabled(media is not None and media.has_audio)
         reveal = menu.addAction("ファイルの場所を開く")
         reveal.triggered.connect(lambda _checked=False: self._reveal(media_id))
+        # 覚えていない素材でも灰色で出す 隠すと、既定を覚えられることに気付けない
+        forget = menu.addAction("素材の既定を消す")
+        forget.triggered.connect(
+            lambda _checked=False: self.defaults_clear_requested.emit(str(media_id))
+        )
+        forget.setEnabled(media is not None and media.defaults is not None)
         menu.addSeparator()
         remove = menu.addAction("プールから外す")
         remove.triggered.connect(lambda _checked=False: self.remove_requested.emit(str(media_id)))
@@ -481,6 +497,10 @@ def _describe(media: MediaItem, rate: FrameRate) -> str:
     if media.has_audio:
         count = len(media.audio_streams)
         kinds.append(f"音声{count}本" if count > 1 else "音声")
+    # 置き方の既定（#524）を覚えた素材は、置くと初めから位置や音量が変わっている
+    # 一覧で見分けられないと、なぜ変わって置かれたのかが分からない
+    if media.defaults is not None:
+        kinds.append("既定あり")
     if kinds:
         parts.append(" / ".join(kinds))
 
