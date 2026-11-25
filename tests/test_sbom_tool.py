@@ -108,6 +108,18 @@ def _zip(
     return buffer.getvalue()
 
 
+def _versioned_dll(version: str) -> bytes:
+    """版情報（VS_VERSION_INFO の ProductVersion）だけを持つ DLL の偽物"""
+    body = (
+        "VS_VERSION_INFO".encode("utf-16-le")
+        + b"\0\0"
+        + "ProductVersion\0".encode("utf-16-le")
+        + b"\0\0"
+        + f"{version}\0".encode("utf-16-le")
+    )
+    return (6 + len(body)).to_bytes(2, "little") + b"\0" * 4 + body
+
+
 def _write(tmp_path: Path, data: bytes, name: str = "SashimonoEdit-1.2.3-windows-x64.zip") -> Path:
     path = tmp_path / name
     path.write_bytes(data)
@@ -265,7 +277,11 @@ class TestGenerate:
     def test_recorded_files_are_listed_with_their_package(
         self, tool: ModuleType, tmp_path: Path
     ) -> None:
-        """記録のそろった包みは載せ、Python と一緒に入った DLL は Python の部品にハッシュを付ける"""
+        """記録のそろった包みが載らないと、脆弱性の照合でその包みを見落とす
+
+        Python と一緒に入った DLL（OpenSSL など）にハッシュと版が付かないと、差し替えも
+        古い版も見分けられない
+        """
         listed = _listed(tool)
         lua = "_internal/lupa/lua54.cp314-win_amd64.pyd"
         extra = {
@@ -287,10 +303,39 @@ class TestGenerate:
         found = _components(tool.generate(_write(tmp_path, archive)).data)
         assert found["packaging"]["purl"] == f"pkg:pypi/packaging@{listed['packaging']}"
         assert "lupa" in found
-        python = next(item for name, item in found.items() if name.startswith("Python"))
-        inner = python["components"]
+        openssl = found["OpenSSL"]
+        inner = openssl["components"]
         assert isinstance(inner, list)
-        assert "_internal/libssl-3.dll" in {item["name"] for item in inner}
+        assert {item["name"] for item in inner} == {"_internal/libssl-3.dll"}
+
+    def test_parts_bundled_with_python_get_their_own_versions(
+        self, tool: ModuleType, tmp_path: Path
+    ) -> None:
+        """同梱の OpenSSL に Python の版を付けると、脆弱性の照合で OpenSSL の版が外れる
+
+        表は 1 行にまとめているので、部品ごとに分け、版は各 DLL の版情報から読む 読めない部品
+        （libffi）には版を付けない（推した版を付けると照合を誤らせる）
+        """
+        extra = {
+            "Sashimono/_internal/libssl-3.dll": _versioned_dll("3.5.9"),
+            "Sashimono/_internal/libcrypto-3.dll": _versioned_dll("3.5.9"),
+            "Sashimono/_internal/sqlite3.dll": _versioned_dll("3.50.4.0"),
+            "Sashimono/_internal/libffi-8.dll": b"ffi",
+        }
+        owners = {name.removeprefix("Sashimono/"): "python" for name in extra}
+        found = _components(
+            tool.generate(_write(tmp_path, _zip(tool, extra=extra, owners=owners))).data
+        )
+        python = found["Python"]
+        assert python["version"] == ".".join(str(part) for part in minimum_python())
+        assert python["licenses"] == [{"expression": "PSF-2.0"}]
+        names = python["components"]
+        assert isinstance(names, list)
+        assert {item["name"] for item in names} == {"_internal/python314.dll"}
+        assert found["OpenSSL"]["version"] == "3.5.9"
+        assert found["OpenSSL"]["cpe"] == "cpe:2.3:a:openssl:openssl:3.5.9:*:*:*:*:*:*:*"
+        assert found["SQLite"]["version"] == "3.50.4"
+        assert "version" not in found["libffi"]
 
     def test_a_license_text_that_is_not_an_spdx_expression_is_a_name(
         self, tool: ModuleType
@@ -332,7 +377,7 @@ class TestWrite:
 
 class TestCompare:
     def test_a_list_for_another_zip_is_caught(self, tool: ModuleType, tmp_path: Path) -> None:
-        """組み直した zip の隣に前の zip の一覧が上がっていたら、照らして見つける"""
+        """組み直した zip の隣に前の zip の一覧が残っていると、配った物と違う一覧を公開する"""
         old = _write(tmp_path, _zip(tool), "old.zip")
         bom = tool.generate(old).data
         extra = {"Sashimono/_internal/av.libs/avutil-60-" + "1" * 32 + ".dll": b"rebuilt"}

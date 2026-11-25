@@ -250,7 +250,11 @@ def dll_version_field(path: Path, name: str) -> str | None:
     資源の塊の中だけを探す ファイル全体から探すと、版情報を読む側のコードが持つ同じ文字列に
     当たる 読むだけで DLL は開かない 載せると中のコードが走り、Windows 以外でも試せなくなる
     """
-    data = path.read_bytes()
+    return dll_version_text(path.read_bytes(), name)
+
+
+def dll_version_text(data: bytes, name: str) -> str | None:
+    """:func:`dll_version_field` の中身 zip の中の DLL のように、ファイルに無い中身からも読む"""
     marker = data.find("VS_VERSION_INFO".encode("utf-16-le"))
     # 塊の頭は名前の 6 バイト前 全体の長さ・値の長さ・種類の 3 つが 2 バイトずつ並ぶ
     if marker < 6:

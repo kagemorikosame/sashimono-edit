@@ -62,6 +62,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import build_package  # noqa: E402
+import collect_sources  # noqa: E402
 from package_notices import canonical_name  # noqa: E402
 
 from sashimono import __version__  # noqa: E402
@@ -103,7 +104,29 @@ CPE_PRODUCTS: dict[str, tuple[str, str]] = {
     "libiconv": ("gnu", "libiconv"),
     "dav1d": ("videolan", "dav1d"),
     "opus": ("opus-codec", "opus"),
+    "openssl": ("openssl", "openssl"),
+    "sqlite": ("sqlite", "sqlite"),
 }
+
+#: Python 本体と一緒に入る DLL を、部品ごとに分ける（DLL の名前の頭 → 部品の名前）
+#: 一覧の表は「Python と同梱の OpenSSL・libffi など」の 1 行にまとめているが、脆弱性は部品ごとの版で
+#: 決まる まとめたまま Python の版を付けると、OpenSSL や SQLite の照合が外れる（PR #548 の 4 回目）
+PYTHON_PARTS: tuple[tuple[str, str], ...] = (
+    ("python3", "Python"),
+    ("libcrypto", "OpenSSL"),
+    ("libssl", "OpenSSL"),
+    ("sqlite3", "SQLite"),
+    ("libffi", "libffi"),
+)
+#: Python 本体（CPython）の使用許諾 同梱の部品の分は Python の LICENSE.txt の中に並ぶ
+PYTHON_LICENSE = [{"expression": "PSF-2.0"}]
+BUNDLED_WITH_PYTHON = [
+    {
+        "license": {
+            "name": "licenses\\Python\\LICENSE.txt に Python に同梱の部品として書かれた使用許諾"
+        }
+    }
+]
 
 #: SPDX の式として読める使用許諾の欄 これに当たらない書き方（文章）は名前として残す
 #: 識別子は版の付いた形（``GPL-2.0-or-later``）か、版の無い決まった名前だけにする 「LGPL」の
@@ -423,9 +446,6 @@ def _parts(
         if index not in reached:
             version = version_of(row.version_cell)
             note = "" if version else row.version_cell
-            if row.name.lower().startswith("python") and python:
-                # 表は「3.14」までしか書かない 脆弱性は修正版で決まるので DLL から読んだ版にする
-                version, note = python, ""
             reached[index] = Found(
                 1 + index,
                 row.name,
@@ -464,6 +484,7 @@ def _parts(
         entry(row).files[relative] = _digest(archive, f"{_APP}/{relative}")
 
     left: list[str] = []
+    split: list[Found] = []
     for row in rows:
         if row.copies & native_copies:
             # DLL を数えて当てる部品 当たらなければ積んでいない
@@ -474,21 +495,81 @@ def _parts(
         if not inside:
             left.append(row.name)
             continue
+        if row.name.lower().startswith("python"):
+            # 1 行にまとめた Python と同梱の部品は、部品ごとに分けて載せる
+            split += _python_parts(archive, record, inside, rows, row, python)
+            continue
         found = entry(row)
-        is_python = found.name.lower().startswith("python")
         for relative in inside:
             filename = PurePosixPath(relative).name.lower()
-            if is_python:
-                # Python 本体と一緒に入った DLL（OpenSSL・libffi・sqlite など）は
-                # 出どころの記録で決まる
-                hit = record.files[relative] == build_package.OWNER_PYTHON and filename.endswith(
-                    ".dll"
-                )
-            else:
-                hit = any(fnmatch.fnmatch(filename, pattern.lower()) for pattern in row.patterns)
-            if hit:
+            if any(fnmatch.fnmatch(filename, pattern.lower()) for pattern in row.patterns):
                 found.files[relative] = _digest(archive, f"{_APP}/{relative}")
-    return list(reached.values()), left
+    every = [*reached.values(), *split]
+    for part in every:
+        _version_from_files(archive, part)
+    return every, left
+
+
+def _dll_version(archive: zipfile.ZipFile, relative: str) -> str | None:
+    """DLL の版情報の ProductVersion 4 つ目の数が 0 なら落とす（3.50.4.0 → 3.50.4）"""
+    found = collect_sources.dll_version_text(archive.read(f"{_APP}/{relative}"), "ProductVersion")
+    if not found or not _VERSION.fullmatch(found.strip()):
+        return None
+    text = found.strip()
+    return text[:-2] if text.count(".") == 3 and text.endswith(".0") else text
+
+
+def _version_from_files(archive: zipfile.ZipFile, part: Found) -> None:
+    """表に版の書けない部品（VC++ の実行時の部品など）は、DLL の版情報がそろっていればその版にする
+
+    版の無い部品は脆弱性の照合で当たらない 版情報の違う DLL が混ざる部品は決められないので付けない
+    """
+    if part.version or not part.files:
+        return
+    versions = {_dll_version(archive, relative) for relative in part.files}
+    if len(versions) == 1 and None not in versions:
+        part.version = versions.pop()
+        part.cpe = _cpe(part.name, part.version)
+        part.note = "DLL の版情報から読んだ版"
+
+
+def _python_parts(
+    archive: zipfile.ZipFile,
+    record: Record,
+    inside: list[str],
+    rows: list[PartRow],
+    row: PartRow,
+    python: str | None,
+) -> list[Found]:
+    """Python 本体と一緒に入った DLL を部品ごとに分ける
+
+    Python（CPython）の版は python3XX.dll から読む（表は「3.14」までしか書かない） OpenSSL・SQLite
+    などは各 DLL の版情報から読む ほかの行の型に当たる DLL（VC++ の実行時の部品）はその行に任せる
+    """
+    others = [pattern.lower() for other in rows if other is not row for pattern in other.patterns]
+    grouped: dict[str, Found] = {}
+    order = 1 + rows.index(row)
+    for relative in sorted(inside):
+        filename = PurePosixPath(relative).name.lower()
+        if record.files[relative] != build_package.OWNER_PYTHON or not filename.endswith(".dll"):
+            continue
+        if any(fnmatch.fnmatch(filename, pattern) for pattern in others):
+            continue
+        base = build_package.native_base_name(filename)
+        name = next((part for head, part in PYTHON_PARTS if base.startswith(head)), base)
+        if name not in grouped:
+            is_python = name == "Python"
+            grouped[name] = Found(
+                order,
+                name,
+                python if is_python else None,
+                PYTHON_LICENSE if is_python else BUNDLED_WITH_PYTHON,
+                cpe=_cpe(name, python) if is_python else None,
+                evidence=f"{_APP}/{row.place}",
+                note="" if is_python else "Python に同梱の版",
+            )
+        grouped[name].files[relative] = _digest(archive, f"{_APP}/{relative}")
+    return [grouped[name] for name in sorted(grouped, key=lambda name: (name != "Python", name))]
 
 
 @dataclass

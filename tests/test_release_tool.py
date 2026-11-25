@@ -1546,7 +1546,10 @@ class TestBill:
     def test_a_draft_without_a_bill_gets_one_made_from_the_zip(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """一覧を作る前の版の run で上げた下書きでも、手元で zip から作って上げて進む"""
+        """一覧の無い下書き（一覧を作る前の run の物）で止めると、組み直さないと出せない
+
+        手元で zip から作って上げて進む
+        """
         world.github.bill_follows_zip = False
         world.answers = ["y", "y"]
         assert world.main(tool) == 0
@@ -1615,7 +1618,7 @@ class TestBill:
         capsys: pytest.CaptureFixture[str],
         previous: bytes,
     ) -> None:
-        """前の一覧は参考に見せるだけ 形が崩れていても、公開の確認まで進める"""
+        """参考に見せるだけの前の一覧の崩れで落ちると、正しい版を公開できなくなる"""
         world.previous = previous
         world.answers = ["y", "y"]
         assert world.main(tool) == 0
@@ -1625,7 +1628,7 @@ class TestBill:
     def test_an_unreadable_previous_bill_does_not_stop(
         self, tool: ModuleType, world: World, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """初めて一覧を添付する版では前の一覧が無い 比べられないことを出して進む"""
+        """初めて一覧を添付する版では前の一覧が無い ここで止めると 0.2.7 を出せない"""
         world.answers = ["y", "y"]
         assert world.main(tool) == 0
         assert "前に公開した版の部品の一覧を読めず" in capsys.readouterr().out

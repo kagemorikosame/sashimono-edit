@@ -591,7 +591,7 @@ def test_the_bill_is_made_from_the_built_zip_and_shipped_with_it() -> None:
 
 
 def test_a_bill_for_another_zip_is_not_uploaded() -> None:
-    """一覧の頭に書いた zip の SHA-256 が組み立てた zip と違えば、どちらも上げずに止める"""
+    """別の zip の一覧を一緒に上げると、配った物と違う部品の一覧を公開する"""
     publish = _jobs(RELEASE)["publish"]
     upload = publish.index("gh release upload")
     check = publish.index(".metadata.component.hashes")

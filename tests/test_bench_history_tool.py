@@ -126,7 +126,7 @@ class TestStability:
         assert len(kept) == 4
 
     def test_two_runs_are_never_stable(self, tool: ModuleType) -> None:
-        """2 回の幅が狭いのは偶然かもしれない 判定に使わない"""
+        """2 回の幅が狭いのは偶然かもしれない 安定と見ると、たまたまの差で退行と言って止まる"""
         summary = tool.summarize("seek", {"runs": _runs([10.0, 10.0])})
         assert not summary.items["gop1"].stable
 
@@ -183,7 +183,7 @@ class TestCompare:
         assert any("機械が違う" in note for note in comparison.notes)
 
     def test_another_gpu_is_not_compared(self, tool: ModuleType) -> None:
-        """同じ CPU でも GPU が違えば合成の速さは比べられない"""
+        """GPU の違う記録と比べると、同じ CPU でも合成の速さの差を退行と取り違える"""
         base = _history("0.2.6", "2026-11-01", {"render": _runs([10.0] * 5, gpu="GPU A")})
         target = _history("0.2.7", "2026-11-24", {"render": _runs([20.0] * 5, gpu="GPU B")})
         comparison = tool.compare(base, target)
@@ -208,7 +208,9 @@ class TestCompare:
         assert any("飛ばした" in note and "GPU が無い" in note for note in comparison.notes)
 
     def test_a_failed_run_is_reported_apart_from_the_items(self, tool: ModuleType) -> None:
-        """落ちた回は理由と一緒に出す 残りの回で数えた項目は、回が減れば揺れの扱いになる"""
+        """落ちた回を黙ると、少ない回で数えた値を安定と信じて判定する 理由と一緒に出し、
+        回が減った項目は揺れの扱いにする
+        """
         base, _ = self._pair([10.0] * 5, [10.0] * 5)
         runs = _runs([10.0, 10.0])
         runs.append({"run": 3, "status": "failed", "reason": "終了コード 1 記録が無い"})
@@ -275,6 +277,28 @@ class TestCompare:
         assert "飛ばした（ffmpeg が無い）" in shown
         assert "素材を作れない" in shown
         assert "測れなかった回 1" in shown
+
+    def test_reasons_show_even_without_a_base(self, tool: ModuleType) -> None:
+        """前の記録に無い測りで理由を黙ると、compare だけを見る人には GPU が無くて飛ばしたのか
+        全部の回が落ちたのかが分からない
+        """
+        base = _history("0.2.6", "2026-11-01", {"seek": _runs([10.0] * 5)})
+        skipped = _record({}, status="skipped")
+        skipped["reason"] = "GPU が無い"
+        target = _history(
+            "0.2.7",
+            "2026-11-24",
+            {
+                "seek": _runs([10.0] * 5),
+                "render": [{"run": 1, **skipped}],
+                "timeline": [{"run": 1, "status": "failed", "reason": "素材を作れない"}],
+            },
+        )
+        shown = tool.report(tool.compare(base, target))
+        assert "GPU が無い" in shown
+        assert "素材を作れない" in shown
+        target["machine"] = {**target["machine"], "cpu": "別の CPU"}
+        assert "素材を作れない" in tool.report(tool.compare(base, target))
 
     def test_only_failures_exit_zero(
         self, tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -371,7 +395,7 @@ class TestRun:
     def test_a_record_counts_even_with_a_failing_exit_code(
         self, tool: ModuleType, tmp_path: Path
     ) -> None:
-        """合成の測りは予算を超えると 1 で終わる 測れているので、記録を信じる"""
+        """合成の測りは予算を超えると 1 で終わる 落ちた扱いにすると、遅くなった版ほど比べられない"""
 
         def over_budget(
             script: Path, arguments: Sequence[str], output: Path, timeout: float
@@ -387,7 +411,10 @@ class TestRun:
     def test_runs_take_turns_and_the_history_is_kept_and_compared(
         self, tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """回すたびに測りの順を巡らせ、版の名前で残し、同じ機械の前の記録と比べる"""
+        """1 本を続けて回すと、重かった時間にその測りの全部の回が入って、その測りだけ遅く見える
+
+        回すたびに順を巡らせ、版の名前で残し、同じ機械の前の記録と比べるかを見る
+        """
         order: list[str] = []
 
         def fake(
@@ -468,6 +495,19 @@ class TestRecord:
         with pytest.raises(ValueError, match="値が無い"):
             results.read_record(path)
 
+    @pytest.mark.parametrize("value", ["10" + "0" * 400, "NaN", "Infinity", "true"])
+    def test_a_value_that_is_not_a_finite_number_is_refused(
+        self, results: ModuleType, tmp_path: Path, value: str
+    ) -> None:
+        """桁あふれや NaN を通すと、数える所で落ちるか、中央と幅が NaN になって判定が黙って崩れる"""
+        text = json.dumps(_record({"gop1": 1.0})).replace('"median": 1.0', f'"median": {value}')
+        path = tmp_path / "数.json"
+        path.write_text(text, encoding="utf-8")
+        with pytest.raises(ValueError, match="数として読めない"):
+            results.read_record(path)
+        path.write_text(json.dumps(_record({"gop1": 1.5})), encoding="utf-8")
+        assert results.read_record(path)["items"][0]["median"] == 1.5
+
     def test_a_decode_error_is_not_a_measured_time(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -523,7 +563,7 @@ class TestRecord:
     def test_the_seek_bench_records_a_skip_without_ffmpeg(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """ffmpeg の無い機械では測らない 落ちたのではなく飛ばしたと書く"""
+        """ffmpeg の無い機械で落ちたと書くと、測りの失敗と見分けられず、毎回落ちたと報告する"""
         seek = _load("bench_seek")
         monkeypatch.setattr(seek.shutil, "which", lambda _name: None)
         path = tmp_path / "seek.json"

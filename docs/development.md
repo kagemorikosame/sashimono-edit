@@ -5221,9 +5221,13 @@ gh release upload <タグ> dist\sources\sources-SHA256SUMS.txt dist\sources\sour
   `build_package.NATIVE_LICENSES`（組み立ての確かめと同じ表）で 1 つずつ部品へ当て、当たらなければ止める
 - 記録の無い zip（0.2.6 までの zip）からは作らない 0.2.2 の組み立ての残り（TOC と組み立てたフォルダ）
   から記録を作って 0.2.2 の zip に足し、全部のファイルが記録で合って同じ 39 の部品が出ることを確かめた
-- Python の包みには purl、脆弱性の照合に使う名前が決まっている部品（Python・Qt・FFmpeg・zlib・
-  libwebp・libvpx・libiconv・dav1d・Opus）には CPE を書く Python は表の「3.14」ではなく、zip の
-  DLL から読んだ修正版まで書く 推測の CPE は書かない（照合で別の製品に当たる）
+- Python の包みには purl、脆弱性の照合に使う名前が決まっている部品（Python・OpenSSL・SQLite・Qt・
+  FFmpeg・zlib・libwebp・libvpx・libiconv・dav1d・Opus）には CPE を書く 推測の CPE は書かない
+  （照合で別の製品に当たる）
+- 表の「Python と同梱の OpenSSL・libffi など」の 1 行は、部品ごと（Python・OpenSSL・SQLite・libffi）に
+  分けて載せる 脆弱性は部品ごとの版で決まるため Python の版は python3XX.dll から（表は「3.14」まで
+  しか書かない）、ほかは各 DLL の版情報（ProductVersion）から読む 読めない部品（libffi）には版を
+  付けない 表に版の書けない部品（VC++ の実行時の部品など）も、DLL の版情報がそろっていればその版にする
 - DLL ごとの SHA-256 と、zip そのものの SHA-256（一覧の頭 `metadata.component`）も書く
 - 同じ zip からは同じ一覧ができる（時刻を入れない 通し番号は zip の SHA-256 から決める）
 

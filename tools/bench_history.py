@@ -420,29 +420,48 @@ def label_of(data: dict[str, Any]) -> str:
     return str(data.get("label") or data.get("version"))
 
 
+def state_notes(name: str, summary: BenchSummary) -> list[str]:
+    """今回の記録だけで分かる事（落ちた回・飛ばした回・項目ごとの測れなかった回と異常値）
+
+    比べられるかどうかに関わらず出す 比べない枝（機械や GPU が違う・前の記録に無い）で先に
+    抜けると、``compare`` だけを見る人には、なぜ測れなかったのかが見えない
+    """
+    notes = [f"{name}: 落ちた {failure}" for failure in summary.failures]
+    if summary.skipped:
+        notes.append(f"{name}: 飛ばした回がある（{summary.skipped}）")
+    for key, item in summary.items.items():
+        if item.failed_runs:
+            notes.append(f"{name}/{key}: 測れなかった回 {item.failed_runs}")
+        if item.outliers:
+            shown = "、".join(f"{value:.2f}" for value in item.outliers)
+            notes.append(f"{name}/{key}: 異常値として外した回 {shown} ms")
+    return notes
+
+
 def compare(base: dict[str, Any], target: dict[str, Any]) -> Comparison:
     """2 つの版の記録を比べる 機械・GPU・条件の違う測りは比べずに理由を残す"""
     result = Comparison(label_of(base), label_of(target))
+    current = {name: summarize(name, entry) for name, entry in target.get("benches", {}).items()}
+    for name, summary in sorted(current.items()):
+        result.notes += state_notes(name, summary)
     if not same_machine(base.get("machine"), target.get("machine")):
-        result.notes.append(
+        result.notes.insert(
+            0,
             "機械が違うので比べない（"
-            f"{machine_text(base.get('machine'))} → {machine_text(target.get('machine'))}）"
+            f"{machine_text(base.get('machine'))} → {machine_text(target.get('machine'))}）",
         )
         return result
-    names = sorted(set(base.get("benches", {})) | set(target.get("benches", {})))
+    names = sorted(set(base.get("benches", {})) | set(current))
     for name in names:
         before = base.get("benches", {}).get(name)
-        after = target.get("benches", {}).get(name)
-        if after is None:
+        now = current.get(name)
+        if now is None:
             result.notes.append(f"{name}: 今回は測っていない")
             continue
-        now = summarize(name, after)
         if before is None:
             result.notes.append(f"{name}: 前の記録に無い（今回から測った）")
             continue
         old = summarize(name, before)
-        for failure in now.failures:
-            result.notes.append(f"{name}: 落ちた {failure}")
         if now.skipped or old.skipped:
             reason = now.skipped or old.skipped
             result.notes.append(f"{name}: 飛ばした回があるので比べない（{reason}）")
@@ -467,12 +486,6 @@ def compare(base: dict[str, Any], target: dict[str, Any]) -> Comparison:
                 result.verdicts.append(Verdict(name, key, item.label, NEW, 0.0, item.center))
                 continue
             result.verdicts.append(judge(name, old.items[key], now.items[key]))
-        for key, item in now.items.items():
-            if item.failed_runs:
-                result.notes.append(f"{name}/{key}: 測れなかった回 {item.failed_runs}")
-            if item.outliers:
-                shown = "、".join(f"{value:.2f}" for value in item.outliers)
-                result.notes.append(f"{name}/{key}: 異常値として外した回 {shown} ms")
     return result
 
 

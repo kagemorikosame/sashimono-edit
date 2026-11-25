@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import statistics
@@ -175,6 +176,16 @@ def read_record(path: Path) -> dict[str, Any]:
     return data
 
 
+def finite(value: Any) -> bool:
+    """有限の数か（真偽値は数に数えない JSON の true が 1 として通るのを防ぐ）"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
 def check_run(data: Any, where: str) -> None:
     """1 回の走りの記録の形を見る 崩れていれば ``ValueError``
 
@@ -193,9 +204,13 @@ def check_run(data: Any, where: str) -> None:
     for item in data["items"]:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             raise ValueError(f"{where} に読めない項目がある")
-        if item.get("status") == OK and not (
-            isinstance(item.get("median"), (int, float))
-            and isinstance(item.get("samples"), list)
-            and item["samples"]
-        ):
+        if item.get("status") != OK:
+            continue
+        samples = item.get("samples")
+        if not isinstance(samples, list) or not samples:
             raise ValueError(f"{where} の {item['name']} に値が無い")
+        # 数として使える有限の値だけを受け取る 桁あふれ（10**400 など）や NaN を通すと、数える所で
+        # 落ちるか、中央や幅が NaN になり判定が黙って崩れる
+        for value in (item.get("median"), item.get("p95", item.get("median")), *samples):
+            if not finite(value):
+                raise ValueError(f"{where} の {item['name']} に数として読めない値がある")
