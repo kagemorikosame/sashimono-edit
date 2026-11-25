@@ -141,6 +141,7 @@ __all__ = [
     "AI_MINUTE_LIMITS",
     "AI_TOKEN_LIMITS",
     "AUTO_QUALITY_HEIGHT",
+    "CHOICE_PREFERENCES",
     "DETAIL_MIN_WIDTHS",
     "DOCK_TABS_BOTTOM",
     "DOCK_TABS_TOP",
@@ -1214,6 +1215,49 @@ def _limiter_depth(value: object, fallback: int) -> int:
         if type(value) is int and value == depth:
             return depth
     return fallback
+
+
+#: 文字の設定のうち、アプリが決めた選択肢の名前だけを持つ欄（:class:`PreferenceStore` が
+#: ``_choice`` で読む欄） 診断情報（#516）はこの欄の値だけを写し、ほかの文字の欄（置き場・
+#: 字幕の見た目の鍵・声の名前・URL）は「設定あり」にする 本人が名付けた物は形では見分けられない
+#: （PR #550 の指摘） ``_choice`` で読む欄を足したらここにも足す
+#: （``tests/test_diagnostic_report.py`` が ``_parse`` の中と照らす）
+CHOICE_PREFERENCES = frozenset(
+    {
+        "ai_effort",
+        "ai_limit_action",
+        "ai_model",
+        "ai_send_files",
+        "ai_send_frames",
+        "ai_send_text",
+        "ai_transcribe_model",
+        "direction_genre",
+        "direction_strength",
+        "dock_tabs",
+        "emphasis_easing",
+        "encoder_priority",
+        "export_format",
+        "insert_paste",
+        "keyframe_drag",
+        "library_backdrop",
+        "library_thumbnails",
+        "match_video",
+        "media_split",
+        "media_view",
+        "new_project_layers",
+        "ocr_engine",
+        "preview_fill",
+        "preview_margin",
+        "proxy_unused",
+        "reframe_follow",
+        "reframe_size",
+        "scene_analysis",
+        "screen_analysis",
+        "scripts_move",
+        "seam_video",
+        "theme",
+    }
+)
 
 
 class PreferenceStore:

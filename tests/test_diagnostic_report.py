@@ -34,7 +34,7 @@ from sashimono.ui.report_masking import (
     mask_places,
     mask_secrets,
 )
-from sashimono.ui.workspace import Preferences
+from sashimono.ui.workspace import CHOICE_PREFERENCES, Preferences, PreferenceStore
 
 #: 空白を含む利用者名 形で場所を拾う伏せ方は空白で切れるので、名前の後ろが残りやすい
 HOME = r"C:\Users\Kage Mori"
@@ -231,8 +231,47 @@ class TestPastRecords:
             "Current thread 0x00001a2b (most recent call first):",
             '  File "sashimono/engine/gpu/context.py", line 40 in make_current',
             "  <no Python frame>",
-            "Extension modules: numpy.core._multiarray_umath, PySide6.QtCore",
+            f"Extension modules: numpy.core._multiarray_umath, {TEXT_MARK} (total: 2)",
             TEXT_MARK,
+        ]
+
+    def test_ascii_text_after_a_fixed_line_is_not_copied(self) -> None:
+        # 壊れると、英字だけの本文が理由や部品の名前の形に当たって写る（PR #550 の指摘）
+        # 今の作品の名前の表は渡さない（前の起動の記録には表が無い）
+        record = (
+            "Fatal Python error: Segmentation fault Customer Alice\n"
+            "Windows fatal exception: access violation\n"
+            "Fatal Python error: Customer Alice wrote this\n"
+            '  File "Customer Alice notes", line 3 in run\n'
+            "Extension modules: numpy.core._multiarray_umath, PySide6.QtCore Customer Alice"
+            " (total: 2)\n"
+        )
+        masked = mask_fault_record(record, TEXT_MARK)
+        assert "Customer" not in masked and "Alice" not in masked
+        assert masked.splitlines() == [
+            f"Fatal Python error: Segmentation fault {TEXT_MARK}",
+            "Windows fatal exception: access violation",
+            f"Fatal Python error: {TEXT_MARK}",
+            '  File "?", line 3 in run',
+            f"Extension modules: numpy.core._multiarray_umath, {TEXT_MARK} (total: 2)",
+        ]
+
+    def test_ascii_text_shaped_like_a_type_or_a_head_is_not_copied(self) -> None:
+        # 壊れると、英字だけの本文の行が例外の種類や記録の頭の形に当たり、名前が写る
+        record = (
+            "=== 2026-11-24T10:00:00 版 0.2.7\n"
+            "CustomerError: x\n"
+            "=== 2026-11-24T10:00:00 版 CustomerA\n"
+            "ValueError: x\n"
+            "sashimono.core.io.serialize.ProjectFileError: x\n"
+        )
+        masked = mask_error_record(record, TEXT_MARK)
+        assert "Customer" not in masked
+        assert masked.splitlines() == [
+            "=== 2026-11-24T10:00:00 版 0.2.7",
+            TEXT_MARK,
+            f"ValueError: {TEXT_MARK}",
+            f"sashimono.core.io.serialize.ProjectFileError: {TEXT_MARK}",
         ]
 
     def test_a_secret_is_hidden_even_when_a_subtitle_matches_its_key(self) -> None:
@@ -311,18 +350,22 @@ class TestReport:
                 report_folder="",
                 theme="light",
                 new_project_style_guide=StyleGuide(notes="社外秘の方針 顧客 A 社向け"),
-                subtitle_look_last="社長の字幕",
+                subtitle_look_last="alias:CustomerA",
+                narration_voice_name="Alice",
             )
         )
-        lines = "\n".join(preference_lines(preferences))
-        for gone in ("山田", "社外秘", "顧客", "社長"):
+        lines = "\n".join(preference_lines(preferences, CHOICE_PREFERENCES))
+        for gone in ("山田", "社外秘", "顧客", "CustomerA", "Alice"):
             assert gone not in lines
         assert f"package_folder: {PATH_MARK}" in lines
         assert "report_folder: （空 既定）" in lines
         assert "theme: light" in lines
         # 方針は中身がある印だけ 本人が名付けた物は形が決まらないので「設定あり」
         assert "new_project_style_guide: （有り）" in lines
+        # 英数字だけの本人の名前（alias:CustomerA）も、選択肢の欄でなければ写さない
+        # （PR #550 の指摘）
         assert "subtitle_look_last: （設定あり）" in lines
+        assert "narration_voice_name: （設定あり）" in lines
         empty = "\n".join(preference_lines(asdict(Preferences())))
         assert "new_project_style_guide: （無し）" in empty
 
@@ -410,3 +453,23 @@ class TestGather:
         assert gathered.stalls.startswith("止まり 1 回 合計 120 ms")
         assert gathered.problems == ("画面の止まりの記録で形の違う行を 4 行飛ばした",)
         assert len(gathered.errors) == 1
+
+
+def test_the_choice_fields_are_the_ones_read_as_choices() -> None:
+    # 壊れると、選択肢で読む欄を足しても診断情報に値が出ないか、選択肢でない欄（本人の名前を
+    # 持つ欄）を一覧に足して値が写る 設定の読み手が ``_choice`` で読む欄と一覧を照らす
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(PreferenceStore._parse)))
+    read_as_choices = {
+        keyword.arg
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if isinstance(keyword.value, ast.Call)
+        and isinstance(keyword.value.func, ast.Name)
+        and keyword.value.func.id == "_choice"
+    }
+    assert read_as_choices == CHOICE_PREFERENCES

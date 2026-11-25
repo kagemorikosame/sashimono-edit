@@ -9,10 +9,12 @@ Qt を使わない 文面を組む所（試験を含む）が窓を作らずに�
 
 from __future__ import annotations
 
+import builtins
 import ctypes
 import ntpath
 import os
 import re
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -233,7 +235,7 @@ def mask_places(text: str, mark: str) -> str:
 _EXCEPTION_SUFFIXES = ("Error", "Exception", "Warning", "Interrupt", "Exit", "Iteration", "Group")
 
 _ERROR_HEAD = re.compile(
-    r"^=== (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) 版 ([0-9A-Za-z.+\-]+)"
+    r"^=== (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) 版 (\d+\.\d+[0-9A-Za-z.+\-]*)"
     r"(?: スレッド ([A-Za-z0-9_.\-]+))?"
 )
 _FIXED_ERROR_LINES = frozenset(
@@ -248,18 +250,40 @@ _FRAME = re.compile(r'^(\s*)File "([^"\n]*)", line (\d+)(?:,? in ([\w<>.]+))?')
 _EXCEPTION = re.compile(
     r"^(\s*)([A-Za-z_][A-Za-z0-9_.]*)(?:(:)(?: (\[(?:Errno|WinError) -?\d+\]))?(.*))?$", re.ASCII
 )
-_FATAL = re.compile(
-    r"^(Fatal Python error|Windows fatal exception): ([A-Za-z][A-Za-z ]{0,40})(.*)$"
+_FATAL = re.compile(r"^(Fatal Python error|Windows fatal exception): (.*)$")
+#: 致命的な例外の理由として写してよい物 faulthandler と Windows が決まった文で書く物だけ
+#: 英字の並びなら何でも通すと、後ろに続いた英字の本文（``Segmentation fault Customer Alice``）まで
+#: 理由として写る（PR #550 の指摘） 知らない理由は写さない
+_FATAL_REASONS = (
+    "Segmentation fault",
+    "Aborted",
+    "Floating point exception",
+    "Bus error",
+    "Illegal instruction",
+    "access violation",
+    "stack overflow",
+    "illegal instruction",
+    "in page error",
+    "int divide by zero",
+    "float divide by zero",
+    "privileged instruction",
 )
 _FAULT_CODE = re.compile(r"^Windows fatal exception: code (0x[0-9a-fA-F]+)$")
 _THREAD = re.compile(r"^(Current thread|Thread) (0x[0-9a-fA-F]+) \(most recent call first\):$")
 _FIXED_FAULT_LINES = re.compile(r"^\s*(?:<no Python frame>|Garbage-collecting)$")
-_MODULES = re.compile(r"^Extension modules: (.*)$")
-_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
+_MODULES = re.compile(r"^Extension modules: (.*?)(?: \(total: (\d+)\))?$")
+#: 部品の名前 1 つ（``numpy.core._multiarray_umath``） 項目ごとに全体で照らす 語を拾い出すと、
+#: 後ろに続いた英字の本文（``PySide6.QtCore Customer Alice``）の語まで部品の名前として写る
+_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+#: 並びの行の場所として写してよい物 Python のファイル（``x.py``）か、Python が決まった形で付ける
+#: 名前（``<frozen importlib._bootstrap>`` ``<string>``） 場所の欄に本文が入った行を写さない
+_FRAME_PLACE = re.compile(r"[^\"\n]*\.py[cdwo]?|<[\w .\-]{1,60}>")
 
 
 def _frame_line(found: re.Match[str], comma: bool) -> str:
     indent, place, number, function = found.groups()
+    if not _FRAME_PLACE.fullmatch(place):
+        place = "?"
     line = f'{indent}File "{place}", line {number}'
     if function:
         line += f"{',' if comma else ''} in {function}"
@@ -272,12 +296,26 @@ def _exception_line(line: str, mark: str) -> str | None:
     if found is None:
         return None
     indent, kind, colon, number, body = found.groups()
-    if not kind.rsplit(".", 1)[-1].endswith(_EXCEPTION_SUFFIXES):
+    if not kind.rsplit(".", 1)[-1].endswith(_EXCEPTION_SUFFIXES) or not _known_exception(kind):
         return None
     if not colon:
         return indent + kind
     rest = f" {number}" if number else ""
     return f"{indent}{kind}:{rest}" + (f" {mark}" if (body or "").strip() else "")
+
+
+def _known_exception(kind: str) -> bool:
+    """例外の種類の名前として写してよいか
+
+    Python は作り付けの例外を名前だけで、ほかを部品の名前を頭に付けて書く
+    （``sashimono.core.io.serialize.ProjectFileError`` ``av.error.InvalidDataError``）
+    作り付けの例外の名前か、頭が読み込んである部品の名前の物だけを写す 終わりの形
+    （``Error`` など）だけで見ると、英字だけの本文の行（``CustomerError: …``）が種類として写る
+    """
+    if "." not in kind:
+        found = getattr(builtins, kind, None)
+        return isinstance(found, type) and issubclass(found, BaseException)
+    return kind.split(".", 1)[0] in sys.modules
 
 
 def _hidden(lines: list[str], line: str, mark: str) -> None:
@@ -330,8 +368,19 @@ def mask_fault_record(text: str, mark: str) -> str:
             continue
         fatal = _FATAL.match(line)
         if fatal is not None:
-            name, reason, rest = fatal.groups()
-            lines.append(f"{name}: {reason.strip()}" + (f" {mark}" if rest.strip() else ""))
+            name, rest = fatal.groups()
+            known = next(
+                (
+                    reason
+                    for reason in _FATAL_REASONS
+                    if rest == reason or rest.startswith(reason + " ")
+                ),
+                None,
+            )
+            if known is None:
+                lines.append(f"{name}: {mark}")
+            else:
+                lines.append(f"{name}: {known}" + (f" {mark}" if rest != known else ""))
             continue
         thread = _THREAD.match(line)
         if thread is not None:
@@ -346,9 +395,16 @@ def mask_fault_record(text: str, mark: str) -> str:
             continue
         modules = _MODULES.match(line)
         if modules is not None:
-            # 部品の名前だけを並べ直す 名前の形でない物（数や括弧の中の続き）は写さない
-            names = [name for name in _MODULE_NAME.findall(modules.group(1)) if name != "total"]
-            lines.append("Extension modules: " + ", ".join(names))
+            # 項目ごとに部品の名前の形かを全体で照らし、違う項目は印にする 末尾の件数は数だけ写す
+            items = [item.strip() for item in modules.group(1).split(",")]
+            shown: list[str] = []
+            for item in items:
+                if _MODULE_NAME.fullmatch(item):
+                    shown.append(item)
+                elif not shown or shown[-1] != mark:
+                    shown.append(mark)
+            total = f" (total: {modules.group(2)})" if modules.group(2) else ""
+            lines.append("Extension modules: " + ", ".join(shown) + total)
             continue
         _hidden(lines, line, mark)
     return "\n".join(lines)

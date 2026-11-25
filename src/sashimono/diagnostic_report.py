@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import platform
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -149,11 +149,14 @@ def gather(log: FaultLog) -> Gathered:
     return Gathered(stalls, tuple(errors), tuple(lost), tuple(problems))
 
 
-def preference_lines(preferences: Mapping[str, Any]) -> list[str]:
+def preference_lines(
+    preferences: Mapping[str, Any], choices: Collection[str] = frozenset()
+) -> list[str]:
     """設定を 1 行 1 項目で 置き場の欄は値を伏せる（AI へ送る設定と同じ伏せ方）
 
     文字・数・真偽だけを載せる 並びや辞書（新しい作品の編集の方針など）は本人の文を含みうるので
-    有る無しだけにする
+    有る無しだけにする 文字の値を写すのは ``choices``（アプリが決めた選択肢の名前だけを持つ欄
+    ``ui.workspace.CHOICE_PREFERENCES``）の欄だけ ほかの文字の欄は「設定あり」にする
     """
     hidden = redact(dict(preferences), ())
     lines: list[str] = []
@@ -163,12 +166,12 @@ def preference_lines(preferences: Mapping[str, Any]) -> list[str]:
             lines.append(f"  {key}: {json.dumps(value)}")
         elif isinstance(value, str):
             # 空の置き場は「既定」 値を伏せた欄は印のまま（選んであることだけ分かる）
-            # 選択肢の名前（dark h264 など）の形だけを写す 本人が名付けた物（プリセットの名前・
-            # 声の名前・URL）は形が決まらないので「設定あり」にする
-            # （伏せる物を探さず、残す形を決める）
+            # 値を写すのは選択肢の欄だけ 形で見分けると、英数字だけで付けた本人の名前
+            # （字幕の見た目の ``alias:CustomerA``）が選択肢の形に当たって残る（PR #550 の指摘）
+            # 選択肢の欄でも形を確かめる（手で書き換えた設定は読み手が既定へ戻すが、念のため）
             if not value:
                 shown = "（空 既定）"
-            elif value == PATH_MARK or _CHOICE.fullmatch(value):
+            elif value == PATH_MARK or (key in choices and _CHOICE.fullmatch(value)):
                 shown = value
             else:
                 shown = "（設定あり）"
@@ -196,9 +199,10 @@ def build_report(
     preferences: Mapping[str, Any] | None,
     gathered: Gathered,
     *,
+    choices: Collection[str] = frozenset(),
     now: datetime | None = None,
 ) -> str:
-    """伏せる前の報告の全文"""
+    """伏せる前の報告の全文 ``choices`` は :func:`preference_lines` へ渡す"""
     made = (now or datetime.now()).isoformat(timespec="seconds")
     out = [
         "Sashimono Edit の診断情報",
@@ -212,7 +216,11 @@ def build_report(
     ]
     out.extend(f"画面: {screen}" for screen in env.screens)
     out += ["", "## 設定"]
-    out.extend(preference_lines(preferences) if preferences is not None else ["  （読めなかった）"])
+    out.extend(
+        preference_lines(preferences, choices)
+        if preferences is not None
+        else ["  （読めなかった）"]
+    )
     out += ["", "## 画面の止まりの記録"]
     out.append(
         gathered.stalls

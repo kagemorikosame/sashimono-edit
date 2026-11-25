@@ -4191,6 +4191,7 @@ class MainWindow(QMainWindow):
         from sashimono.ai.outbound import file_secrets, secret_pairs, text_secrets
         from sashimono.diagnostic_report import build_report, environment, gather, mask
         from sashimono.fault_log import installed
+        from sashimono.ui.workspace import CHOICE_PREFERENCES
 
         document = self._document
         projects = (document.project, *document.past_projects)
@@ -4211,7 +4212,10 @@ class MainWindow(QMainWindow):
             for screen in QApplication.screens()
         ]
         text = build_report(
-            environment(qVersion(), screens), asdict(self._preferences), gather(installed())
+            environment(qVersion(), screens),
+            asdict(self._preferences),
+            gather(installed()),
+            choices=CHOICE_PREFERENCES,
         )
         return mask(text, names=names, texts=texts)
 

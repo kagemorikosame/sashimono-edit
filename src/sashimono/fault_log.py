@@ -57,7 +57,9 @@ MAX_LOG_BYTES = 1024 * 1024
 KEEP_LOST = 5
 #: エラーの記録の 1 件の頭 ``=== 2026-11-24T12:00:00`` の前で切る
 #: 起動ごとの記録の頭の行（:meth:`FaultLog.install` が書く形）
-_SESSION_HEAD = re.compile(r"起動 (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) 版 ([0-9A-Za-z.+\-]+)")
+_SESSION_HEAD = re.compile(
+    r"起動 (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) 版 (\d+\.\d+[0-9A-Za-z.+\-]*)"
+)
 _ENTRY_HEAD = re.compile(r"^(?==== \d{4}-\d{2}-\d{2}T)", re.MULTILINE)
 
 
