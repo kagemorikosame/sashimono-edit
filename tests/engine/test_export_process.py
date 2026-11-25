@@ -86,6 +86,47 @@ def test_it_falls_back_to_this_process(
     assert target.stat().st_size > 0
 
 
+@pytest.mark.parametrize(
+    "failure", [WorkerCrashedError("落ちた"), None], ids=["crashed", "stopped"]
+)
+def test_nothing_is_left_beside_the_target(
+    project: Project,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception | None,
+) -> None:
+    """壊れると、子が落ちたか猶予を過ぎて止めたとき、書きかけの仮のファイルが書き出し先に残る
+
+    子は親が決めた仮のファイルへ直に書く（子の中でもう 1 つ作らない PR #547 の指摘）
+    """
+    target = tmp_path / "x.mp4"
+    target.write_bytes(b"before")
+    monkeypatch.setattr(job_module, "run_in_process", _fake_run(failure, write=b"half"))
+    with pytest.raises(ExportError):
+        export_anywhere(project, ExportSettings(path=target), separate_process=True)
+    assert target.read_bytes() == b"before"
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["x.mp4"]
+
+
+def test_a_cancel_after_the_child_finished_keeps_the_previous_file(
+    project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """壊れると、子が書き終えた後に押した中止を見ずに、前のファイルを置き換える"""
+    target = tmp_path / "x.mp4"
+    target.write_bytes(b"before")
+    done = ExportOutcome(path="", notes=())
+    monkeypatch.setattr(job_module, "run_in_process", _fake_run(done, write=b"after"))
+    with pytest.raises(ExportError, match="中止"):
+        export_anywhere(
+            project,
+            ExportSettings(path=target),
+            separate_process=True,
+            should_cancel=lambda: True,
+        )
+    assert target.read_bytes() == b"before"
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["x.mp4"]
+
+
 def test_an_export_error_in_the_child_reads_as_is(
     project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -238,7 +279,7 @@ def test_the_child_returns_a_failure_with_its_records(
     def fail(*_args: object, **_kwargs: object) -> Path:
         raise raised
 
-    monkeypatch.setattr(job_module, "export_project", fail)
+    monkeypatch.setattr(job_module, "write_export", fail)
     outcome = job_module.export_job(
         progress=lambda _value: None,
         should_cancel=lambda: False,
@@ -261,7 +302,7 @@ def test_the_child_returns_a_cancel_with_its_records(
     def cancelled(*_args: object, **_kwargs: object) -> Path:
         raise ExportError("書き出しを中止した")
 
-    monkeypatch.setattr(job_module, "export_project", cancelled)
+    monkeypatch.setattr(job_module, "write_export", cancelled)
     outcome = job_module.export_job(
         progress=lambda _value: None,
         should_cancel=lambda: True,
@@ -322,7 +363,7 @@ def test_the_child_applies_the_settings_before_drawing(
         seen.append((native.enabled(), plugin.scan_all()))
         return tmp_path / "x.mp4"
 
-    monkeypatch.setattr(job_module, "export_project", draw)
+    monkeypatch.setattr(job_module, "write_export", draw)
     job_module.export_job(
         progress=lambda _value: None,
         should_cancel=lambda: False,

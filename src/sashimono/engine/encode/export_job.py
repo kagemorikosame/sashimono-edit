@@ -18,7 +18,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +31,11 @@ from sashimono.engine.encode.exporter import (
     ExportError,
     ExportSettings,
     export_project,
+    place_export,
+    scratch_beside,
+    write_export,
 )
+from sashimono.engine.encode.formats import DEFAULT_FORMAT, format_named, format_of
 from sashimono.engine.encoders import (
     PRIORITY_CPU,
     ProbeMemory,
@@ -150,17 +153,22 @@ def export_job(
     runtime.apply()
     if probes is not None:
         remember(probes)
-    # GL を作れるかを先に確かめる 書き出しの途中で作れないと分かると、どこまで書いたかの
-    # 後片付けまで子の中で済ませてから親が頭からやり直すことになり、時間が倍かかる
-    from sashimono.engine.gpu import GLContextError, OffscreenGLContext
+    if not _audio_only(settings):
+        # GL を作れるかを先に確かめる 書き出しの途中で作れないと分かると、どこまで書いたかの
+        # 後片付けまで子の中で済ませてから親が頭からやり直すことになり、時間が倍かかる
+        # 音声だけの書き出し（#527）は GL を使わないので確かめない 作れない機械で
+        # スレッドへ戻ると、音だけの書き出しまで画面と同じプロセスで回すことになる
+        from sashimono.engine.gpu import GLContextError, OffscreenGLContext
 
-    try:
-        OffscreenGLContext().release()
-    except GLContextError as exc:
-        raise RuntimeError(f"{GL_UNAVAILABLE_MARK}: {exc}") from exc
+        try:
+            OffscreenGLContext().release()
+        except GLContextError as exc:
+            raise RuntimeError(f"{GL_UNAVAILABLE_MARK}: {exc}") from exc
     notes: list[str] = []
     try:
-        path = export_project(
+        # 親が決めた仮のファイルへ直に書く ここで export_project を使うと、子の中でもう 1 つ
+        # 仮のファイルを作り、子が落ちたときに親の知らない書きかけが残る（PR #547 の指摘）
+        path = write_export(
             project,
             settings,
             progress=progress,
@@ -179,6 +187,12 @@ def export_job(
     return ExportOutcome(path=str(path), notes=tuple(notes), records=global_report.records())
 
 
+def _audio_only(settings: ExportSettings) -> bool:
+    """音声だけの形式（#527）か 知らない拡張子は映像として扱い、書き出しの側に断らせる"""
+    chosen = format_of(settings.path)
+    return chosen is not None and chosen.audio_only
+
+
 def is_gl_unavailable(reason: str) -> bool:
     """子の失敗の文が「子で GL を作れない」か"""
     return GL_UNAVAILABLE_MARK in reason
@@ -188,19 +202,6 @@ def _discard(path: Path) -> None:
     """子の仮のファイルを消す 消せなくても元の失敗を隠さない"""
     with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
-
-
-def _scratch_for(target: Path) -> Path:
-    """子が書く仮のファイル 書き出し先と同じフォルダに、同じ拡張子で置く
-
-    子は書き出し先へ直には書かない 子が落ちた・取り消しの猶予を過ぎて止めたときは子の中の
-    後片付けが走らないので、直に書くと途中で切れた動画が利用者の選んだ場所に残る 親が
-    書き出し先を消せば、まだ書き始めてもいないのに前からあったファイルまで消える 仮の
-    ファイルに書かせて、終わったときだけ置き換える
-    同じフォルダに置くのは、置き換えをドライブを跨がない名前の付け替えで済ませるため
-    拡張子を残すのは、入れ物の形とチャプターを埋めるかを拡張子で決めているため
-    """
-    return target.with_name(f".{target.stem}.{uuid.uuid4().hex[:8]}.writing{target.suffix}")
 
 
 def export_anywhere(
@@ -228,16 +229,22 @@ def export_anywhere(
         # CPU を名指ししたときは GPU を確かめない 確かめの子を起こせない機械ではこの中で
         # GPU を開くことになり、CPU を選んだのに壊れた駆動でアプリごと落ちうる
         # 子の書き出しも CPU の名指しなら GPU を試さない（export_candidates）
+        # 音声だけの書き出し（#527）は映像のエンコーダを開かないので確かめない
+        # 自動の候補は形式で変わる（WebM は VP9） 書かない形式の候補を確かめても待つだけ
         named = settings.video_codec
-        if named and encoder_vendor(named) == PRIORITY_CPU:
+        chosen = format_of(settings.path) or format_named(DEFAULT_FORMAT)
+        if (named and encoder_vendor(named) == PRIORITY_CPU) or chosen.audio_only:
             probes = remembered()
         else:
-            names = list(exporter.VIDEO_CODEC_PREFERENCE)
+            names = list(exporter.automatic_codecs(chosen))
             if named:
                 names.append(named)
             probes = probe_and_remember(names)
         target = settings.path
-        scratch = _scratch_for(target)
+        # 子は書き出し先へ直には書かない 子が落ちた・取り消しの猶予を過ぎて止めたときは子の中の
+        # 後片付けが走らないので、直に書くと途中で切れた動画が利用者の選んだ場所に残る 親が
+        # 仮の名前を決めて子に書かせ、終わったときだけ置き換える 子が落ちても親が消せる
+        scratch = scratch_beside(target)
         try:
             outcome = run_in_process(
                 export_job,
@@ -280,12 +287,11 @@ def export_anywhere(
                 raise ExportError(outcome.error)
             try:
                 # run_in_process は子が終わるまで待ってから戻るので、子はもうファイルを掴んでいない
-                scratch.replace(target)
-            except OSError as exc:
+                # 付け替える直前の中止も見る（同じプロセスの書き出しと同じ place_export）
+                place_export(scratch, target, should_cancel)
+            except ExportError:
                 _discard(scratch)
-                raise ExportError(
-                    f"書き出したファイルを置き換えられない: {target} ({exc})"
-                ) from exc
+                raise
             if notice is not None:
                 for note in outcome.notes:
                     notice(note)

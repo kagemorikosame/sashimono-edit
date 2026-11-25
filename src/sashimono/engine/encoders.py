@@ -31,6 +31,7 @@ __all__ = [
     "PRIORITY_INTEL",
     "PROBE_BIT_RATE",
     "PROBE_TIMEOUT_S",
+    "VP9_OPTIONS",
     "MonotonicProgress",
     "ProbeMemory",
     "encoder_options",
@@ -82,6 +83,12 @@ AMF_QUALITY = "balanced"
 #: NVENC の VBR に近い振る舞いを狙う AMD の実機で確かめていない 外れたら直す（#365）
 AMF_PEAK_RATIO = (3, 2)
 
+#: VP9（libvpx-vp9 WebM #527）へ既定で渡す選択肢 省くと libvpx の既定（行を並べない）で、
+#: 1920x1080 を 1 コマ 78 ms かけて書く（2026-11-24 この開発機で 30 コマを書いて測った）
+#: cpu-used 4 と行の並列で 30 ms 大きさは 3% 増えるだけだった realtime と cpu-used 8 は
+#: 17 ms だが大きさが 1.6 倍になり、同じビットレートで画が粗くなるので選ばない
+VP9_OPTIONS = {"deadline": "good", "cpu-used": "4", "row-mt": "1"}
+
 
 class MonotonicProgress:
     """次の候補のエンコーダで書き直しても、進み具合を後ろへ戻さない
@@ -114,11 +121,13 @@ class MonotonicProgress:
 
 
 def encoder_options(name: str, bit_rate: int | None) -> dict[str, str]:
-    """``name`` のエンコーダへ既定で渡す選択肢 AMF のほかは空
+    """``name`` のエンコーダへ既定で渡す選択肢 AMF と VP9（:data:`VP9_OPTIONS`）のほかは空
 
     名前と値は FFmpeg の文書と amfenc_h264.c / amfenc_hevc.c の AVOption に合わせた
     ``maxrate`` は全エンコーダに共通の選択肢（``rc_max_rate``）で、AMF は peak bitrate として読む
     """
+    if name == "libvpx-vp9":
+        return dict(VP9_OPTIONS)
     if encoder_vendor(name) != PRIORITY_AMD:
         return {}
     options = {"quality": AMF_QUALITY}
