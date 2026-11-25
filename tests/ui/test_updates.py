@@ -390,6 +390,22 @@ class TestRestarting:
         assert ready.launched == []
         assert ready.store.load().ready_version == NEWER
 
+    def test_another_version_during_the_save_question_starts_nothing(self, ready: _Harness) -> None:
+        """保存の確認で迷っている間に、ほかの窓が別の版を落として置き場を差し替えた
+        照らさずに進むと、〔新しい版〕の窓で見て選んだ版とは違う版へ入れ替える
+        """
+        other = "9001.0.0"
+
+        def replaced_meanwhile() -> bool:
+            write_build_info(ready.layout.staged, other, "cp314")
+            ready.store.save(replace(ready.store.load(), ready_version=other))
+            return True
+
+        ready.controller._confirm_close = replaced_meanwhile
+        assert not ready.controller.restart_now(NEWER)
+        assert ready.launched == []
+        assert ready.informed and ready.informed[-1][0] == "入れ替えを止めました"
+
     def test_a_cancelled_rollback_is_not_remembered(
         self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -568,6 +584,26 @@ class TestWaitingForTheParts:
         assert waiting.resume_asked == 0
         assert waiting.launched == []
         assert not waiting.controller.waiting
+
+    def test_another_version_while_asking_starts_nothing(
+        self, waiting: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """尋ねて答えを待つ間に、ほかの窓が別の版を落として置き場を差し替えた
+        照らさずに進むと、本人が〔今すぐ再起動する〕と答えた版ではない版へ入れ替える
+        """
+        other = "9001.0.0"
+
+        def replaced_meanwhile(_mode: str) -> bool:
+            write_build_info(waiting.layout.staged, other, "cp314")
+            waiting.store.save(replace(waiting.store.load(), ready_version=other))
+            return True
+
+        monkeypatch.setattr(waiting.controller, "_ask_resume", replaced_meanwhile)
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.launched == []
+        assert not waiting.controller.waiting
+        assert waiting.informed and waiting.informed[-1][0] == "入れ替えを止めました"
 
     def test_an_open_window_puts_it_off(
         self, waiting: _Harness, monkeypatch: pytest.MonkeyPatch

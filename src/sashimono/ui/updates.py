@@ -670,7 +670,7 @@ class UpdateController(QObject):
         self._stop_waiting()
         answer = self._choose("新しい版", "<br>".join(lines))
         if answer == ANSWER_NOW:
-            self.restart_now()
+            self.restart_now(version)
         elif answer == ANSWER_NEXT_START:
             # 本人が選んだ予約 後で〔入れる前に尋ねる〕を入れても外さない（もう答えてある）
             self._store.save(replace(self._store.load(), apply_on_start=True, apply_chosen=True))
@@ -689,11 +689,16 @@ class UpdateController(QObject):
             settle(layout=self._layout, store=self._store, results=())
             self._refresh_button()
 
-    def restart_now(self) -> bool:
-        """今すぐ入れる 編集の途中で止めてはいけない作業が動いていれば断る"""
-        if self._layout is None or self.ready_version() is None:
+    def restart_now(self, version: str | None = None) -> bool:
+        """今すぐ入れる 編集の途中で止めてはいけない作業が動いていれば断る
+
+        ``version`` は本人に見せて選ばれた版 省けば今待っている版 入れ替え係を起こす直前に
+        照らし、違う版へ変わっていれば止める
+        """
+        ready = self.ready_version()
+        if self._layout is None or ready is None:
             return False
-        return self._restart("apply")
+        return self._restart("apply", version if version is not None else ready)
 
     def roll_back(self) -> bool:
         """ヘルプの〔前の版に戻す…〕"""
@@ -715,7 +720,7 @@ class UpdateController(QObject):
         )
         if answer != ANSWER_NOW:
             return False
-        return self._restart("rollback")
+        return self._restart("rollback", info.version if info is not None else "")
 
     def resume_waiting(self) -> None:
         """裏の作業（AI の部品の自動更新）が終わった 待っていた入れ替えへ進む
@@ -749,33 +754,31 @@ class UpdateController(QObject):
             return
         if self._preferences().update_confirm and not self._ask_resume(mode):
             return
-        self._restart(mode)
+        # 尋ねている間にも版は変わりうる 照らすのは _restart が入れ替え係を起こす直前に行う
+        self._restart(mode, version)
 
-    def _target_version(self, mode: str) -> str:
-        """入れ替える先の版 待つ間に変わっていないかを見るために覚える"""
+    def _still_there(self, mode: str, version: str) -> bool:
+        """本人が選んだ入れ替え先の版が、まだ置き場にあるか
+
+        戻す先は build info が読めない古い版もあるので、そのときは空の版どうしで照らす
+        """
         if mode == "apply":
-            return self.ready_version() or ""
+            return bool(version) and self.ready_version() == version
         if self._layout is None or not self._layout.has_previous():
-            return ""
+            return False
         from sashimono.update.package import read_build_info
 
         info = read_build_info(self._layout.previous)
-        return info.version if info is not None else ""
+        return (info.version if info is not None else "") == version
 
-    def _still_there(self, mode: str, version: str) -> bool:
-        if mode == "apply":
-            return bool(version) and self.ready_version() == version
-        return (
-            self._layout is not None
-            and self._layout.has_previous()
-            and self._target_version(mode) == version
-        )
-
-    def _restart(self, mode: str) -> bool:
+    def _restart(self, mode: str, version: str) -> bool:
         """保存の確認が済んでから入れ替え係を起こし、窓を閉じて終わる
 
         入れ替え係を先に起こすと、保存の確認で取り消したり迷って待ちの 120 秒を過ぎたりしたとき、
         入れ替え係が待つのを諦めて今の版を起こし、本体が 2 つ動く 確認で取り消されたら起こさない
+
+        ``version`` は本人が選んだ入れ替え先の版 確認の窓で迷っている間に、ほかの窓が別の版を
+        落として置き場を差し替えることがある 起こす直前に照らし、違えば止める
         """
         assert self._layout is not None
         # 新しい頼みを見る前に、前に待っていた分をやめる 残すと、この頼みを断った後に前の頼み
@@ -796,7 +799,7 @@ class UpdateController(QObject):
             )
             return False
         if waits:
-            self._wait_for(mode, waits)
+            self._wait_for(mode, version, waits)
             return False
         if self._busy_elsewhere():
             return False
@@ -804,6 +807,16 @@ class UpdateController(QObject):
             return False
         # 確認で迷っている間に、ほかの窓が入れ替えを始めたかもしれない もう一度見る
         if self._busy_elsewhere():
+            return False
+        if not self._still_there(mode, version):
+            # 確認の間に置き場が別の版へ変わった（ほかの窓が落とし終えた・ベータを切った）
+            # このまま進むと、本人が選んでいない版へ入れ替える 止めて選び直してもらう
+            self._refresh_button()
+            again = "〔新しい版を入れる…〕" if mode == "apply" else "〔ヘルプ〕→〔前の版に戻す…〕"
+            self._inform(
+                "入れ替えを止めました",
+                f"選んでいる間に、入れ替える版が変わりました {again}からもう一度選んでください",
+            )
             return False
         # 写すのはこの場で行う（裏へ出さない） 保存の確認はもう済んでいて、裏へ出すと写している
         # 間に編集でき、閉じるときにその変更を尋ねずに捨てる 入れ替え係が始まるのを待つのと同じく、
@@ -851,13 +864,13 @@ class UpdateController(QObject):
         clear_swap_pending(userdirs.config_root(), token)
         return False
 
-    def _wait_for(self, mode: str, waits: list[str]) -> None:
+    def _wait_for(self, mode: str, version: str, waits: list[str]) -> None:
         """裏の作業の終わりを待ってから入れ替える 待っていることを、窓を塞がずに知らせる
 
         断ってもう一度選ばせると、本人は何も頼んでいないのに何を待てばよいか分からない（#528）
         ステータスバーにも残し、待っている間に見返せるようにする
         """
-        self._waiting = (mode, self._target_version(mode))
+        self._waiting = (mode, version)
         target = "新しい版へ入れ替え" if mode == "apply" else "前の版へ戻し"
         # 待った後にもう一度尋ねる設定なら、そう言っておく 「入れ替えます」とだけ言って尋ねると
         # 言ったことと違い、尋ねずに入れ替えると言わずに画面が消える
