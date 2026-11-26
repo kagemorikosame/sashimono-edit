@@ -72,6 +72,8 @@ NOT_FOR_THE_CHILD = frozenset(
         "responsive_switch",
         "gc_manual",
         "stall_watch",
+        # 診断情報（#516）を保存する窓の初めの場所 画面で作る物で、子は作らない
+        "report_folder",
         # 画面の見た目と操作の癖
         "pool_progress",
         "hdr_notice",
@@ -100,6 +102,8 @@ NOT_FOR_THE_CHILD = frozenset(
         "playhead_snap_work_area",
         "playhead_snap_markers",
         "theme",
+        # 起動画面（#526）の動き 子は起動画面を出さない
+        "splash_motion",
         # 作品を開くときに素材を探す順 子は場所を決め終えた作品をそのまま受け取る
         "media_relative_first",
         # 素材を読み込むときと既定を覚えるときに見る（#524） 子は置き終えた作品を受け取る
@@ -231,6 +235,8 @@ MODULE_GLOBALS = {
     ("core/io/recovery.py", "_last_stamp"): "要らない",
     # 自己診断が作る Qt のアプリ 子は自分で作る
     ("selfcheck.py", "_application"): "要らない",
+    # 落ちた起動とエラーの記録の係（#516） 編集画面の起動だけが掛ける 子は掛けない
+    ("fault_log.py", "_installed"): "要らない",
 }
 
 

@@ -40,6 +40,7 @@ __all__ = [
     "LOG_NAME",
     "StallWatch",
     "default_log_path",
+    "program_place",
     "threshold_from_env",
 ]
 
@@ -100,6 +101,11 @@ class _Stall:
     samples: list[dict[str, Any]] = field(default_factory=list)
 
 
+#: 本体の置き場（このファイルのある ``sashimono`` のフォルダ） 比べやすいよう大文字小文字と区切りを
+#: そろえておく 読み込むときに 1 度だけ求める
+_PACKAGE_ROOT = os.path.normcase(str(Path(__file__).absolute().parent))
+
+
 def _where(filename: str) -> str:
     """呼び出しの並びに書くファイルの名前 本体の物は ``sashimono/ui/inspector/panel.py`` のように
     置き場ごと
@@ -108,12 +114,28 @@ def _where(filename: str) -> str:
     ファイルが見分けられず、記録を数える道具（``tools/stall_report.py``）が原因を取り違える
     頭に ``sashimono/`` を付けるのは、本体の頭の ``app.py`` を標準の同じ名前の物と分けるため
     外の部品（Qt や標準の物）は名前だけ 置き場まで書くと、本人の名前の入ったパスが残る
+
+    本体かどうかは、途中に ``sashimono`` という名前のフォルダがあるかでは決めない 本人の
+    フォルダの名前が ``sashimono`` だと、外の部品の場所までそこから下が残る（PR #550 の指摘）
+    本当の本体の置き場（:data:`_PACKAGE_ROOT`）の下か、配布版が書く相対の場所（``sashimono\\ui\\x.py``
+    利用者のフォルダを含まない）だけを本体と見る 文字だけで比べる（ファイルを見に行くと GIL を
+    手放し、写している最中の並びが壊れる :func:`_frame_lines` を参照）
     """
-    parts = Path(filename).parts
-    if "sashimono" in parts[:-1]:
-        last = len(parts) - 1 - parts[-2::-1].index("sashimono") - 1
-        return "/".join(parts[last:])
-    return Path(filename).name
+    path = Path(filename)
+    if not path.is_absolute():
+        parts = path.parts
+        if len(parts) > 1 and parts[0] == "sashimono":
+            return "/".join(parts)
+        return path.name
+    folded = os.path.normcase(filename)
+    if folded.startswith(_PACKAGE_ROOT + os.sep):
+        return "/".join(("sashimono", *Path(filename[len(_PACKAGE_ROOT) + 1 :]).parts))
+    return path.name
+
+
+#: 並びに書く場所の削り方 診断情報（#516）がエラーの並びにも同じ削り方を使う 別に書くと、
+#: 止まりの記録とエラーで同じファイルが違う名前で出て、突き合わせられない
+program_place = _where
 
 
 def _frame_lines(frame: FrameType | None) -> list[str]:
@@ -275,9 +297,11 @@ class StallWatch:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.exists() and self.path.stat().st_size > MAX_LOG_BYTES:
                 self.path.replace(self.path.with_suffix(self.path.suffix + ".1"))
-            with self.path.open("a", encoding="utf-8") as stream:
+            # 対になっていない文字（スレッドの名前など）は ``\\udcxx`` の形で書く 書けずに上がると、
+            # 見張りのスレッドごと止まり、その後の止まりを記録しない（#516 の記録の係と同じ扱い）
+            with self.path.open("a", encoding="utf-8", errors="backslashreplace") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError:
+        except (OSError, ValueError):
             # 書けない置き場（容量が尽きた・読み取り専用）でも編集は止めない 診断のために
             # 本人の作業を落とすのは本末転倒
             return
