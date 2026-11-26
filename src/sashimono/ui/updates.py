@@ -31,6 +31,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QPushButto
 
 from sashimono import __version__
 from sashimono.core import userdirs
+from sashimono.core.io.locks import try_hold
 from sashimono.links import RELEASES_URL
 from sashimono.runtime import FeaturePack, python_abi, runtime_target_dir
 from sashimono.ui.workspace import SCRIPTS_MOVE_ASK, SCRIPTS_MOVE_OFF, Preferences
@@ -58,7 +59,7 @@ from sashimono.update.portable import (
 )
 from sashimono.update.reinstall import describe, estimate
 from sashimono.update.signing import trusted_keys
-from sashimono.update.state import UpdateStateStore, busy_with
+from sashimono.update.state import STAGE_LOCK, UpdateStateStore, busy_with, lock_path
 from sashimono.update.swap import Launched, SwapPlan, launch, wait_started
 
 __all__ = ["STARTUP_DELAY_MS", "UpdateController"]
@@ -176,7 +177,7 @@ class UpdateController(QObject):
         self.button = QPushButton(window)
         self.button.setFlat(True)
         self.button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.button.clicked.connect(self.offer)
+        self.button.clicked.connect(self._on_button)
         self.button.hide()
 
     # --- 状態 ---
@@ -808,6 +809,21 @@ class UpdateController(QObject):
         # 確認で迷っている間に、ほかの窓が入れ替えを始めたかもしれない もう一度見る
         if self._busy_elsewhere():
             return False
+        # 版を照らしてから入れ替え係が走り出すまで、落とす側の錠を押さえる 押さえないと、
+        # 照らした直後にほかの窓が別の版を落として置き場を差し替え、本人が選んでいない版へ
+        # 入れ替わる 入れ替え係が走り出せば、入れ替え係の錠を見て落とす側が止まる（prepare）
+        stage_lock = try_hold(lock_path(STAGE_LOCK, self._store.path.parent))
+        if stage_lock is None:
+            self._inform_staging_elsewhere()
+            return False
+        try:
+            return self._hand_over(mode, version)
+        finally:
+            stage_lock.release()
+
+    def _hand_over(self, mode: str, version: str) -> bool:
+        """選んだ版を照らし、本人の物を写して入れ替え係へ渡す 落とす側の錠を押さえて呼ぶ"""
+        assert self._layout is not None
         if not self._still_there(mode, version):
             # 確認の間に置き場が別の版へ変わった（ほかの窓が落とし終えた・ベータを切った）
             # このまま進むと、本人が選んでいない版へ入れ替える 止めて選び直してもらう
@@ -881,6 +897,7 @@ class UpdateController(QObject):
         )
         self._notify("終わったら入れ替えます", "\n".join([*waits, then]))
         self._say(" ".join([*waits, then]), 0)
+        self._refresh_button()
 
     def _stop_waiting(self) -> None:
         self._resume_timer.stop()
@@ -888,6 +905,7 @@ class UpdateController(QObject):
             return
         self._waiting = None
         self._window.statusBar().clearMessage()
+        self._refresh_button()
 
     def _launch_swap(self, mode: str) -> bool:
         """入れ替え係を起こし、走り出したら窓を閉じて終わる 起こせなければ知らせて偽"""
@@ -935,13 +953,15 @@ class UpdateController(QObject):
             self._inform_other_swap()
             return True
         if busy == "stage":
-            self._inform(
-                "今は入れられません",
-                "ほかの Sashimono の窓が新しい版を落としています"
-                " 終わってからもう一度選んでください",
-            )
+            self._inform_staging_elsewhere()
             return True
         return False
+
+    def _inform_staging_elsewhere(self) -> None:
+        self._inform(
+            "今は入れられません",
+            "ほかの Sashimono の窓が新しい版を落としています 終わってからもう一度選んでください",
+        )
 
     def _inform_other_swap(self) -> None:
         self._inform(
@@ -953,12 +973,30 @@ class UpdateController(QObject):
     # --- 見せ方 ---
 
     def _refresh_button(self) -> None:
+        """入れ替えを待つ版があるか、部品の更新の終わりを待っている間だけ出す
+
+        待っている間も出しておくのは、ステータスバーの一時の文言はほかの知らせ（素材の控えが
+        できた など）に上書きされ、消えた後は待っていることを見返せないため
+        """
+        waiting = self._waiting
         version = self.ready_version()
+        if waiting is not None:
+            target = f"新しい版 {version}" if waiting[0] == "apply" else "前の版"
+            self.button.setText(f"{target}へ入れ替えるのを待っています（AI の部品の更新中）…")
+            self.button.show()
+            return
         if version is None:
             self.button.hide()
             return
         self.button.setText(f"新しい版 {version} を入れる…")
         self.button.show()
+
+    def _on_button(self) -> None:
+        """待っている間に押されたら、待っている頼みを尋ね直す（やめるならそこで選べる）"""
+        if self._waiting is not None and self._waiting[0] == "rollback":
+            self.roll_back()
+            return
+        self.offer()
 
     def _say(self, text: str, timeout: int) -> None:
         self._window.statusBar().showMessage(text, timeout)

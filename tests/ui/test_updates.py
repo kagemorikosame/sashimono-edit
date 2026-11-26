@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 
 from sashimono import __version__
 from sashimono.core.io import load_project, save_project
-from sashimono.core.io.locks import try_hold
+from sashimono.core.io.locks import is_held, try_hold
 from sashimono.core.io.serialize import FORMAT_VERSION, PRE_UPGRADE_SUFFIX
 from sashimono.core.model import Project
 from sashimono.ui import updates as updates_module
@@ -406,6 +406,33 @@ class TestRestarting:
         assert ready.launched == []
         assert ready.informed and ready.informed[-1][0] == "入れ替えを止めました"
 
+    def test_no_other_window_can_stage_while_handing_over(
+        self, ready: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """版を照らしてから入れ替え係が走り出すまで、落とす側の錠を押さえる
+        押さえないと、照らした直後にほかの窓が別の版を落とし、選んでいない版へ入れ替わる
+        """
+        monkeypatch.setattr(QApplication, "quit", lambda: None)
+        stage_lock = lock_path(STAGE_LOCK, ready.store.path.parent)
+        held_while_launching: list[bool] = []
+        launch = ready.controller._launcher
+
+        def watching(plan: SwapPlan) -> Launched:
+            held_while_launching.append(is_held(stage_lock))
+            return launch(plan)
+
+        ready.controller._launcher = watching
+        assert ready.controller.restart_now()
+        assert held_while_launching == [True]
+        # 走り出した後は入れ替え係の錠が守る 持ったままだと、窓が閉じるまで落とす側が止まる
+        assert not is_held(stage_lock)
+
+    def test_the_stage_lock_is_let_go_when_the_helper_fails(self, ready: _Harness) -> None:
+        # 起こせずに今の版のまま続けるのに錠を持ち続けると、この窓を閉じるまで新しい版を落とせない
+        ready.controller._waiter = lambda _launched: False
+        assert not ready.controller.restart_now()
+        assert not is_held(lock_path(STAGE_LOCK, ready.store.path.parent))
+
     def test_a_cancelled_rollback_is_not_remembered(
         self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -499,6 +526,16 @@ class TestWaitingForTheParts:
         assert waiting.launched == []
         assert waiting.notified and PARTS in waiting.notified[0][1]
         assert "終わったら" in waiting.window.statusBar().currentMessage()
+
+    def test_the_button_keeps_showing_the_wait(self, waiting: _Harness) -> None:
+        """ステータスバーの文言はほかの知らせに上書きされる 消えた後も待っていると見返せるよう、
+        右端のボタンにも出しておき、待つのをやめたら元へ戻す
+        """
+        waiting.window.statusBar().showMessage("素材の控えができました", 10)
+        assert not waiting.controller.button.isHidden()
+        assert "待っています" in waiting.controller.button.text()
+        waiting.controller._stop_waiting()
+        assert waiting.controller.button.text() == f"新しい版 {NEWER} を入れる…"
 
     def test_it_asks_once_more_then_goes_on(self, waiting: _Harness) -> None:
         """入れる前に尋ねる設定（既定）では、待った後にもう一度尋ねてから入れ替える
