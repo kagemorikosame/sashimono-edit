@@ -1032,7 +1032,9 @@ class MainWindow(QMainWindow):
             confirm_close=self._confirm_discard,
             close_window=self._close_for_update,
             rescan_scripts=self.rescan_scripts,
+            waits=self.update_waits,
         )
+        self._chat.parts_settled.connect(self._updates.resume_waiting)
         self.statusBar().addPermanentWidget(self._updates.button)
 
     def _dock(self, title: str, name: str) -> QDockWidget:
@@ -4425,10 +4427,21 @@ class MainWindow(QMainWindow):
         self._updates.start()
 
     def update_blockers(self) -> list[str]:
-        """更新のために再起動してはいけない作業 書き出しは窓を占めるので、ここまで来ない"""
+        """更新のために再起動してはいけない作業"""
+        # エクスプローラーの下見の再生と、測る・見本を作る裏の仕事は入れない どれも読むだけで、
+        # 閉じるときに止めて捨て、測った分は書き残す（closeEvent） 途中で切れても次の起動で
+        # 測り直すだけで、本人の作った物は失わない 入れると、下見を鳴らしているだけで断られる
         found = []
-        if self._chat.working:
-            found.append("AI アシスタントが作業しています（環境の導入を含む）")
+        person_export = self._person_export
+        if person_export is not None and person_export.export_progress is not None:
+            # 書き出しの窓は手を塞ぐので、本人が選んでここへ来ることはない ただ部品の更新を
+            # 待っていた入れ替えは、窓の exec の中で終わりの知らせを受けて進みうる（#528）
+            # 通すと、走っている書き出しを残したまま窓を閉じ、書き出しが途中で切れる
+            found.append("動画を書き出しています")
+        if self._chat.responding:
+            found.append("AI アシスタントが作業しています")
+        if self._chat.setting_up:
+            found.append("AI 連携の環境を入れています")
         if self._subtitles.transcribing:
             found.append("字幕を起こしています")
         if self._assistant_export.running:
@@ -4440,6 +4453,17 @@ class MainWindow(QMainWindow):
             # 人の窓〔ナレーションを作る…〕で声を作っている途中（#335） 再起動すると作った声を捨てる
             found.append("ナレーションの声を作っています")
         return found
+
+    def update_waits(self) -> list[str]:
+        """更新のための再起動を、断らずに終わりを待ってから進めてよい作業（#528）
+
+        AI の部品の自動更新は本人が頼んだ物ではなく、裏で数十秒で終わる 断ると、何も
+        していないつもりの人に何を待てばよいか分からない窓を出す 終わると
+        ``ChatPanel.parts_settled`` が出て、入れ替えの続きへ進む
+        """
+        if self._chat.updating_parts:
+            return ["AI の部品を裏で新しくしています（数十秒で終わります）"]
+        return []
 
     def _close_for_update(self) -> bool:
         """更新のために閉じる 保存の確認は入れ替え係を起こす前に済ませてあるので尋ねない

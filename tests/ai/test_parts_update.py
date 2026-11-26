@@ -789,6 +789,55 @@ class TestPanelAutomatic:
         assert "AI の部品（" in _text(widget)
 
 
+class TestWhatTheAssistantIsDoing:
+    """アプリの更新を断るときに理由を言い分けるため、AI の側の作業を分けて見せる（#528）"""
+
+    def test_the_automatic_update_alone_is_not_a_conversation(
+        self, automatic: tuple[ChatPanel, PartsUpdater, _Installer]
+    ) -> None:
+        # 会話と見分けられないと、何も頼んでいない人に「AI アシスタントが作業しています」と出て
+        # 何を待てばよいか分からないまま、アプリの更新を断られる
+        widget, updater, _ = automatic
+        settled: list[bool] = []
+        widget.parts_settled.connect(lambda: settled.append(widget.responding))
+        updater._check(asked=False)
+        _settle(updater)
+        widget._poll()
+        assert (widget.updating_parts, widget.responding, widget.setting_up) == (True, False, False)
+        _settle(updater)
+        assert widget.updating_parts is False
+        assert settled == [False]
+
+    def test_the_end_is_told_after_held_prompts_go_out(
+        self, automatic: tuple[ChatPanel, PartsUpdater, _Installer]
+    ) -> None:
+        # 持っておいた指示を渡す前に知らせると、待っていたアプリの入れ替えが会話の始まる
+        # 直前に窓を閉じ、頼んだ指示が応えられないまま消える
+        widget, updater, _ = automatic
+        settled: list[bool] = []
+        widget.parts_settled.connect(lambda: settled.append(widget.responding))
+        updater._check(asked=False)
+        _settle(updater)
+        widget._poll()
+        _send(widget, "切って")
+        _settle(updater)
+        assert settled == [True]
+
+    def test_a_failed_update_is_told_too(
+        self, automatic: tuple[ChatPanel, PartsUpdater, _Installer]
+    ) -> None:
+        # 失敗を知らせないと、部品の更新を待っているアプリの入れ替えがいつまでも進まない
+        widget, updater, installer = automatic
+        installer.result = False
+        settled: list[bool] = []
+        widget.parts_settled.connect(lambda: settled.append(True))
+        updater._check(asked=False)
+        _settle(updater)
+        widget._poll()
+        _settle(updater)
+        assert settled == [True]
+
+
 class TestPreference:
     def test_it_is_on_by_default_and_kept(
         self, tmp_path: Path, qt_application: QApplication

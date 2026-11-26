@@ -277,6 +277,10 @@ class ChatPanel(QWidget):
     #: 送ってよいかの窓で「送る（次からは尋ねない）」と答えた 引数は送る物（:class:`Outbound` の値）
     #: 設定に覚えるのは受け取る側（設定の置き場を 1 か所にするため）
     send_allowed = Signal(str)
+    #: 部品の自動の入れ替えが終わった（失敗も含む） 部品の更新を待っていたアプリの入れ替えを
+    #: 進めるのに使う 持っておいた指示を会話へ渡した後に出すので、受け取る側が見る
+    #: :attr:`responding` には、入れ替えの後に始まった会話が入っている
+    parts_settled = Signal()
 
     def __init__(
         self,
@@ -386,6 +390,8 @@ class ChatPanel(QWidget):
         self._updater = updater if updater is not None else PartsUpdater(AI_PACK, self)
         self._updater.prepare = self._release_session
         self._updater.finished.connect(self._on_parts_updated)
+        # 後に繋ぐ Qt は繋いだ順に呼ぶので、_on_parts_updated が指示を渡し終えてから知らせが出る
+        self._updater.finished.connect(lambda *_: self.parts_settled.emit())
         #: AI 連携の環境が使えるか（:meth:`_refresh_availability` で覚える） 計画の欄は見張りの
         #: 時計（80 ミリ秒）ごとに合わせるので、そのたびに部品の版・PATH・ファイルを調べ直さない
         self._ready = False
@@ -1245,20 +1251,29 @@ class ChatPanel(QWidget):
                 self._stopping = True
                 self._refresh_status()
 
-    @property
-    def working(self) -> bool:
-        """指示に応えている最中か、AI 連携の環境を入れている最中か
+    # AI の側の作業は 3 つに分けて見せる 更新のための再起動を断るときに、どれが理由かで
+    # 言い方と待ち方を変える（1 つの真偽にまとめると、本人が何も頼んでいない部品の自動更新でも
+    # 「AI アシスタントが作業しています」と出て、何を待てばよいか分からない #528）
 
-        更新のための再起動を断るのに使う 送った直後（Claude Code の起動と接続の数秒）は
-        ``session.busy`` が立っていないので、残っている指示も見る
+    @property
+    def responding(self) -> bool:
+        """本人が頼んだ指示に応えている最中か
+
+        送った直後（Claude Code の起動と接続の数秒）は ``session.busy`` が立っていないので、
+        残っている指示も見る
         """
         session = self._session
-        return (
-            bool(self._queued)
-            or (session is not None and session.busy)
-            or self._setup.busy
-            or self._updater.installing
-        )
+        return bool(self._queued) or (session is not None and session.busy)
+
+    @property
+    def setting_up(self) -> bool:
+        """導入の欄から AI 連携の環境を入れている最中か"""
+        return self._setup.busy
+
+    @property
+    def updating_parts(self) -> bool:
+        """AI の部品を裏で自動で入れ替えている最中か 終わると :attr:`parts_settled` が出る"""
+        return self._updater.installing
 
     def close_session(self) -> None:
         """会話を畳む ウィンドウを閉じるときに呼ぶ"""

@@ -17,6 +17,7 @@ import re
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from sashimono import __version__
 from sashimono.core import userdirs
@@ -199,6 +200,37 @@ def apply_on_start(
         return not started_by_swapper()
     if busy is not None:
         return False  # ほかの窓が新しい版を落としている 置き場が替わる途中なので触らない
+    # 予約した版を照らしてから入れ替え係が走り出すまで、落とす側の錠を押さえる 押さえないと、
+    # 照らした直後にほかの窓が別の版を落として置き場を差し替え、予約していない版へ入れ替わる
+    # （画面からの入れ替え UpdateController._hand_over と同じ守り #528）
+    try:
+        stage_lock = try_hold(lock_path(STAGE_LOCK, store.path.parent))
+    except OSError:
+        # 更新の置き場に錠を作れない（書けない所） 入れ替えずにいつもどおり起動する
+        # 投げると、予約が無くても編集画面が開かない
+        return False
+    if stage_lock is None:
+        return False
+    try:
+        # 錠を取ってからもう一度入れ替え係を見る 上で見た後に、ほかの窓が入れ替え係を起こして
+        # 落とす側の錠を放すことがある 見逃すと、予約の印はもう下りているので編集画面を出し、
+        # 入れ替え係をこの窓が閉じるまで待たせる（prepare・_drop_staged と同じ順）
+        if busy_with(store.path.parent) == "swap":
+            return not started_by_swapper()
+        return _apply_reserved(arguments, layout, store, swap, current, choices)
+    finally:
+        stage_lock.release()
+
+
+def _apply_reserved(
+    arguments: Sequence[str],
+    layout: Layout,
+    store: UpdateStateStore,
+    swap: Callable[[SwapPlan], bool],
+    current: str,
+    choices: Callable[[], UpdateChoices],
+) -> bool:
+    """予約した版を入れ替え係へ渡す 落とす側の錠を押さえて呼ぶ（:func:`apply_on_start`）"""
     loaded = store.load()
     state = reconcile(loaded, choices())
     if not state.apply_on_start:
@@ -303,19 +335,32 @@ def settle(
         if ready and (layout is None or layout.staged_version() != ready):
             # 入れ替えを待っていた版が無くなった（本人が消した・別の起動が入れた）
             state = _clear_ready(state)
-    if (
-        layout is not None
-        and not state.ready_version
-        and layout.staged.exists()
-        and busy_with(store.path.parent) is None
-    ):
-        # 待つ物の無い置き場を残さない 100 MB を超える ほかの窓が落としている・入れ替え係が
-        # 走っている間は触らない（展開し終えて覚え書きを書く前の物を消してしまう）
-        shutil.rmtree(layout.staged, ignore_errors=True)
+    if layout is not None and not state.ready_version and layout.staged.exists():
+        _drop_staged(layout, store.path.parent)
     # 書けなくても次の起動で同じ片付けをやり直すだけ
     with contextlib.suppress(OSError):
         store.save(state)
     return notice
+
+
+def _drop_staged(layout: Layout, folder: Path) -> None:
+    """待つ物の無い置き場を消す 100 MB を超えるので残さない
+
+    ほかの窓が落としている・入れ替え係が走っている間は触らない（展開し終えて覚え書きを書く
+    前の物や、入れ替えている最中の物を消してしまう） 落とす側の錠を押さえてから入れ替え係の
+    錠を見る 見てから消すまでの間に、ほかの窓が落とし始めたり入れ替え係を起こしたりしない
+    """
+    try:
+        lock = try_hold(lock_path(STAGE_LOCK, folder))
+    except OSError:
+        return  # 錠を作れない所では片付けない 次の起動でまた試すだけで、起動は止めない
+    if lock is None:
+        return
+    try:
+        if busy_with(folder) != "swap":
+            shutil.rmtree(layout.staged, ignore_errors=True)
+    finally:
+        lock.release()
 
 
 def prepare(
@@ -336,12 +381,15 @@ def prepare(
     """
     store = store if store is not None else UpdateStateStore()
     folder = store.path.parent
-    if busy_with(folder) == "swap":
-        raise UpdateBusyError("入れ替えの最中")
     lock = try_hold(lock_path(STAGE_LOCK, folder))
     if lock is None:
         raise UpdateBusyError("ほかの窓が新しい版を落としている")
     try:
+        # 入れ替え係は錠を取ってから見る 取る前に見ると、見た後で別の窓が入れ替え係を起こして
+        # 落とす側の錠を放したとき、入れ替えている最中の置き場を別の版へ差し替える（#528）
+        # 入れ替え係を起こす側は、走り出すまで落とす側の錠を押さえている
+        if busy_with(folder) == "swap":
+            raise UpdateBusyError("入れ替えの最中")
         stage(manifest, transport, layout, should_cancel=should_cancel)
         state = store.load()
         if state.ready_version != manifest.version:

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 
 from sashimono import __version__
 from sashimono.core.io import load_project, save_project
-from sashimono.core.io.locks import try_hold
+from sashimono.core.io.locks import HeldLock, is_held, try_hold
 from sashimono.core.io.serialize import FORMAT_VERSION, PRE_UPGRADE_SUFFIX
 from sashimono.core.model import Project
 from sashimono.ui import updates as updates_module
@@ -72,6 +72,11 @@ class _Harness:
         self.store = UpdateStateStore(tmp_path / "state.json")
         self.preferences = preferences
         self.blockers: list[str] = []
+        #: 断らずに終わりを待つ作業（AI の部品の自動更新）
+        self.waits: list[str] = []
+        #: 待った後に、今すぐ再起動してよいかと尋ねた回数と、その答え
+        self.resume_asked = 0
+        self.resume_answer = True
         #: 保存の確認の答え 偽なら取り消した
         self.confirm = True
         #: 確認と入れ替え係を起こした順
@@ -93,9 +98,11 @@ class _Harness:
             launcher=self._launch,
             waiter=lambda _launched: True,
             confirm_close=self._confirm,
+            waits=lambda: list(self.waits),
         )
         self.controller._inform = self._inform  # type: ignore[method-assign]
         self.controller._notify = self._notify  # type: ignore[method-assign]
+        self.controller._ask_resume = self._ask_resume  # type: ignore[method-assign]
         #: 手を止めさせない窓で知らせた物（尋ねずに済ませたこと）
         self.notified: list[tuple[str, str]] = []
         self.sleeper: subprocess.Popen[bytes] | None = None
@@ -109,6 +116,11 @@ class _Harness:
 
     def _notify(self, title: str, text: str) -> None:
         self.notified.append((title, text))
+
+    def _ask_resume(self, mode: str) -> bool:
+        del mode
+        self.resume_asked += 1
+        return self.resume_answer
 
     def _confirm(self) -> bool:
         self.events.append("confirm")
@@ -378,6 +390,105 @@ class TestRestarting:
         assert ready.launched == []
         assert ready.store.load().ready_version == NEWER
 
+    def test_another_version_during_the_save_question_starts_nothing(self, ready: _Harness) -> None:
+        """保存の確認で迷っている間に、ほかの窓が別の版を落として置き場を差し替えた
+        照らさずに進むと、〔新しい版〕の窓で見て選んだ版とは違う版へ入れ替える
+        """
+        other = "9001.0.0"
+
+        def replaced_meanwhile() -> bool:
+            write_build_info(ready.layout.staged, other, "cp314")
+            ready.store.save(replace(ready.store.load(), ready_version=other))
+            return True
+
+        ready.controller._confirm_close = replaced_meanwhile
+        assert not ready.controller.restart_now(NEWER)
+        assert ready.launched == []
+        assert ready.informed and ready.informed[-1][0] == "入れ替えを止めました"
+
+    def test_parts_starting_during_the_save_question_wait_again(self, ready: _Harness) -> None:
+        """保存の確認の窓が開いている間も画面の時計は回り、部品の自動更新が始まりうる
+        見直さずに渡すと、窓を閉じる所で部品の入れ替えを止め、部品の更新が終わらないまま入れ替わる
+        """
+
+        def parts_begin() -> bool:
+            ready.waits = [PARTS]
+            return True
+
+        ready.controller._confirm_close = parts_begin
+        assert not ready.controller.restart_now()
+        assert ready.launched == []
+        assert ready.controller._waiting == ("apply", NEWER)
+
+    def test_a_conversation_begun_during_the_save_question_refuses(self, ready: _Harness) -> None:
+        # 確認の間に始めた会話を見ずに渡すと、頼んだ編集が途中で切れる
+        def conversation_begins() -> bool:
+            ready.blockers = ["AI アシスタントが作業しています"]
+            return True
+
+        ready.controller._confirm_close = conversation_begins
+        assert not ready.controller.restart_now()
+        assert ready.launched == []
+        assert ready.informed and "AI アシスタントが作業しています" in ready.informed[-1][1]
+
+    def test_a_swap_begun_during_the_save_question_starts_nothing(self, ready: _Harness) -> None:
+        """確認の間にほかの窓が入れ替え係を起こした 渡すと入れ替え係が 2 つ走る"""
+        swap_lock = lock_path(SWAP_LOCK, ready.store.path.parent)
+        taken: list[HeldLock | None] = []
+
+        def swap_begins() -> bool:
+            taken.append(try_hold(swap_lock))
+            return True
+
+        ready.controller._confirm_close = swap_begins
+        try:
+            assert not ready.controller.restart_now()
+        finally:
+            for held in taken:
+                if held is not None:
+                    held.release()
+        assert ready.launched == []
+        assert ready.informed and ready.informed[-1][0] == "ほかの窓で入れ替えを始めています"
+
+    def test_an_unwritable_update_folder_says_so(
+        self, ready: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 錠を作れずに投げると、押した〔今すぐ再起動して入れる〕が黙って何も起こさない
+        def unwritable(_path: Path) -> HeldLock | None:
+            raise PermissionError("書けない")
+
+        monkeypatch.setattr(updates_module, "try_hold", unwritable)
+        assert not ready.controller.restart_now()
+        assert ready.launched == []
+        assert ready.informed and ready.informed[-1][0] == "入れ替えを始められません"
+
+    def test_no_other_window_can_stage_while_handing_over(
+        self, ready: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """版を照らしてから入れ替え係が走り出すまで、落とす側の錠を押さえる
+        押さえないと、照らした直後にほかの窓が別の版を落とし、選んでいない版へ入れ替わる
+        """
+        monkeypatch.setattr(QApplication, "quit", lambda: None)
+        stage_lock = lock_path(STAGE_LOCK, ready.store.path.parent)
+        held_while_launching: list[bool] = []
+        launch = ready.controller._launcher
+
+        def watching(plan: SwapPlan) -> Launched:
+            held_while_launching.append(is_held(stage_lock))
+            return launch(plan)
+
+        ready.controller._launcher = watching
+        assert ready.controller.restart_now()
+        assert held_while_launching == [True]
+        # 走り出した後は入れ替え係の錠が守る 持ったままだと、窓が閉じるまで落とす側が止まる
+        assert not is_held(stage_lock)
+
+    def test_the_stage_lock_is_let_go_when_the_helper_fails(self, ready: _Harness) -> None:
+        # 起こせずに今の版のまま続けるのに錠を持ち続けると、この窓を閉じるまで新しい版を落とせない
+        ready.controller._waiter = lambda _launched: False
+        assert not ready.controller.restart_now()
+        assert not is_held(lock_path(STAGE_LOCK, ready.store.path.parent))
+
     def test_a_cancelled_rollback_is_not_remembered(
         self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -450,6 +561,239 @@ class TestRestarting:
         assert __version__ in harness.store.load().skipped
 
 
+PARTS = "AI の部品を裏で新しくしています（数十秒で終わります）"
+
+
+class TestWaitingForTheParts:
+    """AI の部品の自動更新の最中は、断らずに終わりを待ってから入れ替える（#528）"""
+
+    @pytest.fixture
+    def waiting(self, harness: _Harness, monkeypatch: pytest.MonkeyPatch) -> _Harness:
+        harness.controller.start()
+        monkeypatch.setattr(QApplication, "quit", lambda: None)
+        harness.waits = [PARTS]
+        assert not harness.controller.restart_now()
+        return harness
+
+    def test_it_waits_instead_of_refusing(self, waiting: _Harness) -> None:
+        # 断ると、何も頼んでいない人に何を待てばよいか分からない窓を出し、もう一度選ばせる
+        assert waiting.controller.waiting
+        assert waiting.informed == []
+        assert waiting.launched == []
+        assert waiting.notified and PARTS in waiting.notified[0][1]
+        assert "終わったら" in waiting.window.statusBar().currentMessage()
+
+    def test_the_button_keeps_showing_the_wait(self, waiting: _Harness) -> None:
+        """ステータスバーの文言はほかの知らせに上書きされる 消えた後も待っていると見返せるよう、
+        右端のボタンにも出しておき、待つのをやめたら元へ戻す
+        """
+        waiting.window.statusBar().showMessage("素材の控えができました", 10)
+        assert not waiting.controller.button.isHidden()
+        assert "待っています" in waiting.controller.button.text()
+        waiting.controller._stop_waiting()
+        assert waiting.controller.button.text() == f"新しい版 {NEWER} を入れる…"
+
+    def test_it_asks_once_more_then_goes_on(self, waiting: _Harness) -> None:
+        """入れる前に尋ねる設定（既定）では、待った後にもう一度尋ねてから入れ替える
+        尋ねずに閉じると、待っている間に編集の続きをしていた人の手元で画面が消える
+        """
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.resume_asked == 1
+        assert waiting.events == ["confirm", "launch"]
+        assert not waiting.controller.waiting
+
+    def test_saying_no_after_waiting_starts_nothing(self, waiting: _Harness) -> None:
+        # 断ったのに入れ替わると、手を止めたくない人の画面が消える 待つ版は残し、後で入れられる
+        waiting.waits = []
+        waiting.resume_answer = False
+        waiting.controller.resume_waiting()
+        assert waiting.launched == []
+        assert waiting.controller.ready_version() == NEWER
+        assert not waiting.controller.button.isHidden()
+
+    def test_not_asking_goes_straight_on(self, waiting: _Harness) -> None:
+        # 尋ねない設定の人に、もう一度尋ねると手を止めさせる
+        waiting.preferences = Preferences(update_confirm=False)
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.resume_asked == 0
+        assert waiting.launched and waiting.launched[0].mode == "apply"
+
+    def test_a_conversation_begun_meanwhile_refuses(self, waiting: _Harness) -> None:
+        """待っている間に会話を始めた 入れ替えると頼んだ編集が途中で切れるので、今の文言で断る"""
+        waiting.waits = []
+        waiting.blockers = ["AI アシスタントが作業しています"]
+        waiting.controller.resume_waiting()
+        assert waiting.launched == []
+        assert waiting.informed and "AI アシスタントが作業しています" in waiting.informed[0][1]
+        assert not waiting.controller.waiting
+
+    def test_still_busy_keeps_waiting(self, waiting: _Harness) -> None:
+        # まだ入れている最中に進むと、入れ替える途中の部品を残してアプリが消える
+        waiting.controller.resume_waiting()
+        assert waiting.controller.waiting
+        assert waiting.resume_asked == 0
+        assert waiting.launched == []
+
+    def test_closing_while_waiting_starts_nothing_later(self, waiting: _Harness) -> None:
+        # 閉じた後に終わりの知らせが届いて入れ替えへ進むと、閉じたはずの窓から入れ替え係が起きる
+        waiting.controller.shutdown()
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.resume_asked == 0
+        assert waiting.launched == []
+        assert waiting.controller.ready_version() == NEWER
+
+    def test_choosing_again_replaces_the_wait(
+        self, waiting: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 待っている間に〔次の起動で入れる〕を選び直したのに、部品の更新の後で再起動すると
+        # 本人の新しい答えを無視する
+        monkeypatch.setattr(waiting.controller, "_choose", lambda *_a, **_k: ANSWER_NEXT_START)
+        waiting.controller.offer()
+        assert not waiting.controller.waiting
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.launched == []
+
+    def test_a_version_dropped_meanwhile_starts_nothing(self, waiting: _Harness) -> None:
+        # 待っている間にベータを切るなどで待つ版が消えたのに進むと、空の置き場へ入れ替える
+        waiting.store.save(replace(waiting.store.load(), ready_version=""))
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.resume_asked == 0
+        assert waiting.launched == []
+        assert not waiting.controller.waiting
+
+    def test_another_version_meanwhile_starts_nothing(self, waiting: _Harness) -> None:
+        # 待つ間にほかの窓が別の版を落とした 進むと、本人が選んでいない版へ入れ替える
+        other = "9001.0.0"
+        write_build_info(waiting.layout.staged, other, "cp314")
+        waiting.store.save(replace(waiting.store.load(), ready_version=other))
+        assert waiting.controller.ready_version() == other
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.resume_asked == 0
+        assert waiting.launched == []
+        assert not waiting.controller.waiting
+
+    def test_another_version_while_asking_starts_nothing(
+        self, waiting: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """尋ねて答えを待つ間に、ほかの窓が別の版を落として置き場を差し替えた
+        照らさずに進むと、本人が〔今すぐ再起動する〕と答えた版ではない版へ入れ替える
+        """
+        other = "9001.0.0"
+
+        def replaced_meanwhile(_mode: str) -> bool:
+            write_build_info(waiting.layout.staged, other, "cp314")
+            waiting.store.save(replace(waiting.store.load(), ready_version=other))
+            return True
+
+        monkeypatch.setattr(waiting.controller, "_ask_resume", replaced_meanwhile)
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.launched == []
+        assert not waiting.controller.waiting
+        assert waiting.informed and waiting.informed[-1][0] == "入れ替えを止めました"
+
+    def test_an_open_window_puts_it_off(
+        self, waiting: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """書き出しや設定の窓が開いている間に終わりの知らせが来ても、その窓の中では進まない
+        進むと、開いている窓の作業を残したまま入れ替えへ向かう 閉じたら進む
+        """
+        opened: list[object] = [object()]
+        monkeypatch.setattr(QApplication, "activeModalWidget", lambda: opened[0])
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.controller.waiting
+        assert waiting.resume_asked == 0
+        assert waiting.controller._resume_timer.isActive()
+
+        opened[0] = None
+        waiting.controller.resume_waiting()
+        assert waiting.resume_asked == 1
+        assert waiting.launched
+
+    def test_the_offer_window_does_not_start_the_old_wait(
+        self, waiting: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 尋ねる窓が出ている間に部品の更新が終わり、前に待っていた分で再起動すると、
+        # 本人が〔後で〕を選んでも効かない
+        waiting.preferences = Preferences(update_confirm=False)
+        waiting.waits = []
+
+        def choose(*_a: object, **_k: object) -> str:
+            waiting.controller.resume_waiting()
+            return updates_module.ANSWER_LATER
+
+        monkeypatch.setattr(waiting.controller, "_choose", choose)
+        waiting.controller.offer()
+        assert waiting.launched == []
+        assert not waiting.controller.waiting
+
+    def test_choosing_now_again_waits_again(
+        self, waiting: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 選び直した〔今すぐ〕でまだ部品を入れていれば、待ち直さないと選んだのに何も起きない
+        monkeypatch.setattr(
+            waiting.controller, "_choose", lambda *_a, **_k: updates_module.ANSWER_NOW
+        )
+        waiting.controller.offer()
+        assert waiting.controller.waiting
+        assert waiting.launched == []
+
+    def test_a_refused_rollback_drops_the_old_wait(
+        self, waiting: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """新しい版を待つ間に〔前の版に戻す〕を選び、字幕起こしで断られた 部品の更新の後で
+        前の頼み（新しい版へ入れる）が動くと、選び直した方と違う物が走る
+        """
+        waiting.layout.previous.mkdir()
+        (waiting.layout.previous / APP_EXE).write_bytes(b"MZ")
+        monkeypatch.setattr(
+            waiting.controller, "_choose", lambda *_a, **_k: updates_module.ANSWER_NOW
+        )
+        waiting.blockers = ["字幕を起こしています"]
+        assert not waiting.controller.roll_back()
+        assert not waiting.controller.waiting
+        waiting.blockers = []
+        waiting.waits = []
+        waiting.controller.resume_waiting()
+        assert waiting.launched == []
+
+    def test_other_work_lists_the_parts_too(self, harness: _Harness) -> None:
+        # 断るときに部品の更新を伏せると、字幕起こしを待った後にまた断られる理由が分からない
+        harness.controller.start()
+        harness.blockers = ["字幕を起こしています"]
+        harness.waits = [PARTS]
+        assert not harness.controller.restart_now()
+        assert not harness.controller.waiting
+        assert harness.informed
+        assert "字幕を起こしています" in harness.informed[0][1]
+        assert PARTS in harness.informed[0][1]
+
+    def test_a_rollback_waits_and_is_remembered(
+        self, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 戻すのも待ってから進む 戻した後に今の版を「飛ばす版」へ覚えないと、次の確かめですぐ戻る
+        harness.layout.previous.mkdir()
+        (harness.layout.previous / APP_EXE).write_bytes(b"MZ")
+        monkeypatch.setattr(
+            harness.controller, "_choose", lambda *_a, **_k: updates_module.ANSWER_NOW
+        )
+        monkeypatch.setattr(QApplication, "quit", lambda: None)
+        harness.waits = [PARTS]
+        assert not harness.controller.roll_back()
+        assert __version__ not in harness.store.load().skipped
+        harness.waits = []
+        harness.controller.resume_waiting()
+        assert harness.launched and harness.launched[0].mode == "rollback"
+        assert __version__ in harness.store.load().skipped
+
+
 class TestTheEditor:
     @pytest.fixture
     def window(self, qt_application: QApplication) -> Iterator[MainWindow]:
@@ -513,8 +857,55 @@ class TestTheEditor:
         self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # AI の作業中に更新の再起動を許すと、頼んだ編集や環境の導入が途中で断ち切られる
-        monkeypatch.setattr(type(window._chat), "working", property(lambda _self: True))
-        assert window.update_blockers()
+        monkeypatch.setattr(type(window._chat), "responding", property(lambda _self: True))
+        assert window.update_blockers() == ["AI アシスタントが作業しています"]
+        assert window.update_waits() == []
+
+    def test_installing_the_environment_says_so(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 会話と同じ文言だと、導入の欄の pip を待てばよいと分からない
+        monkeypatch.setattr(type(window._chat), "setting_up", property(lambda _self: True))
+        assert window.update_blockers() == ["AI 連携の環境を入れています"]
+
+    def test_the_parts_update_is_waited_for_not_refused(
+        self, window: MainWindow, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """裏の部品の自動更新は本人が頼んだ物ではない 会話の文言で断らず、終わりを待つ（#528）"""
+        monkeypatch.setattr(type(window._chat), "updating_parts", property(lambda _self: True))
+        assert window.update_blockers() == []
+        assert window.update_waits() == [PARTS]
+
+    def test_the_end_of_the_parts_update_reaches_the_updates(self, window: MainWindow) -> None:
+        # 繋がっていないと、部品の更新が終わってもアプリの入れ替えがいつまでも待ったまま
+        window.updates._waiting = ("apply", NEWER)
+        window._chat.parts_settled.emit()
+        assert not window.updates.waiting
+
+    def test_a_running_export_blocks(self, window: MainWindow) -> None:
+        """部品の更新を待っていた入れ替えは、書き出しの窓の中で終わりの知らせを受けて進みうる
+        通すと、走っている書き出しを残したまま窓を閉じ、書き出しが途中で切れる
+        """
+
+        class _Exporting:
+            export_progress = 0.5
+
+        window._person_export = _Exporting()  # type: ignore[assignment]
+        try:
+            assert window.update_blockers() == ["動画を書き出しています"]
+        finally:
+            window._person_export = None
+
+    def test_an_idle_export_window_does_not_block(self, window: MainWindow) -> None:
+        # 書き出していない窓まで書き出し中と言うと、断る理由が動いている物と合わない
+        class _Idle:
+            export_progress = None
+
+        window._person_export = _Idle()  # type: ignore[assignment]
+        try:
+            assert window.update_blockers() == []
+        finally:
+            window._person_export = None
 
     def test_closing_for_an_update_asks_only_once(
         self, qt_application: QApplication, monkeypatch: pytest.MonkeyPatch
