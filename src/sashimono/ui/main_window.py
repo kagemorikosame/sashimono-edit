@@ -4390,29 +4390,19 @@ class MainWindow(QMainWindow):
         if saved is None:
             return
         # 保存した所を次に開く所にする 報告に添える物を同じ所へまとめられる
-        # 設定を書けたときだけ覚える 先に覚えると、書けなかったときに次の保存で同じ所を
-        # 選んでも「もう覚えている」と見て書き直さない（PR #550 の指摘） 知らせは 1 つにまとめる
-        # （設定を書けなかった知らせを、保存の知らせで上書きしない）
+        # 保存の置き場は毎回必ず書く（``always`` 前に読んだ値と同じでも書く） 書けたときだけ
+        # 画面の中を替える（書けなかったら次の保存でもう 1 度書く） 知らせは 1 つにまとめる
+        # ファイルの中と比べて同じなら書かない作りにすると、保存が変えた所を見分ける元が古いまま
+        # 残り、後で別の設定を保存したときに、ほかの窓が書いた置き場をこの窓の古い置き場で
+        # 書き戻す（PR #550 の指摘が 3 回） 比べずに毎回書けば、ファイル・画面の中・見分ける元の
+        # 3 つがいつも保存した所にそろう
         message = f"診断情報を保存しました: {saved}"
-        folder = str(saved.parent)
-        # 比べるのは書けた設定（ファイルの中） 画面の中の値と比べると、設定画面で変えて書けなかった
-        # 置き場へ保存したときに「もう覚えている」と見て書き直さず、次の起動で前の置き場に戻る
-        # （PR #550 の指摘）
-        # 読み直しは比べるためだけ（``stored``） ``load`` で読むと、保存が変えた所を見分ける元が
-        # 替わり、画面の中で変えて書けていないほかの設定を書かなくなる（PR #550 の指摘）
-        changed = replace(self._preferences, report_folder=folder)
-        if folder != PreferenceStore().stored().report_folder:
-            try:
-                # 前に読んだ値と同じでも書く ほかの窓がその後に別の置き場を書いていると、
-                # 「変えていない」と見て書かず、次の起動でそちらに戻る（PR #550 の指摘）
-                PreferenceStore().save(changed, always={"report_folder"})
-            except OSError as exc:
-                message += f"（保存した場所は設定に書けなかったので覚えていません: {exc}）"
-            else:
-                self._preferences = changed
+        changed = replace(self._preferences, report_folder=str(saved.parent))
+        try:
+            PreferenceStore().save(changed, always={"report_folder"})
+        except OSError as exc:
+            message += f"（保存した場所は設定に書けなかったので覚えていません: {exc}）"
         else:
-            # ファイルにはもう書いてある 画面の中だけが別の所（設定画面で変えて書けなかった所）を
-            # 指していれば、保存した所にそろえる そろえないと次の保存の窓が別の所で開く
             self._preferences = changed
         self.statusBar().showMessage(message, 10000)
 

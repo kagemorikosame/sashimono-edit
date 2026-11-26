@@ -260,3 +260,37 @@ def test_the_folder_is_written_even_when_it_matches_what_was_read(
     window.create_diagnostics()
     assert PreferenceStore().stored().report_folder == str(folder_a)
     assert window._preferences.report_folder == str(folder_a)
+
+
+def test_saving_to_the_folder_already_written_keeps_later_changes_by_others(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 壊れると、ファイルにある置き場（B）へ保存したときに設定を書かず、見分ける元が古い A の
+    # ままになる その後ほかの窓が C を書き、この窓で別の設定（磁石）だけを変えて保存すると、
+    # A と B の差を「変えた」と見て置き場を B に書き戻す（PR #550 の指摘）
+    import json
+
+    store = PreferenceStore()
+
+    def other_window_writes(folder: Path) -> None:
+        # 2 つ目の窓（別のプロセス）の代わりに、設定のファイルを直に書き換える
+        data = json.loads(store.path.read_text(encoding="utf-8"))
+        data["report_folder"] = str(folder)
+        store.path.write_text(json.dumps(data), encoding="utf-8")
+
+    folders = {name: tmp_path / name for name in ("A", "B", "C")}
+    for folder in folders.values():
+        folder.mkdir()
+    window._preferences = replace(window._preferences, report_folder=str(folders["A"]))
+    store.save(window._preferences)
+    other_window_writes(folders["B"])
+
+    def save(self: DiagnosticDialog) -> int:
+        assert self.save_to(folders["B"] / "診断.txt")
+        return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(DiagnosticDialog, "exec", save)
+    window.create_diagnostics()
+    other_window_writes(folders["C"])
+    store.save(replace(window._preferences, timeline_snap=not window._preferences.timeline_snap))
+    assert store.stored().report_folder == str(folders["C"])
