@@ -16,11 +16,18 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # この 2 つは Qt を読まない（読まないことを試験で押さえている）
 from sashimono.asr import activate_runtime
 from sashimono.core.userdirs import migrate_legacy_folders
 from sashimono.runtime import pip_arguments, recover_runtime_swap, run_pip
+
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QApplication
+
+    from sashimono.ui.main_window import MainWindow
+    from sashimono.ui.splash import SplashChoices, StartupSplash
 
 __all__ = ["ADD_ON_CHECK_FLAG", "IMPORT_CHECK_FLAG", "SELF_CHECK_FLAG", "main"]
 
@@ -209,19 +216,22 @@ def _start_editor(arguments: list[str]) -> int:
     # 通常の実行では何もしない（パッケージ版のためだけの手当て）
     activate_runtime()
 
+    # 落ちた起動と拾われなかったエラーを書き残す（#516 診断情報に載せる） 画面を出す前に掛ける
+    # 起動の途中（部品が読めない・編集画面を作れない）で落ちた物こそ、本人の手元に残したい
+    # 自己診断と pip の役では掛けない どちらも本人の置き場を使わない
+    from sashimono import fault_log
+
+    fault_log.install()
+
     from PySide6.QtCore import QTimer
     from PySide6.QtGui import QIcon, QSurfaceFormat
     from PySide6.QtWidgets import QApplication
 
-    from sashimono.core.io import ProjectFileError, load_project
-    from sashimono.engine.gpu import preferred_surface_format
+    # ここまでは軽い物だけを読む 起動画面（#526）を、編集画面の部品を読む前に出すため
+    from sashimono.engine.gl_format import preferred_surface_format
     from sashimono.resources import ICON_FILE, path_to
-    from sashimono.ui.main_window import MainWindow
+    from sashimono.ui.splash import showing_splash, splash_choices
     from sashimono.ui.theme import apply_theme
-    from sashimono.ui.translation import install_qt_translation
-    from sashimono.ui.updates import STARTUP_DELAY_MS
-    from sashimono.ui.workspace import PreferenceStore
-    from sashimono.update.swap import mark_started
 
     # サーフェス形式は QApplication を作る前に決めておく必要がある
     # 後から設定しても、ウィジェットのコンテキストには反映されない
@@ -230,37 +240,79 @@ def _start_editor(arguments: list[str]) -> int:
     application = QApplication(arguments)
     application.setApplicationName("Sashimono")
     application.setWindowIcon(QIcon(str(path_to(ICON_FILE))))
-    # 窓を作る前に当てる 部品は作った時点のテーマの色で組み立てられるので、後から
-    # 当てると暗いテーマの色で一瞬描かれてから切り替わる
-    apply_theme(application, PreferenceStore().load().theme)
-    # 窓を作る前に読む 後から読むと、先に作った部品の文言は英語のまま残る
-    install_qt_translation(application)
+    # 起動画面より先にテーマを当てる 設定の読み手は重い部品を読むので、テーマと起動画面の
+    # 動きだけを直に読む 暗い起動画面から明るい編集画面へ変わると、明るい方を選んだ人の目に光る
+    # 部品は作った時点のテーマの色で組み立てられるので、窓を作る前に当てる必要もある
+    choices = splash_choices()
+    apply_theme(application, choices.theme)
 
-    project = None
-    path = None
-    if len(arguments) > 1:
-        try:
-            project = load_project(
-                Path(arguments[1]), relative_first=PreferenceStore().load().media_relative_first
-            )
-            path = Path(arguments[1])
-        except ProjectFileError as exc:
-            print(f"プロジェクトを開けない: {exc}", file=sys.stderr)
-
-    window = MainWindow(project, path=path)
-    window.show()
-    # 窓を出せたことを入れ替え係へ知らせる 知らせないと、入れたばかりの版が起動できなかった
+    # 段の数 作品を渡されたときだけ「作品を開いています」の段がある
+    steps = 3 if len(arguments) > 1 else 2
+    with showing_splash(application, choices, steps=steps) as splash:
+        window = _open_editor(application, arguments, splash, choices)
+    # 窓が出たことを入れ替え係へ知らせる 知らせないと、入れたばかりの版が起動できなかった
     # ものとして前の版へ戻される（入れ替え係が起こしたときだけ書く）
+    from sashimono.ui.updates import STARTUP_DELAY_MS
+    from sashimono.update.swap import mark_started
+
     QTimer.singleShot(0, mark_started)
-    # 窓が描かれてから尋ねる 先に尋ねると、何のソフトの話かが分からない
+    # 窓が描かれてから尋ねる 先に尋ねると、何のソフトの話かが分からない 起動画面はもう閉じて
+    # いる（確かめの窓を起動画面が隠さない）
     QTimer.singleShot(0, window.offer_recovery)
-    if project is not None:
+    if window.project_path is not None:
         # 渡された作品の素材が見つからなければ知らせる（#447 〔開く…〕と同じ）
         QTimer.singleShot(0, lambda: window.show_missing_media(only_if_missing=True))
     # 新しい版を確かめるのは、起動が落ち着いてから 起動を待たせない
     QTimer.singleShot(STARTUP_DELAY_MS, window.start_updates)
     QTimer.singleShot(STARTUP_DELAY_MS, _probe_encoders_in_background)
     return application.exec()
+
+
+def _open_editor(
+    application: QApplication,
+    arguments: list[str],
+    splash: StartupSplash,
+    choices: SplashChoices,
+) -> MainWindow:
+    """起動画面を出したまま編集画面の部品を読み、作品を開き、編集画面を出す
+
+    出したら起動画面を閉じる（:meth:`QSplashScreen.finish` 編集画面が映るまで待ってから閉じる）
+    途中で投げたら、呼んだ側（:func:`~sashimono.ui.splash.showing_splash`）が起動画面を閉じる
+    """
+    from sashimono.ui.splash import STEP_PARTS, STEP_PROJECT, STEP_WINDOW
+    from sashimono.ui.theme import apply_theme
+
+    splash.step(STEP_PARTS)
+    from sashimono.core.io import ProjectFileError, load_project
+    from sashimono.ui.main_window import MainWindow
+    from sashimono.ui.translation import install_qt_translation
+    from sashimono.ui.workspace import PreferenceStore
+
+    preferences = PreferenceStore().load()
+    # 起動画面の前に直に読んだテーマと、読み手が読んだテーマが違えば当て直す（同じなら何もしない
+    # 当て直すとスタイルシートを作り直すので、ふだんの起動を遅らせない）
+    if preferences.theme != choices.theme:
+        apply_theme(application, preferences.theme)
+    # 窓を作る前に読む 後から読むと、先に作った部品の文言は英語のまま残る
+    install_qt_translation(application)
+
+    project = None
+    path = None
+    if len(arguments) > 1:
+        splash.step(STEP_PROJECT)
+        try:
+            project = load_project(
+                Path(arguments[1]), relative_first=preferences.media_relative_first
+            )
+            path = Path(arguments[1])
+        except ProjectFileError as exc:
+            print(f"プロジェクトを開けない: {exc}", file=sys.stderr)
+
+    splash.step(STEP_WINDOW)
+    window = MainWindow(project, path=path)
+    window.show()
+    splash.finish(window)
+    return window
 
 
 def _probe_encoders_in_background() -> None:

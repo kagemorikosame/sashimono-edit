@@ -237,15 +237,22 @@ def test_the_environment_variable() -> None:
 
 def test_our_files_are_written_with_their_folder() -> None:
     """壊れると、設定パネルの panel.py と会話の panel.py が同じ名前になり、原因を取り違える"""
+    import sashimono
     from sashimono.stall_watch import _where
 
-    inspector = str(Path("C:/x/src/sashimono/ui/inspector/panel.py"))
-    chat = str(Path("C:/x/_internal/sashimono/ui/chat/panel.py"))
-    assert _where(inspector) == "sashimono/ui/inspector/panel.py"
-    assert _where(chat) == "sashimono/ui/chat/panel.py"
-    assert _where(str(Path("C:/x/src/sashimono/app.py"))) == "sashimono/app.py"
+    package = Path(sashimono.__file__).resolve().parent
+    assert (
+        _where(str(package / "ui" / "inspector" / "panel.py")) == "sashimono/ui/inspector/panel.py"
+    )
+    assert _where(str(package / "ui" / "chat" / "panel.py")) == "sashimono/ui/chat/panel.py"
+    assert _where(str(package / "app.py")) == "sashimono/app.py"
+    # 配布版は本体の場所を相対で書く 利用者のフォルダを含まないのでそのまま残す
+    assert _where(str(Path("sashimono/ui/chat/panel.py"))) == "sashimono/ui/chat/panel.py"
     # 外の部品は名前だけ 置き場まで書くと、本人の名前の入ったパスが記録に残る
     assert _where(str(Path("C:/Users/someone/python/threading.py"))) == "threading.py"
+    # 本人のフォルダが sashimono という名前でも、本体の置き場の外なら名前だけ（PR #550 の指摘）
+    outside = Path("C:/Users/sashimono/顧客/site-packages/numpy/core.py")
+    assert _where(str(outside)) == "core.py"
 
 
 def test_memory_is_written_with_each_stall(tmp_path: Path) -> None:

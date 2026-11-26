@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Collection
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -140,6 +141,7 @@ from sashimono.ui.library_view import BACKDROP_CHECKER, BACKDROP_MODES, LibraryO
 from sashimono.ui.media_match import MATCH_ASK, MATCH_MODES
 from sashimono.ui.media_pool import VIEW_LIST, VIEW_MODES
 from sashimono.ui.preview_handles import KEYFRAME_DRAG_AT_PLAYHEAD, KEYFRAME_DRAG_MODES
+from sashimono.ui.splash import SPLASH_MOTION_DEFAULT
 from sashimono.ui.theme import THEME_DARK, THEME_MODES
 
 __all__ = [
@@ -147,6 +149,7 @@ __all__ = [
     "AI_MINUTE_LIMITS",
     "AI_TOKEN_LIMITS",
     "AUTO_QUALITY_HEIGHT",
+    "CHOICE_PREFERENCES",
     "DETAIL_MIN_WIDTHS",
     "DOCK_TABS_BOTTOM",
     "DOCK_TABS_TOP",
@@ -536,6 +539,11 @@ class Preferences:
     #: 起きて少しだけ重くなり、記録も溜まる カクつきを報告するときだけ入れてもらう
     #: 環境変数 ``SASHIMONO_STALL_WATCH`` でも入る（:mod:`sashimono.stall_watch`）
     stall_watch: bool = False
+    #: 診断情報（ヘルプの〔診断情報を作る…〕 #516）を保存するときに初めに開くフォルダ
+    #: 空は「ドキュメント」
+    #: 保存した所を覚えて次の初めの場所にする 報告に添える物を毎回同じ所へまとめたい人がいるので
+    #: 設定画面でも選べるようにする 送る物ではないので、どこを選んでも外へは出ない
+    report_folder: str = ""
     #: AviUtl2 の汎用プラグイン（``.aux2``）を全部読んで、スクリプトが引くモジュールを探す
     #: 既定は切 切っている間は、名前を出すと確かめたプラグイン（合成フォントの
     #: ``comfont.aux2``）だけを読む 全部を読むと、関係の無いプラグインが初期化で
@@ -708,6 +716,11 @@ class Preferences:
     #: 「合わせる」を既定にしないのは、Windows を明るくしている人の画面が、版を上げた
     #: だけで黙って明るくなるため
     theme: str = THEME_DARK
+    #: 起動画面の進み具合の文字を段ごとに切り替える（#526） 既定は入 起動している途中だと
+    #: 知らない人ほど、文字が変わるのを見て固まっていないと分かる 動く物を嫌う人と、遅い機械で
+    #: 描き直す分も惜しい人は切る 切っても起動画面そのものは出る（出さないと起動しているかが
+    #: 分からなくなる） 起動画面は設定を読む前に出るので、ここと同じ既定を起動画面の側が持つ
+    splash_motion: bool = SPLASH_MOTION_DEFAULT
     #: 起動したときに新しい版を確かめる（数時間に 1 回まで） 見つけたら裏で落として確かめておく
     #: 既定は入 古い版のまま直った不具合に困り続ける人を作らない 締め切り前など、編集環境を
     #: 変えたくない人は切る（切っている間は今の版に留まる ヘルプの〔更新を確かめる…〕で
@@ -1254,6 +1267,51 @@ def _limiter_depth(value: object, fallback: int) -> int:
     return fallback
 
 
+#: 文字の設定のうち、アプリが決めた選択肢の名前だけを持つ欄（:class:`PreferenceStore` が
+#: ``_choice`` で読む欄） 診断情報（#516）はこの欄の値だけを写し、ほかの文字の欄（置き場・
+#: 字幕の見た目の鍵・声の名前・URL）は「設定あり」にする 本人が名付けた物は形では見分けられない
+#: （PR #550 の指摘） ``_choice`` で読む欄を足したらここにも足す
+#: （``tests/test_diagnostic_report.py`` が ``_parse`` の中と照らす）
+CHOICE_PREFERENCES = frozenset(
+    {
+        "ai_effort",
+        "ai_limit_action",
+        "ai_model",
+        "ai_send_files",
+        "ai_send_frames",
+        "ai_send_text",
+        "ai_transcribe_model",
+        "direction_genre",
+        "direction_strength",
+        "dock_tabs",
+        "emphasis_easing",
+        "encoder_priority",
+        "explorer_double_click",
+        "explorer_view",
+        "export_format",
+        "insert_paste",
+        "keyframe_drag",
+        "library_backdrop",
+        "library_thumbnails",
+        "match_video",
+        "media_split",
+        "media_view",
+        "new_project_layers",
+        "ocr_engine",
+        "preview_fill",
+        "preview_margin",
+        "proxy_unused",
+        "reframe_follow",
+        "reframe_size",
+        "scene_analysis",
+        "screen_analysis",
+        "scripts_move",
+        "seam_video",
+        "theme",
+    }
+)
+
+
 class PreferenceStore:
     """:class:`Preferences` の読み書き
 
@@ -1268,6 +1326,16 @@ class PreferenceStore:
         preferences = self._parse(self._read())
         _PREFERENCES_SEEN[_path_key(self.path)] = preferences
         return preferences
+
+    def stored(self) -> Preferences:
+        """書いてある設定を読むだけ :meth:`load` と違い、保存で変えた所を見分ける元を変えない
+
+        保存（:meth:`save`）は前に読んだ設定と比べて、変えた所だけを重ねる 中身を見るためだけに
+        :meth:`load` で読み直すと元が今の中身に替わり、画面の中で変えて書けていない所を
+        「変えていない」と見て書かなくなる（PR #550 の指摘） 試験や確かめで書いてある中身を
+        見るときはこちらを使う
+        """
+        return self._parse(self._read())
 
     def _read(self) -> dict[str, Any] | None:
         """書いてある中身 無い・壊れているなら ``None``"""
@@ -1321,6 +1389,7 @@ class PreferenceStore:
             pool_progress=_flag(data.get("pool_progress"), plain.pool_progress),
             hdr_notice=_flag(data.get("hdr_notice"), plain.hdr_notice),
             stall_watch=_flag(data.get("stall_watch"), plain.stall_watch),
+            report_folder=_folder(data.get("report_folder"), plain.report_folder),
             all_aviutl_plugins=_flag(data.get("all_aviutl_plugins"), plain.all_aviutl_plugins),
             media_view=_choice(data.get("media_view"), VIEW_MODES, plain.media_view),
             ai_model=_choice(data.get("ai_model"), tuple(m.id for m in AI_MODELS), plain.ai_model),
@@ -1393,6 +1462,7 @@ class PreferenceStore:
                 _LEGACY_MULTI_AUDIO.get(str(data.get("multi_audio")), plain.media_split),
             ),
             theme=_choice(data.get("theme"), THEME_MODES, plain.theme),
+            splash_motion=_flag(data.get("splash_motion"), plain.splash_motion),
             update_check=_flag(data.get("update_check"), plain.update_check),
             update_beta=_flag(data.get("update_beta"), plain.update_beta),
             update_confirm=_flag(data.get("update_confirm"), plain.update_confirm),
@@ -1621,8 +1691,12 @@ class PreferenceStore:
             ai_image_edge=_member(data.get("ai_image_edge"), IMAGE_EDGES, plain.ai_image_edge),
         )
 
-    def save(self, preferences: Preferences) -> None:
+    def save(self, preferences: Preferences, *, always: Collection[str] = ()) -> None:
         """この窓で変えた項目だけを、書いてある中身へ重ねて書く
+
+        ``always`` の項目は、前に読んだ値と同じでも必ず書く 書いた後のファイルの値を、この窓の
+        値に必ずそろえたい所で使う（診断情報の保存の置き場 #516） 前に読んだ値と同じだと
+        「変えていない」と見て書かず、ほかの窓がその後に書いた別の値が残る（PR #550 の指摘）
 
         窓はそれぞれ起動したときに読んだ設定を持っている 丸ごと書き戻すと、ほかの窓が
         その後に変えた項目（テーマなど）を、この窓が別の項目（磁石など）を変えただけで
@@ -1647,7 +1721,7 @@ class PreferenceStore:
                     {
                         name: value
                         for name, value in ours.items()
-                        if name not in before or before[name] != value
+                        if name in always or name not in before or before[name] != value
                     }
                 )
             write_atomic(self.path, json.dumps(data, ensure_ascii=False, indent=2))

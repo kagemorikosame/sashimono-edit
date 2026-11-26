@@ -138,6 +138,7 @@ from sashimono.engine.vision.sampling import MEASURED_SCREEN_SAMPLE
 from sashimono.gc_policy import IDLE_S, MAX_DEFER_S
 from sashimono.stall_watch import DEFAULT_THRESHOLD_MS, default_log_path
 from sashimono.ui.backup_settings import BackupSection, confirm_backup_changes
+from sashimono.ui.diagnostic_dialog import ReportFolderField
 from sashimono.ui.encoder_recheck import EncoderRecheck
 from sashimono.ui.flow_layout import FlowLayout
 from sashimono.ui.library_thumbnails import THUMBNAILS_FULL, THUMBNAILS_OFF, THUMBNAILS_SIMPLE
@@ -686,6 +687,15 @@ class PreferencesDialog(QDialog):
         )
         form.addRow(self._stall_watch)
 
+        # 診断情報（#516）は送らずに本人が保存する 保存の窓を初めに開く所だけを選ぶ
+        self._report_folder = ReportFolderField(preferences.report_folder, self)
+        self._report_folder.setToolTip(
+            "ヘルプ → 診断情報を作る… で作った報告を保存するときに、初めに開くフォルダ "
+            "空は「ドキュメント」 保存した所は次に開く所として覚える\n"
+            "診断情報は自動では送らない 中身を見て、保存したファイルを本人が報告に添える"
+        )
+        form.addRow("診断情報を保存する場所", self._report_folder)
+
         # 一覧の上のボタンでも切り替えられる ここにも置くのは、設定を開いて OK を
         # 押したときに、ボタンで選んだ表示を黙って既定へ戻さないため
         self._media_view = QComboBox(self)
@@ -760,6 +770,14 @@ class PreferencesDialog(QDialog):
             "プレビューの絵そのもの（書き出す色）はテーマで変わらない"
         )
         form.addRow("画面の色（テーマ）", self._theme)
+        self._splash_motion = QCheckBox("起動画面で進み具合の文字を切り替える", self)
+        self._splash_motion.setChecked(preferences.splash_motion)
+        self._splash_motion.setToolTip(
+            "起動している間、起動画面の下の文字を「部品を読んでいます」「作品を開いています」の"
+            "ように段ごとに切り替える 切ると「起動しています」のまま動かない "
+            "起動画面そのものはどちらでも出る 次の起動から効く"
+        )
+        form.addRow(self._splash_motion)
         self._preview_fill = QComboBox(self)
         for value, text in PREVIEW_FILL_CHOICES:
             self._preview_fill.addItem(text, value)
@@ -1641,6 +1659,7 @@ class PreferencesDialog(QDialog):
             pool_progress=self._pool_progress.isChecked(),
             hdr_notice=self._hdr_notice.isChecked(),
             stall_watch=self._stall_watch.isChecked(),
+            report_folder=self._report_folder.folder(),
             all_aviutl_plugins=self._all_plugins.isChecked(),
             media_view=str(self._media_view.currentData()),
             ai_model=str(self._ai_model.currentData()),
@@ -1686,6 +1705,7 @@ class PreferencesDialog(QDialog):
             new_project_style_guide=self._new_project_style.guide,
             media_split=str(self._media_split.currentData()),
             theme=str(self._theme.currentData()),
+            splash_motion=self._splash_motion.isChecked(),
             update_check=self._update_check.isChecked(),
             update_beta=self._update_beta.isChecked(),
             update_confirm=self._update_confirm.isChecked(),

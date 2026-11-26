@@ -404,6 +404,10 @@ LEDGER: tuple[Entry, ...] = (
     ),
     read_only("メニュー/ヘルプ/使い方", _HELP, "help.manual"),
     read_only("メニュー/ヘルプ/不具合・要望を送る", _HELP, "help.report"),
+    # 診断情報（#516）は人が中身を確かめて保存する物 AI は作らず、置き場の設定を読むだけ
+    read_only(
+        "メニュー/ヘルプ/診断情報を作る…", _HELP, "help.diagnostics", "preferences.report_folder"
+    ),
     read_only(
         "メニュー/ヘルプ/更新を確かめる…",
         _UPDATE,

@@ -1273,6 +1273,7 @@ class MainWindow(QMainWindow):
         help_menu = self._menu("ヘルプ")
         self._add(help_menu, "使い方", QKeySequence("F1"), self.open_manual)
         self._add(help_menu, "不具合・要望を送る", QKeySequence(), self.open_report_page)
+        self._add(help_menu, "診断情報を作る…", QKeySequence(), self.create_diagnostics)
         help_menu.addSeparator()
         self._add(help_menu, "更新を確かめる…", QKeySequence(), self._updates.check_now)
         self._add(help_menu, "前の版に戻す…", QKeySequence(), self._updates.roll_back)
@@ -4326,6 +4327,87 @@ class MainWindow(QMainWindow):
         """不具合・要望の受け口をブラウザで開く"""
         self._open_link(REPORT_URL)
 
+    def diagnostic_text(self) -> str:
+        """診断情報の全文（#516） 伏せた後の物 送らない 窓で本人が確かめて保存する
+
+        伏せる表は AI へ送る物と同じ集め方（:meth:`AssistantBridge._learn_names`）で集める
+        今の作品だけでなく、履歴に残った前の作品・字幕起こしの記録・前に開いた作品の場所も
+        入れる エラーの文には、前に開いていた作品の素材の名前も残りうる
+        """
+        from sashimono.ai.outbound import file_secrets, secret_pairs, text_secrets
+        from sashimono.diagnostic_report import build_report, environment, gather, mask
+        from sashimono.fault_log import installed
+        from sashimono.ui.workspace import CHOICE_PREFERENCES
+
+        document = self._document
+        projects = (document.project, *document.past_projects)
+        names = secret_pairs(
+            file_secrets(
+                projects,
+                project_path=self._path,
+                export_folder=self.export_folder,
+                media=document.seen_media,
+                names=document.seen_project_names,
+                remembered=self.remembered_names(),
+            )
+        )
+        texts = [text for project in projects for text in text_secrets(project)]
+        screens = [
+            f"{screen.size().width()}x{screen.size().height()} "
+            f"{round(screen.devicePixelRatio() * 100)}%"
+            for screen in QApplication.screens()
+        ]
+        text = build_report(
+            environment(qVersion(), screens),
+            asdict(self._preferences),
+            gather(installed()),
+            choices=CHOICE_PREFERENCES,
+        )
+        return mask(text, names=names, texts=texts)
+
+    def create_diagnostics(self) -> None:
+        """ヘルプの〔診断情報を作る…〕 作って窓で見せ、本人が保存したら置き場を覚える
+
+        作るのに失敗しても窓は出す 何も出ないと、報告できないうえに理由も分からない
+        """
+        from sashimono.ui.diagnostic_dialog import DiagnosticDialog
+
+        try:
+            text = self.diagnostic_text()
+        except Exception as exc:  # 作れない理由は様々 どれでも作れなかったことと型を見せる
+            text = (
+                "診断情報を作れませんでした\n"
+                f"理由: {type(exc).__name__}\n"
+                "この文と、作ろうとしたときに何をしていたかを報告に書いてください\n"
+            )
+        dialog = DiagnosticDialog(
+            text,
+            folder=self._preferences.report_folder,
+            open_report=self.open_report_page,
+            parent=self,
+        )
+        dialog.exec()
+        saved = dialog.saved_path
+        dialog.deleteLater()
+        if saved is None:
+            return
+        # 保存した所を次に開く所にする 報告に添える物を同じ所へまとめられる
+        # 保存の置き場は毎回必ず書く（``always`` 前に読んだ値と同じでも書く） 書けたときだけ
+        # 画面の中を替える（書けなかったら次の保存でもう 1 度書く） 知らせは 1 つにまとめる
+        # ファイルの中と比べて同じなら書かない作りにすると、保存が変えた所を見分ける元が古いまま
+        # 残り、後で別の設定を保存したときに、ほかの窓が書いた置き場をこの窓の古い置き場で
+        # 書き戻す（PR #550 の指摘が 3 回） 比べずに毎回書けば、ファイル・画面の中・見分ける元の
+        # 3 つがいつも保存した所にそろう
+        message = f"診断情報を保存しました: {saved}"
+        changed = replace(self._preferences, report_folder=str(saved.parent))
+        try:
+            PreferenceStore().save(changed, always={"report_folder"})
+        except OSError as exc:
+            message += f"（保存した場所は設定に書けなかったので覚えていません: {exc}）"
+        else:
+            self._preferences = changed
+        self.statusBar().showMessage(message, 10000)
+
     def _open_link(self, url: str) -> None:
         # 既定のブラウザが決まっていない機械では開けない 黙ると押しても何も
         # 起きないように見えるので、打ち込めるように URL を出しておく
@@ -5525,6 +5607,7 @@ class MainWindow(QMainWindow):
                 self._preferences.state_folder,
                 self._preferences.export_folder,
                 self._preferences.package_folder,
+                self._preferences.report_folder,
                 str(package_root(self._preferences)),
             )
             if folder
@@ -5583,7 +5666,8 @@ class MainWindow(QMainWindow):
                 for name, (action, _default) in self._actions.items()
             },
             "layout": {"docks": docks},
-            "help": {"manual": MANUAL_URL, "report": REPORT_URL},
+            # 診断情報（#516）は作って見せるだけで送らない 置き場は設定の report_folder
+            "help": {"manual": MANUAL_URL, "report": REPORT_URL, "diagnostics": "送らない"},
             "note": (
                 "読むだけです 変えるのは人だけです（表示 → 設定… / ショートカットの設定… など）"
             ),
