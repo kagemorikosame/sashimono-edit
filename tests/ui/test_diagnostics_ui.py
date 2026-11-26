@@ -133,7 +133,7 @@ class TestTheMenu:
         monkeypatch.setattr(DiagnosticDialog, "exec", save)
         real_save = PreferenceStore.save
 
-        def refuse(self: PreferenceStore, preferences: Preferences) -> None:
+        def refuse(self: PreferenceStore, preferences: Preferences, **_kwargs: object) -> None:
             raise OSError("書けない")
 
         monkeypatch.setattr(PreferenceStore, "save", refuse)
@@ -234,3 +234,29 @@ def test_comparing_the_folder_does_not_reset_what_save_compares_with(
     stored = PreferenceStore().stored()
     assert stored.report_folder == str(target.parent)
     assert stored.theme == "light"
+
+
+def test_the_folder_is_written_even_when_it_matches_what_was_read(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 壊れると、この窓が前に A を読み（書き）、ほかの窓がその後に B を書いたとき、A へ保存しても
+    # 保存が「A は変えていない」と見て書かず、次の起動で B に戻る（PR #550 の指摘）
+    import json
+
+    folder_a = tmp_path / "A"
+    folder_a.mkdir()
+    store = PreferenceStore()
+    window._preferences = replace(window._preferences, report_folder=str(folder_a))
+    store.save(window._preferences)
+    data = json.loads(store.path.read_text(encoding="utf-8"))
+    data["report_folder"] = str(tmp_path / "B")
+    store.path.write_text(json.dumps(data), encoding="utf-8")
+
+    def save(self: DiagnosticDialog) -> int:
+        assert self.save_to(folder_a / "診断.txt")
+        return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(DiagnosticDialog, "exec", save)
+    window.create_diagnostics()
+    assert PreferenceStore().stored().report_folder == str(folder_a)
+    assert window._preferences.report_folder == str(folder_a)

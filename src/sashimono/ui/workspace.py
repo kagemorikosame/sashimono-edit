@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Collection
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -1616,8 +1617,12 @@ class PreferenceStore:
             ai_image_edge=_member(data.get("ai_image_edge"), IMAGE_EDGES, plain.ai_image_edge),
         )
 
-    def save(self, preferences: Preferences) -> None:
+    def save(self, preferences: Preferences, *, always: Collection[str] = ()) -> None:
         """この窓で変えた項目だけを、書いてある中身へ重ねて書く
+
+        ``always`` の項目は、前に読んだ値と同じでも必ず書く 書いた後のファイルの値を、この窓の
+        値に必ずそろえたい所で使う（診断情報の保存の置き場 #516） 前に読んだ値と同じだと
+        「変えていない」と見て書かず、ほかの窓がその後に書いた別の値が残る（PR #550 の指摘）
 
         窓はそれぞれ起動したときに読んだ設定を持っている 丸ごと書き戻すと、ほかの窓が
         その後に変えた項目（テーマなど）を、この窓が別の項目（磁石など）を変えただけで
@@ -1642,7 +1647,7 @@ class PreferenceStore:
                     {
                         name: value
                         for name, value in ours.items()
-                        if name not in before or before[name] != value
+                        if name in always or name not in before or before[name] != value
                     }
                 )
             write_atomic(self.path, json.dumps(data, ensure_ascii=False, indent=2))

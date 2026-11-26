@@ -4259,7 +4259,9 @@ class MainWindow(QMainWindow):
         changed = replace(self._preferences, report_folder=folder)
         if folder != PreferenceStore().stored().report_folder:
             try:
-                PreferenceStore().save(changed)
+                # 前に読んだ値と同じでも書く ほかの窓がその後に別の置き場を書いていると、
+                # 「変えていない」と見て書かず、次の起動でそちらに戻る（PR #550 の指摘）
+                PreferenceStore().save(changed, always={"report_folder"})
             except OSError as exc:
                 message += f"（保存した場所は設定に書けなかったので覚えていません: {exc}）"
             else:
