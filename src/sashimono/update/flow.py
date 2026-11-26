@@ -202,7 +202,7 @@ def apply_on_start(
         return False  # ほかの窓が新しい版を落としている 置き場が替わる途中なので触らない
     # 予約した版を照らしてから入れ替え係が走り出すまで、落とす側の錠を押さえる 押さえないと、
     # 照らした直後にほかの窓が別の版を落として置き場を差し替え、予約していない版へ入れ替わる
-    # （画面からの入れ替え UpdateController._restart と同じ守り #528）
+    # （画面からの入れ替え UpdateController._hand_over と同じ守り #528）
     try:
         stage_lock = try_hold(lock_path(STAGE_LOCK, store.path.parent))
     except OSError:
@@ -212,6 +212,11 @@ def apply_on_start(
     if stage_lock is None:
         return False
     try:
+        # 錠を取ってからもう一度入れ替え係を見る 上で見た後に、ほかの窓が入れ替え係を起こして
+        # 落とす側の錠を放すことがある 見逃すと、予約の印はもう下りているので編集画面を出し、
+        # 入れ替え係をこの窓が閉じるまで待たせる（prepare・_drop_staged と同じ順）
+        if busy_with(store.path.parent) == "swap":
+            return not started_by_swapper()
         return _apply_reserved(arguments, layout, store, swap, current, choices)
     finally:
         stage_lock.release()

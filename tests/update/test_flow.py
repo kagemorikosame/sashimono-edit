@@ -101,6 +101,39 @@ class TestApplyingOnStart:
         # 走り出した後は入れ替え係の錠が守る 持ったままだと、閉じるまで落とす側が止まる
         assert not is_held(stage_lock)
 
+    def test_a_swapper_started_while_taking_the_lock_is_seen(
+        self, layout: Layout, store: UpdateStateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """落とす側の錠を取る直前に、ほかの窓が入れ替え係を起こして錠を放した
+        錠を取る前にしか見ないと、編集画面を出して入れ替え係をこの窓が閉じるまで待たせる
+        """
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        swapping: list[HeldLock | None] = []
+
+        def swapper_starts_first(path: Path) -> HeldLock | None:
+            swapping.append(try_hold(lock_path(SWAP_LOCK, store.path.parent)))
+            return try_hold(path)
+
+        monkeypatch.setattr("sashimono.update.flow.try_hold", swapper_starts_first)
+        plans: list[SwapPlan] = []
+
+        def swap(plan: SwapPlan) -> bool:
+            plans.append(plan)
+            return True
+
+        try:
+            # 入れ替え係に起こされた版ではないので、画面を出さずに終わる（真）
+            assert apply_on_start(["x"], layout=layout, store=store, swap=swap, current="1.1.0")
+        finally:
+            for held in swapping:
+                if held is not None:
+                    held.release()
+        assert plans == []
+        # 予約は走っている入れ替え係に任せたまま 印も下ろさない
+        assert store.load().apply_on_start
+        assert not is_held(lock_path(STAGE_LOCK, store.path.parent))
+
     def test_an_unwritable_update_folder_starts_normally(
         self, layout: Layout, store: UpdateStateStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
