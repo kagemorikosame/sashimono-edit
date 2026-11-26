@@ -2,7 +2,7 @@
 
 import os as _os
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 #: numpy の行列計算（OpenBLAS）が使うスレッドの数の上限（#454）
 #:
