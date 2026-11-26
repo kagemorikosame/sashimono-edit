@@ -1286,6 +1286,8 @@ CHOICE_PREFERENCES = frozenset(
         "dock_tabs",
         "emphasis_easing",
         "encoder_priority",
+        "explorer_double_click",
+        "explorer_view",
         "export_format",
         "insert_paste",
         "keyframe_drag",
