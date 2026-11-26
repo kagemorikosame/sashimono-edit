@@ -69,7 +69,10 @@ class TestTool:
         # 指示に無いと、AI はレシピを読まずに自分の加減で演出を付ける
         prompt = system_prompt()
         assert "get_direction_recipes" in prompt
-        assert "本人が取り込んだ音の素材だけ" in prompt
+        # 効果音の出どころは本人が登録したフォルダか取り込んだ音だけ（#522） 無ければ付けない
+        assert "search_library" in prompt
+        assert "sound_file_id" in prompt
+        assert "どちらも無ければ付けずに" in prompt
 
 
 class TestTheSetting:

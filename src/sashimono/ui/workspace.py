@@ -66,6 +66,13 @@ from sashimono.core.emphasis import (
 )
 from sashimono.core.io.atomic import held_for_update, write_atomic
 from sashimono.core.io.serialize import ProjectFileError, style_guide_from_json
+from sashimono.core.material_library import (
+    DEFAULT_AI_CATEGORIES,
+    LibraryFolder,
+    parse_categories,
+    parse_folders,
+    parse_paths,
+)
 from sashimono.core.mixing import (
     DEFAULT_DUCK_ATTACK_MS,
     DEFAULT_DUCK_DEPTH_DB,
@@ -147,6 +154,10 @@ __all__ = [
     "DOCK_TABS_BOTTOM",
     "DOCK_TABS_TOP",
     "DOCK_TAB_POSITIONS",
+    "EXPLORER_DOUBLE_CLICKS",
+    "EXPLORER_ICON_SIZES",
+    "EXPLORER_PREVIEW_VOLUME_RANGE",
+    "EXPLORER_VIEWS",
     "LAYOUT_VERSION",
     "LIMIT_ACTIONS",
     "MAX_PREFETCH_MB",
@@ -321,6 +332,13 @@ AI_IMAGE_LIMITS = (0, 10_000)
 AI_MINUTE_LIMITS = (0, 1440)
 #: 持ち出し用パッケージの、使う範囲の前後の余裕（秒）の範囲 長すぎると範囲だけ入れる意味が無い
 PACKAGE_MARGINS = (0, 60)
+#: エクスプローラーの試聴の音量（%）の範囲 上げるのは割れるので 100 まで
+EXPLORER_PREVIEW_VOLUME_RANGE = (0, 100)
+#: エクスプローラーの表示・アイコンの幅・ダブルクリックの動きの値（:mod:`sashimono.ui.explorer`
+#: の ``VIEW_MODES`` ``ICON_SIZE_RANGE`` ``DOUBLE_CLICK_ACTIONS`` とそろえる 試験が照らす）
+EXPLORER_VIEWS = ("list", "icons")
+EXPLORER_ICON_SIZES = (64, 256)
+EXPLORER_DOUBLE_CLICKS = ("preview", "timeline")
 #: 素材を読み込んだときに場面の一覧を裏で作るか（#321） :attr:`Preferences.scene_analysis` の値
 #: AI アシスタントが入っているときだけ・いつも・作らない（AI が頼んだときだけ読む）
 SCENES_WITH_AI = "with_ai"
@@ -877,6 +895,37 @@ class Preferences:
     direction_genre: str = DEFAULT_GENRE
     #: 強さ（:data:`~sashimono.core.direction_recipes.STRENGTHS`）
     direction_strength: str = DEFAULT_STRENGTH
+    #: エクスプローラー（#520 #521）に登録したフォルダと分類 既定は空（素材は同梱せず、
+    #: ネットからも取らない 2026-11-24 本人の決定） 分類はフォルダごとに 1 つ
+    #: エクスプローラーと `表示 → 設定…` の両方から変えられる
+    explorer_folders: tuple[LibraryFolder, ...] = ()
+    #: AI アシスタントが自動で使ってよい分類（#522） 既定は効果音と BGM だけ 動画と画像は
+    #: 作品の絵そのものを変えるので、使わせたい人だけが選ぶ（同じく本人の決定）
+    explorer_ai_categories: tuple[str, ...] = DEFAULT_AI_CATEGORIES
+    #: AI が頼まれなくても BGM を付けてよいか 既定は頼まれたときだけ（勝手に曲が鳴ると、
+    #: 曲の要らない作品で 1 本ずつ外す手間が要る 足りなければ頼めば付く）
+    explorer_ai_bgm: bool = False
+    #: エクスプローラーで試聴する音量（%） 100 は作品の再生と同じ大きさ（素材をそのまま鳴らす）
+    #: 大きな効果音を続けて聞くと耳が疲れるので、下げたい人が下げられるようにする
+    explorer_preview_volume: int = 100
+    #: エクスプローラーの表示 一覧（列のある表 既定）かアイコン（見本の絵） 一覧の方が名前と
+    #: 長さを並べて比べられ、見本の絵を作る裏の仕事も起きない パネルのボタンで選んだ物を覚える
+    explorer_view: str = EXPLORER_VIEWS[0]
+    #: アイコン表示の絵の幅（画素） パネルの大きさのスライダーで選んだ物を覚える
+    explorer_icon_size: int = 128
+    #: 中身の行をダブルクリックしたとき 下見で再生する（既定 メディアブラウザーと同じ）か、
+    #: タイムラインへ置くか 置く方に慣れた人は変えられる
+    #: 置くのはドラッグと〔タイムラインへ〕でもできる
+    explorer_double_click: str = EXPLORER_DOUBLE_CLICKS[0]
+    #: エクスプローラーのお気に入り（ファイルとフォルダの場所 入れた順） すぐ呼び出したい素材を
+    #: 木の一番上にまとめる（2026-11-24 本人の要望） 作品ではなく本人に付ける（どの作品を開いても
+    #: 同じ） 消えた・移った物も外さずに残す 欄の名前を ``_paths`` で終えるのは、AI へ送る設定の
+    #: 写しで名前と場所として値ごと伏せるため（:mod:`sashimono.ai.outbound`）
+    explorer_favorite_paths: tuple[str, ...] = ()
+    #: 最後に開いていたフォルダと選んでいたファイル 次の起動ではそこから開く 好みではなく
+    #: 覚えている物なので、書き出しのフォルダと同じく設定画面には出さない
+    explorer_last_folder: str = ""
+    explorer_last_file: str = ""
     #: AI アシスタントがジャンプカットのつなぎ目を目立たなくする（#332）ときの既定
     #: 溶かすか寄るか・どれだけの長さかは人と作品で違う AI に値を言わなければこれを使う
     #: 既定は短いクロスフェードと 20 ms の音のフェード（絵の中身が欠けない側
@@ -1508,6 +1557,28 @@ class PreferenceStore:
             direction_strength=_choice(
                 data.get("direction_strength"), tuple(STRENGTHS), plain.direction_strength
             ),
+            explorer_folders=parse_folders(data.get("explorer_folders")),
+            explorer_ai_categories=parse_categories(
+                data.get("explorer_ai_categories"), plain.explorer_ai_categories
+            ),
+            explorer_ai_bgm=_flag(data.get("explorer_ai_bgm"), plain.explorer_ai_bgm),
+            explorer_preview_volume=_within(
+                data.get("explorer_preview_volume"),
+                EXPLORER_PREVIEW_VOLUME_RANGE,
+                plain.explorer_preview_volume,
+            ),
+            explorer_view=_choice(data.get("explorer_view"), EXPLORER_VIEWS, plain.explorer_view),
+            explorer_icon_size=_within(
+                data.get("explorer_icon_size"), EXPLORER_ICON_SIZES, plain.explorer_icon_size
+            ),
+            explorer_double_click=_choice(
+                data.get("explorer_double_click"),
+                EXPLORER_DOUBLE_CLICKS,
+                plain.explorer_double_click,
+            ),
+            explorer_favorite_paths=parse_paths(data.get("explorer_favorite_paths")),
+            explorer_last_folder=_text(data.get("explorer_last_folder"), ""),
+            explorer_last_file=_text(data.get("explorer_last_file"), ""),
             seam_video=_choice(data.get("seam_video"), SEAM_VIDEOS, plain.seam_video),
             seam_crossfade_ms=_within(
                 data.get("seam_crossfade_ms"), SEAM_CROSSFADE_MS_RANGE, plain.seam_crossfade_ms

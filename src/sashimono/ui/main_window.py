@@ -174,6 +174,11 @@ from sashimono.core.io.library import Library
 from sashimono.core.io.media_memory import MediaMemory, fingerprint, with_remembered
 from sashimono.core.io.recovery import TrimItem
 from sashimono.core.io.serialize import keep_pre_upgrade_copy
+from sashimono.core.material_library import (
+    LibraryFolder,
+    MaterialLibrary,
+    MeasureBook,
+)
 from sashimono.core.mixing import (
     DuckShape,
     gain_commands,
@@ -213,6 +218,7 @@ from sashimono.effects import registry as effect_registry
 from sashimono.effects.emphasis import EmphasisRequest, emphasis_commands, emphasis_label
 from sashimono.effects.seams import seam_transition
 from sashimono.effects.sources import SHAPE, TEXT, TRANSITION
+from sashimono.engine.audio.library_sound import measure_library_file
 from sashimono.engine.audio.mixer import history_seconds
 from sashimono.engine.audio.speech import (
     SpeechError,
@@ -281,6 +287,7 @@ from sashimono.ui.backup_settings import (
 )
 from sashimono.ui.chat import ChatPanel
 from sashimono.ui.emphasis_dialog import ask_emphasis
+from sashimono.ui.explorer import ExplorerPanel
 from sashimono.ui.export_dialog import ExportDialog, credit_text
 from sashimono.ui.graph_editor import GraphEditor
 from sashimono.ui.idle_collect import IdleCollect
@@ -365,6 +372,11 @@ _PORTABLE = QKeySequence.SequenceFormat.PortableText
 #: 頭は黒からのフェードや、カメラを向ける前の揺れで、中身の分からない絵が多い
 #: 短い素材では最後の 1 枚に止まる（:meth:`Filmstrip.at`）
 POOL_THUMBNAIL_SECONDS = Fraction(1)
+
+#: エクスプローラーの素材を測った長さと大きさの控え（#522 キャッシュの置き場の中）
+EXPLORER_MEASURES = "explorer_measures.json"
+#: エクスプローラーの見本の絵と波形の控え（キャッシュの置き場の中） 開くたびに作り直さない
+EXPLORER_THUMBS = "explorer_thumbs"
 
 #: AviUtl のオブジェクトファイル
 EXO_FILTER = "AviUtl オブジェクト (*.exo *.exa *.exo2 *.exa2);;すべてのファイル (*)"
@@ -675,7 +687,9 @@ class MainWindow(QMainWindow):
         #: 作品をまたいで覚える素材の置き方の既定（#524）
         self._media_memory = MediaMemory()
         #: 待っている読み込み パスと、タイムラインへ落とされた位置（落とされていなければ ``None``）
-        self._import_queue: list[tuple[list[Path], _DropTarget | None]] = []
+        self._import_queue: list[tuple[list[Path], _DropTarget | None, bool]] = []
+        #: 素材一覧へだけ入れる読み込み（エクスプローラーの〔素材一覧へ読み込む〕 #521）
+        self._pool_only: weakref.WeakSet[ProbeBatch] = weakref.WeakSet()
         #: タイムラインへ落とされた読み込みの、置く位置 走っている分の結果と一緒に引く
         #: 読み込みに引っ掛けて持つのは、取り消しやプロジェクトの切り替えで読み込みを
         #: 捨てたときに、位置だけが残って次の読み込みに当たらないようにするため
@@ -783,6 +797,26 @@ class MainWindow(QMainWindow):
         self._timeline.set_snap(self._preferences.timeline_snap, self._preferences.snap_distance)
         self._timeline.set_playhead_snap(PlayheadSnap.from_preferences(self._preferences))
         self._media_pool = MediaPoolWidget(project, self)
+        # 登録したフォルダの素材（#520 #521） 測った長さと大きさの控えは AI の道具（#522）と
+        # 一覧の行で同じ物を使う 測り直すと数百の効果音で数十秒待たせる
+        self._explorer_measures = MeasureBook(userdirs.cache_root() / EXPLORER_MEASURES)
+        self._explorer = ExplorerPanel(
+            self._preferences.explorer_folders,
+            self,
+            book=self._explorer_measures,
+            before_play=self._stop_for_explorer,
+            thumbs=userdirs.cache_root() / EXPLORER_THUMBS,
+            # 初めて見せるまで中身を読まない 開かずに編集を始めただけで、裏で数百の素材を測らない
+            active=False,
+        )
+        self._apply_explorer_preferences(self._preferences)
+        # 前回の場所から開く（#521） 消えていれば先頭から 選び直しのたびに設定を書かないよう、
+        # 動いた場所は覚えておき、窓を閉じるときに書く
+        self._explorer_location = (
+            self._preferences.explorer_last_folder,
+            self._preferences.explorer_last_file,
+        )
+        self._explorer.restore_location(*self._explorer_location)
         self._inspector = InspectorPanel(self)
         # 設定パネルは選んだクリップを引くためにプロジェクトを持つ 起動直後にも渡す
         # （渡さないと、最初の編集まで何本も選んだときのまとめ当てが効かない）
@@ -882,6 +916,20 @@ class MainWindow(QMainWindow):
         # タブが裏にある間は字幕の一覧を作り直さない（選ぶたびに見えない表を組んでいた #455）
         subtitle_dock.visibilityChanged.connect(self._subtitles.set_shown)
         self._subtitle_dock = subtitle_dock
+
+        # エクスプローラー（#521）も素材を選ぶパネルなので、素材一覧と同じ所にタブで重ねる
+        explorer_dock = self._dock("エクスプローラー", "explorer")
+        explorer_dock.setWidget(self._explorer)
+        explorer_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, explorer_dock)
+        self.tabifyDockWidget(pool_dock, explorer_dock)
+        pool_dock.raise_()
+        self._explorer_dock = explorer_dock
+        # 隠したら下見を止める（閉じたパネルの下見が鳴り続け、止めるのにまた開くことになる）
+        # 初めて見せたときに中身を読み始める（:meth:`ExplorerPanel.set_active`）
+        explorer_dock.visibilityChanged.connect(self._on_explorer_visible)
 
         chat_dock = self._dock("AI アシスタント", "chat")
         chat_dock.setWidget(self._chat)
@@ -1193,6 +1241,7 @@ class MainWindow(QMainWindow):
             QKeySequence("Ctrl+G"),
             lambda: self._graph_dock.setVisible(not self._graph_dock.isVisible()),
         )
+        self._add(view_menu, "エクスプローラー", QKeySequence(), self.show_explorer)
         view_menu.addSeparator()
         self._add(
             view_menu,
@@ -1320,6 +1369,7 @@ class MainWindow(QMainWindow):
         scenes_before = self._scenes_on_import()
         screen_before = self._screen_on_import()
         self._preferences = preferences
+        self._apply_explorer_preferences(preferences)
         self._apply_scene_preferences(scenes_before)
         self._apply_screen_preferences(screen_before)
         try:
@@ -1621,6 +1671,26 @@ class MainWindow(QMainWindow):
             lambda clip_id: self.freeze_at_playhead(ClipId(clip_id))
         )
         self._media_pool.search_requested.connect(self.show_media_search)
+        self._explorer.folders_changed.connect(self._on_explorer_folders)
+        self._explorer.place_requested.connect(self._place_explorer_files)
+        self._explorer.message.connect(lambda text: self.statusBar().showMessage(text, 5000))
+        self._explorer.import_requested.connect(
+            lambda paths: self.import_media(list(paths), pool_only=True)
+        )
+        self._explorer.favorites_changed.connect(
+            lambda favorites: self._remember_preferences(
+                replace(self._preferences, explorer_favorite_paths=tuple(favorites))
+            )
+        )
+        self._explorer.location_changed.connect(self._on_explorer_location)
+        self._explorer.view_mode_changed.connect(
+            lambda mode: self._remember_preferences(replace(self._preferences, explorer_view=mode))
+        )
+        self._explorer.icon_size_changed.connect(
+            lambda size: self._remember_preferences(
+                replace(self._preferences, explorer_icon_size=size)
+            )
+        )
         self._timeline.status_message.connect(
             lambda message: self.statusBar().showMessage(message, 4000)
         )
@@ -1702,6 +1772,11 @@ class MainWindow(QMainWindow):
 
         self._playback.frame_changed.connect(self._on_playback_frame)
         self._playback.state_changed.connect(self._transport.set_playing)
+        # 作品を鳴らし始めたらエクスプローラーの下見を止める ボタンもショートカットも
+        # ここを通る 止めないと下見と作品の 2 つの音が重なる
+        self._playback.state_changed.connect(
+            lambda playing: self._explorer.preview.stop() if playing else None
+        )
         # 再生中は先読みを止める 同じ GPU を奪い合うと、いま出すべきコマが遅れる
         self._playback.state_changed.connect(self._preview.set_playing)
         # 先読みを止めたら伝える 黙って効かない状態にしない
@@ -1976,7 +2051,9 @@ class MainWindow(QMainWindow):
         if names:
             self.import_media([Path(name) for name in names])
 
-    def import_media(self, paths: list[Path], *, at: DropSpot | None = None) -> None:
+    def import_media(
+        self, paths: list[Path], *, at: DropSpot | None = None, pool_only: bool = False
+    ) -> None:
         """素材を読み込んでタイムラインへ置く 調べるのは裏のスレッドで、待たずに返る
 
         複数選ばれた場合もまとめて 1 回の Undo で戻せるようにする
@@ -1986,6 +2063,7 @@ class MainWindow(QMainWindow):
         ダイアログ・一覧のボタン・一覧やタイムラインへの落とし込みは、どれもここへ来る
         ``at`` はタイムラインへ落とされた位置 無ければ末尾へ並べる 落とされた位置は、
         そのとき開いているシーンの位置として覚える（:meth:`_apply_import`）
+        ``pool_only`` は素材一覧へ入れるだけで置かない（エクスプローラーの〔素材一覧へ読み込む〕）
         """
         if not paths:
             return
@@ -1995,10 +2073,10 @@ class MainWindow(QMainWindow):
             else None
         )
         if self._import is not None:
-            self._import_queue.append((list(paths), target))
+            self._import_queue.append((list(paths), target, pool_only))
             self._show_import_progress()
             return
-        self._start_import(list(paths), target)
+        self._start_import(list(paths), target, pool_only)
 
     @property
     def importing(self) -> bool:
@@ -2085,7 +2163,9 @@ class MainWindow(QMainWindow):
             time.sleep(0.005)
         return True
 
-    def _start_import(self, paths: list[Path], at: _DropTarget | None = None) -> None:
+    def _start_import(
+        self, paths: list[Path], at: _DropTarget | None = None, pool_only: bool = False
+    ) -> None:
         # probe_media はこのモジュールの名前から引く 試験がここを差し替えて、
         # 開けない素材や断られる読み込みを作る
         # 読み込み直しでは必ず開き直す 覚えた結果は再生中のデコーダの作り直しのための物
@@ -2094,6 +2174,8 @@ class MainWindow(QMainWindow):
         self._import = ProbeBatch(paths, self._import_probe())
         if at is not None:
             self._import_spots[self._import] = at
+        if pool_only:
+            self._pool_only.add(self._import)
         self._show_import_progress()
         self._import_timer.start()
 
@@ -2206,14 +2288,18 @@ class MainWindow(QMainWindow):
         spot = target.spot if target is not None else None
         scene = target.scene if target is not None else self._active_scene
         outcomes = batch.results()
-        if self._scene_project(scene) is not None:
+        # 素材一覧へ入れるだけなら作品の大きさとレートを合わせない 合わせるのは別の取り消しの
+        # 段なので、読み込みを取り消しても作品の設定だけが変わったまま残る
+        if self._scene_project(scene) is not None and batch not in self._pool_only:
             self._match_project_to([item for item in outcomes if isinstance(item, MediaItem)])
         if spot is not None and target is not None:
             now = self._document.project.rate
             spot = replace(spot, frame=retime_frame(spot.frame, target.rate, now))
         found = self._scene_project(scene)
         lost = found is None
-        if found is None:
+        pool_only = batch in self._pool_only
+        if found is None or pool_only:
+            # 素材一覧はメインの物 シーンを開いていても、入れるだけならメインへ入れる
             project, spot, scene = self._document.project, None, None
         else:
             project = found
@@ -2222,7 +2308,11 @@ class MainWindow(QMainWindow):
             if isinstance(outcome, ProbeError):
                 failures.append(str(outcome))
                 continue
-            placed = [AddMedia(outcome)] if lost else self._place_dropped(project, outcome, spot)
+            placed = (
+                [AddMedia(outcome)]
+                if lost or pool_only
+                else self._place_dropped(project, outcome, spot)
+            )
             if spot is not None:
                 spot = spot.after(placed)
             for command in placed:
@@ -2240,7 +2330,7 @@ class MainWindow(QMainWindow):
         for media in loaded:
             self._request_analysis(media)
             self._request_proxy(media)
-        small = None if lost else self._small_hint(commands)
+        small = None if lost or pool_only else self._small_hint(commands)
         if small is not None:
             # 1 つの知らせにまとめる 続けて出すと、件数か失敗の訳が合わせ方を上書きする
             # 失敗の訳は後ろへ置く パスと理由が長く、前に置くと合わせ方が画面の外へ押し出される
@@ -2249,6 +2339,8 @@ class MainWindow(QMainWindow):
             )
         elif failures:
             self.statusBar().showMessage(failures[0], 5000)
+        elif pool_only and commands:
+            self.statusBar().showMessage(f"{batch.total} 件を素材一覧へ読み込んだ", 3000)
         elif lost and commands:
             self.statusBar().showMessage(
                 "落とした先のシーンが無くなったので、素材を一覧へ入れるだけにした", 5000
@@ -2508,6 +2600,58 @@ class MainWindow(QMainWindow):
         """
         strip = self._analyzer.filmstrip(media)
         return strip.at(POOL_THUMBNAIL_SECONDS) if strip is not None else None
+
+    def _on_explorer_folders(self, folders: tuple[LibraryFolder, ...]) -> None:
+        """エクスプローラーで登録を変えた 設定に覚え、次に開いたときも同じ登録にする"""
+        self._remember_preferences(replace(self._preferences, explorer_folders=tuple(folders)))
+
+    def _place_explorer_files(self, paths: list[Path]) -> None:
+        """エクスプローラーの〔タイムラインへ〕 読み込んで再生位置へ置く
+
+        OS のエクスプローラーから落としたときと同じ読み込みを通す 置いた物は取り消し 1 回で戻る
+        空の作品で最初の動画に作品の形を合わせたときは、合わせたのは別の段（:meth:`_match_project_to`
+        の決まり 置き方だけを戻したいことが多いため）
+        """
+        self.import_media(list(paths), at=DropSpot(self._timeline.playhead, None))
+
+    def _on_explorer_location(self, folder: str, file: str) -> None:
+        self._explorer_location = (folder, file)
+
+    def _remember_explorer_location(self) -> None:
+        """エクスプローラーの最後の場所を覚える 変わっていなければ書かない"""
+        folder, file = self._explorer_location
+        preferences = self._preferences
+        if (folder, file) != (preferences.explorer_last_folder, preferences.explorer_last_file):
+            self._remember_preferences(
+                replace(preferences, explorer_last_folder=folder, explorer_last_file=file)
+            )
+
+    def _stop_for_explorer(self) -> None:
+        """エクスプローラーの下見を鳴らす前 作品を再生していれば止める（2 つの音が重なると
+        聞き分けられない） 下見の音は作品の時計を動かさない
+        """
+        if self._playback.is_playing:
+            self._playback.toggle()
+
+    def _apply_explorer_preferences(self, preferences: Preferences) -> None:
+        explorer = self._explorer
+        explorer.set_folders(preferences.explorer_folders)
+        explorer.set_favorites(preferences.explorer_favorite_paths)
+        explorer.set_preview_volume(preferences.explorer_preview_volume)
+        explorer.set_view_mode(preferences.explorer_view)
+        explorer.set_icon_size(preferences.explorer_icon_size)
+        explorer.set_double_click(preferences.explorer_double_click)
+
+    def _on_explorer_visible(self, visible: bool) -> None:
+        if visible:
+            self._explorer.set_active(True)
+        else:
+            self._explorer.preview.stop()
+
+    def show_explorer(self) -> None:
+        """エクスプローラーのパネルを前へ出す"""
+        self._explorer_dock.show()
+        self._explorer_dock.raise_()
 
     def _on_pool_view_changed(self, mode: str) -> None:
         """一覧の上のボタンで表示を切り替えた 好みの設定に書いて、次に開いたときも同じにする"""
@@ -4832,6 +4976,18 @@ class MainWindow(QMainWindow):
         return self._preferences.direction_taste
 
     @property
+    def material_library(self) -> MaterialLibrary:
+        preferences = self._preferences
+        return MaterialLibrary(
+            folders=preferences.explorer_folders,
+            ai_categories=preferences.explorer_ai_categories,
+            auto_bgm=preferences.explorer_ai_bgm,
+            book=self._explorer_measures,
+            measure=measure_library_file,
+            favorites=preferences.explorer_favorite_paths,
+        )
+
+    @property
     def seam_style(self) -> SeamStyle:
         return self._preferences.seam_style
 
@@ -5418,6 +5574,19 @@ class MainWindow(QMainWindow):
         names.update(self._package.remembered_names())
         if self._path is not None:
             names.add(str(self._path))
+        # エクスプローラーに登録したフォルダ（#520） 設定の写しと search_library に出る
+        names.update(folder.path for folder in self._preferences.explorer_folders)
+        # お気に入りと前回の場所も、設定の写しに場所として載る
+        names.update(self._preferences.explorer_favorite_paths)
+        names.update(
+            place
+            for place in (
+                self._preferences.explorer_last_folder,
+                self._preferences.explorer_last_file,
+                *self._explorer_location,
+            )
+            if place
+        )
         names.update(
             folder
             for folder in (
@@ -5446,6 +5615,22 @@ class MainWindow(QMainWindow):
             for dock in self.findChildren(QDockWidget)
         }
         preferences = asdict(self._preferences)
+        # AI に使わせない分類の登録したフォルダは、名前と場所を送ると決めた人の所でも載せない
+        # 本人が「AI に見せない」と選んだ物の場所まで外へ出さないため
+        preferences["explorer_folders"] = [
+            folder
+            for folder in preferences["explorer_folders"]
+            if folder["category"] in self._preferences.explorer_ai_categories
+        ]
+        # お気に入りと前回の場所も、AI に使わせない分類の登録したフォルダの中の物は載せない
+        # 登録の行だけを除いても、その中の場所がここから外へ出る
+        hidden = self._hidden_from_ai
+        preferences["explorer_favorite_paths"] = [
+            place for place in self._preferences.explorer_favorite_paths if not hidden(place)
+        ]
+        for key in ("explorer_last_folder", "explorer_last_file"):
+            if hidden(str(preferences[key])):
+                preferences[key] = ""
         # 新しい作品の編集の方針（#343）は本人の文 アプリの設定は同意なしで送るので、ここに
         # 載せると字幕と文字を送らないと決めた人の文まで外へ出る 有る無しだけを残す
         # （作品の方針は get_style_guide が字幕と文字として同意を取って読む）
@@ -5473,6 +5658,19 @@ class MainWindow(QMainWindow):
                 "読むだけです 変えるのは人だけです（表示 → 設定… / ショートカットの設定… など）"
             ),
         }
+
+    def _hidden_from_ai(self, place: str) -> bool:
+        """``place`` を AI へ見せないか（AI に使ってよい分類の登録したフォルダの中の物だけ見せる）
+
+        中に別の登録があれば、場所を含む登録のうち一番深い物の分類で決める（AI の見て回り方と同じ）
+        どの登録の中でもない場所（登録を外した後に残ったお気に入りなど）も見せない
+        見せると、外した登録の中の場所がここから外へ出る
+        """
+        if not place:
+            return False
+        # 含むかと深さは同じそろえ方の場所で比べる（`..` を含む書き方の登録でも深さを誤らない）
+        deepest = MaterialLibrary(folders=self._preferences.explorer_folders).owner_of(place)
+        return deepest is None or deepest.category not in self._preferences.explorer_ai_categories
 
     def view_state(self) -> ViewState:
         """人が画面で見ている表示の状態（#352 :class:`EditorHost` を参照） 読むだけ"""
@@ -5927,6 +6125,9 @@ class MainWindow(QMainWindow):
         # 人の窓で作っている途中の声も、AI の書き出しと同じく止めて捨てる（#335） 残すと、
         # 閉じた後もイベントループが回る場面で、閉じた窓へ WAV を書いて声を置きに来る
         self._stop_narration()
+        self._explorer.shutdown()
+        self._explorer_measures.save()
+        self._remember_explorer_location()
         self._playback.close()
         if self._ai_renderer is not None:
             self._ai_renderer.close()
