@@ -40,6 +40,10 @@ def item_text(item: DirectionItem) -> str:
     if item.amount is not None:
         unit = " %" if item.action == "zoom" else " px"
         text += f" {item.amount}{unit}"
+    if item.sound_name:
+        # どの音を付けるかを〔付ける〕の前に見せる 登録したフォルダから AI が選んだ音（#522）は、
+        # 人がまだ聞いていないことがある
+        text += f"（{item.sound_name}）"
     return text
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
+from pathlib import Path
 
 import pytest
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
@@ -140,3 +141,54 @@ class TestDirectionBox:
         assert host.document.project is before
         assert "やめました" in box.status_text()
         assert box.apply_button.isHidden() is True
+
+
+def test_sounds_read_in_by_the_plan_are_analysed(
+    made: tuple[ChatPanel, FakeHost], tmp_path: Path
+) -> None:
+    # 壊れると、計画から取り込んだ効果音の波形と絵の並びが作られず、タイムラインに波形が出ない
+    from sashimono.core.material_library import (
+        CATEGORY_SOUND_EFFECT,
+        LibraryFolder,
+        MaterialLibrary,
+        Measure,
+        file_id,
+    )
+    from sashimono.core.model import AudioStreamInfo
+    from tests.ai.pending import settle
+
+    widget, host = made
+    sound = tmp_path / "SE" / "ドン.wav"
+    sound.parent.mkdir()
+    sound.write_bytes(b"x")
+    host.material = MaterialLibrary(
+        folders=(LibraryFolder(str(sound.parent), CATEGORY_SOUND_EFFECT),),
+        measure=lambda _path: Measure(seconds=0.8, has_audio=True, has_video=False),
+    )
+    host.probe_result = MediaItem(
+        path=sound,
+        duration=Fraction(4, 5),
+        audio_streams=(
+            AudioStreamInfo(
+                index=0,
+                sample_rate=48000,
+                channels=2,
+                time_base=Fraction(1, 48000),
+                codec="pcm_s16le",
+            ),
+        ),
+    )
+    search = find_operation("search_library")
+    assert search is not None
+    settle(search(host, {}))
+    propose = find_operation("propose_direction")
+    assert propose is not None
+    cues = [
+        {"signal": "laughter", "start_frame": t * 30, "end_frame": t * 30 + 30, "score": 0.9}
+        for t in range(5, _SECONDS, 10)
+    ]
+    propose(host, {"cues": cues, "sound_file_id": file_id(sound)})
+    before = {media.id for media in host.document.project.media}
+    widget.apply_direction()
+    added = [m.id for m in host.document.project.media if m.id not in before]
+    assert added and all(media_id in host.analyzed for media_id in added)

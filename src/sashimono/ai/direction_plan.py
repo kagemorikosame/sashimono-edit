@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import threading
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from fractions import Fraction
+from pathlib import Path
 
-from sashimono.core.commands import AddClip, AddTrack, Command
+from sashimono.core.commands import AddClip, AddMedia, AddTrack, Command
 from sashimono.core.commands.history import Author, Document
 from sashimono.core.direction import (
     NARRATION_FOLDER,
@@ -37,6 +38,7 @@ from sashimono.core.direction_recipes import (
     ACTIONS,
     PlannedDirection,
 )
+from sashimono.core.material_library import same_place
 from sashimono.core.model import (
     Clip,
     ClipId,
@@ -101,6 +103,14 @@ class DirectionItem:
     media_id: MediaId | None = None
     #: 欄に出す時刻（分:秒） 欄はフレームの速さを知らないので、作るときに決めておく
     at: str = ""
+    #: 効果音の素材の名前 欄に出し、何の音を付けるかを〔付ける〕の前に見せる
+    sound_name: str = ""
+    #: エクスプローラーに登録したフォルダから選んだ効果音（#522） まだ作品の素材ではないので、
+    #: 〔付ける〕で素材へ入れてから置く 計画を出すだけでは作品を変えない（素材一覧にも出さない）
+    sound_media: MediaItem | None = None
+    #: ``sound_media`` を調べたときのファイルの版（大きさ, 更新時刻） 〔付ける〕までに差し替わった
+    #: ファイルを、計画を出したときの長さと流れのまま取り込まない
+    sound_version: tuple[int, int] | None = None
 
     @property
     def action_name(self) -> str:
@@ -113,6 +123,9 @@ class ApplyResult:
 
     applied: tuple[int, ...]
     skipped: tuple[tuple[int, str], ...] = ()
+    #: 付けた効果音の項目が実際に使った素材（項目の番号, 素材） 計画の後で同じファイルを取り込んで
+    #: いたときは、計画の素材でなくその素材を使うので、計画の返事にはこちらを出す
+    media: tuple[tuple[int, MediaId], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,17 +223,20 @@ class DirectionProposal:
         """〔やめる〕 何も付けずに閉じる"""
         self._finish(ProposalState.CANCELLED, None)
 
-    def apply(self, document: Document) -> ApplyResult | None:
+    def apply(
+        self, document: Document, allowed: Callable[[MediaItem], bool] | None = None
+    ) -> ApplyResult | None:
         """外していない項目を 1 回の取り消しで戻せるまとまりとして付ける 出していなければ ``None``
 
-        編集画面のスレッドから呼ぶ（文書を変えるため）
+        編集画面のスレッドから呼ぶ（文書を変えるため） ``allowed`` は登録したフォルダから
+        取り込む効果音を、付ける今もまだ AI に使ってよいか（:func:`apply_items`）
         """
         with self._lock:
             view = self._view
             if view is None or view.state is not ProposalState.PROPOSED:
                 return None
             chosen = view.chosen
-        result = apply_items(document, chosen)
+        result = apply_items(document, chosen, allowed)
         self._finish(ProposalState.APPLIED, result)
         return result
 
@@ -272,6 +288,7 @@ def build_items(
     clips: Sequence[ClipId | None],
     sound: MediaItem | None,
     limit: int,
+    sound_version: tuple[int, int] | None = None,
 ) -> tuple[list[DirectionItem], list[tuple[str, str]]]:
     """レシピの選んだ演出を、付ける先の決まった計画の項目にする
 
@@ -341,6 +358,15 @@ def build_items(
                 clip_id=clip_id,
                 media_id=media_id,
                 at=where,
+                sound_name=sound.name if sound is not None and media_id is not None else "",
+                sound_media=(
+                    sound
+                    if sound is not None
+                    and media_id is not None
+                    and project.find_media(sound.id) is None
+                    else None
+                ),
+                sound_version=sound_version,
             )
         )
         if len(items) >= ITEMS_LIMIT:
@@ -385,7 +411,11 @@ def _footage(project: Project, track: Track, clip: Clip, shown: set[TrackId]) ->
     )
 
 
-def apply_items(document: Document, items: Sequence[DirectionItem]) -> ApplyResult:
+def apply_items(
+    document: Document,
+    items: Sequence[DirectionItem],
+    allowed: Callable[[MediaItem], bool] | None = None,
+) -> ApplyResult:
     """``items`` を 1 回の取り消しで戻せるまとまりとして付ける
 
     項目ごとに今の作品から命令を組む 先に全部を組むと、同じクリップへの 2 つ目の寄りが
@@ -395,10 +425,40 @@ def apply_items(document: Document, items: Sequence[DirectionItem]) -> ApplyResu
     """
     applied: list[int] = []
     skipped: list[tuple[int, str]] = []
+    used: list[tuple[int, MediaId]] = []
     if not items:
         return ApplyResult((), ())
     with document.checkpoint(APPLY_LABEL, by=Author.AI):
         for item in items:
+            sound = item.sound_media
+            if (
+                sound is not None
+                and allowed is not None
+                and _held(document.project, sound) is None
+                and not allowed(sound)
+            ):
+                # 計画の後で登録を外した・AI に使わせない分類にした 計画を出したときの確かめだけで
+                # 取り込むと、本人が使わせないと決めた後の音が作品に入る
+                skipped.append(
+                    (item.number, "効果音のフォルダが AI に使わせない設定になったので付けません")
+                )
+                continue
+            if (
+                sound is not None
+                and item.sound_version is not None
+                and file_version(sound.path) != item.sound_version
+            ):
+                # 後から同じ場所のファイルを取り込んでいても版で見る（置くクリップの長さは計画の
+                # ときの長さ 差し替えた長い音を取り込んだ素材へ、短い長さのまま置かない）
+                # 計画の後でファイルが差し替わった（消えた） 計画を出したときに調べた長さと流れの
+                # まま取り込むと、置いたクリップが今のファイルと合わない
+                skipped.append(
+                    (
+                        item.number,
+                        "計画の後で効果音のファイルが変わったので付けません 計画し直してください",
+                    )
+                )
+                continue
             try:
                 commands = _commands(document.project, item)
                 # 先に写しへ当てて、項目の命令がすべて通るかを見る 通らない物（鍵の掛かった
@@ -418,7 +478,30 @@ def apply_items(document: Document, items: Sequence[DirectionItem]) -> ApplyResu
             for command in commands:
                 document.execute(command)
             applied.append(item.number)
-    return ApplyResult(tuple(applied), tuple(skipped))
+            if item.action == ACTION_SOUND:
+                used.extend(
+                    (item.number, command.clip.media_id)
+                    for command in commands
+                    if isinstance(command, AddClip) and command.clip.media_id is not None
+                )
+    return ApplyResult(tuple(applied), tuple(skipped), tuple(used))
+
+
+def file_version(path: Path) -> tuple[int, int] | None:
+    """ファイルの版（大きさ, 更新時刻） 読めなければ ``None``"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _held(project: Project, sound: MediaItem) -> MediaItem | None:
+    """作品の素材のうち ``sound`` と同じ物（同じ ID か、同じ場所のファイル）"""
+    found = project.find_media(sound.id)
+    if found is not None:
+        return found
+    return next((media for media in project.media if same_place(media.path, sound.path)), None)
 
 
 def _commands(project: Project, item: DirectionItem) -> list[Command]:
@@ -441,8 +524,29 @@ def _commands(project: Project, item: DirectionItem) -> list[Command]:
 
 
 def _sound_commands(project: Project, item: DirectionItem) -> list[Command]:
-    """効果音を効果音のトラックへ置く 空いていなければ足したトラックへ置く"""
-    if item.media_id is None or project.find_media(item.media_id) is None:
+    """効果音を効果音のトラックへ置く 空いていなければ足したトラックへ置く
+
+    登録したフォルダから選んだ音（:attr:`DirectionItem.sound_media`）は、まだ作品の素材で
+    なければ素材へ入れてから置く 入れるのも同じ取り消しの段なので、1 回で素材ごと戻る
+    """
+    added: list[Command] = []
+    sound = item.sound_media
+    media_id = item.media_id
+    if (
+        media_id is not None
+        and project.find_media(media_id) is None
+        and sound is not None
+        and sound.id == media_id
+    ):
+        held = _held(project, sound)
+        if held is not None:
+            # 計画の後で同じファイルを取り込んでいた（別の ID） その素材を使う もう 1 本足すと
+            # 素材一覧に同じ音が 2 つ並ぶ
+            media_id = held.id
+        else:
+            added.append(AddMedia(sound))
+            project = added[0].apply(project)
+    if media_id is None or project.find_media(media_id) is None:
         raise ValueError("効果音の素材が見つかりません（計画の後で外された）")
     # 計画を作った時の検査だけでは、その後に人が同じ区間へ置いた効果音を見落とす
     # 足すのは別のトラックなので、重なると両方が鳴って大きくなる 付ける直前の作品でも見る
@@ -456,7 +560,7 @@ def _sound_commands(project: Project, item: DirectionItem) -> list[Command]:
     clip = Clip(
         timeline_start=item.start_frame,
         duration=item.end_frame - item.start_frame,
-        media_id=item.media_id,
+        media_id=media_id,
     )
     timeline = project.timeline
     # 音のソロがあると、ソロでない音のトラックは鳴らない 足すトラックもソロにそろえる
@@ -473,6 +577,6 @@ def _sound_commands(project: Project, item: DirectionItem) -> list[Command]:
         # 消音・鍵・ソロの外のトラックへ置くと、付いたことになっても鳴らない（置けない）
         audible = track.id in sounding and not track.locked
         if track.kind is TrackKind.AUDIO and track.name == SOUND_TRACK_NAME and free and audible:
-            return [AddClip(track.id, clip)]
+            return [*added, AddClip(track.id, clip)]
     track = Track(kind=TrackKind.AUDIO, name=SOUND_TRACK_NAME, solo=solo)
-    return [AddTrack(track), AddClip(track.id, clip)]
+    return [*added, AddTrack(track), AddClip(track.id, clip)]

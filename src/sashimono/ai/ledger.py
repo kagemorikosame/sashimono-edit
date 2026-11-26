@@ -394,6 +394,7 @@ LEDGER: tuple[Entry, ...] = (
         "メニュー/表示/画面配置を初期に戻す", _LAYOUT, "layout.docks", "preferences.dock_tabs"
     ),
     read_only("メニュー/表示/ショートカットの設定…", _SHORTCUTS, "shortcuts"),
+    read_only("メニュー/表示/エクスプローラー", _LAYOUT, "layout.docks.explorer.visible"),
     read_only("メニュー/表示/設定…", _SETTINGS, "preferences"),
     missing(
         "メニュー/再生/再生 / 停止",
@@ -616,6 +617,85 @@ LEDGER: tuple[Entry, ...] = (
         "素材一覧の右クリック/プールから外す",
         "remove_media",
         note="使っていない素材だけ ファイルは消さない 取り消し 1 回で戻る",
+    ),
+    # --- エクスプローラー（#520 #521 #522） 登録したフォルダの素材 ---
+    # 登録と外しは本人の設定（どのフォルダを AI に見せるかも本人が決める #350 の決定）
+    read_only(
+        "エクスプローラー/登録…｜フォルダを分類（効果音・BGM・動画・画像など）を付けて登録する",
+        _SETTINGS,
+        "preferences.explorer_folders",
+    ),
+    read_only(
+        "エクスプローラー/外す｜選んだ登録したフォルダの登録を外す ファイルは消さない",
+        _SETTINGS,
+        "preferences.explorer_folders",
+    ),
+    same(
+        "エクスプローラー/読み直す｜フォルダの中を見直す 後から足したファイルを一覧へ出す",
+        "search_library",
+        note="search_library は呼ぶたびにフォルダを見直す 見るのは AI に使わせる分類のフォルダだけ",
+        safety=Safety.READ_ONLY,
+    ),
+    # 表示の切り替え（一覧とアイコン）は本人の好みで覚える 中身は search_library で読める
+    read_only(
+        "エクスプローラー/一覧｜名前・長さ・大きさなどを列に並べる 見出しで並べ替える",
+        _SETTINGS,
+        "preferences.explorer_view",
+    ),
+    read_only(
+        "エクスプローラー/アイコン｜見本の絵と波形を大きく並べる",
+        _SETTINGS,
+        "preferences.explorer_view",
+    ),
+    # 下見の再生 AI は音を聞けず動きも見られない（作品の再生の行と同じ）
+    hidden(
+        "エクスプローラー/再生｜選んだファイルを下見で再生する・止める（Space）",
+        "AI は音を聞けず動きも見られない 長さと頭の 1 分の大きさは search_library で読む"
+        " 決定の 5 つに当たらず未決",
+    ),
+    same(
+        "エクスプローラー/タイムラインへ｜選んだファイルを読み込んで再生位置へ置く"
+        " 取り消し 1 回で戻る",
+        "place_media",
+        "place_sound",
+        note=(
+            "library_file_id で取り込んで置く AI が使えるのは本人が AI に使わせると選んだ分類の"
+            "フォルダの物だけ（既定は効果音と BGM）"
+        ),
+    ),
+    same(
+        "エクスプローラーの右クリック/タイムラインへ置く",
+        "place_media",
+        "place_sound",
+        note="library_file_id で取り込んで置く 使えるのは AI に使わせる分類のフォルダの物だけ",
+    ),
+    same(
+        "エクスプローラーの右クリック/素材一覧へ読み込む",
+        "import_media",
+        note="library_file_ids と pool_only で素材一覧へ入れるだけにする 取り消し 1 回で戻る",
+    ),
+    hidden("エクスプローラーの右クリック/エクスプローラーで開く", _OUTSIDE),
+    # お気に入り（本人の要望 2026-11-24） 作品ではなく本人の側に覚えるアプリ自身の設定（#350）
+    # AI は search_library の favorite と favorites_only で読む
+    read_only(
+        "エクスプローラーの右クリック/お気に入りに入れる",
+        _SETTINGS,
+        "preferences.explorer_favorite_paths",
+    ),
+    read_only(
+        "エクスプローラーの右クリック/お気に入りから外す",
+        _SETTINGS,
+        "preferences.explorer_favorite_paths",
+    ),
+    read_only(
+        "エクスプローラーの木の右クリック/お気に入りに入れる",
+        _SETTINGS,
+        "preferences.explorer_favorite_paths",
+    ),
+    read_only(
+        "エクスプローラーの木の右クリック/お気に入りから外す",
+        _SETTINGS,
+        "preferences.explorer_favorite_paths",
     ),
     # --- 字幕パネル ---
     same("字幕パネル/起こす…", "transcribe"),
