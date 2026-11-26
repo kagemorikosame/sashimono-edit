@@ -34,14 +34,17 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+import wave
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -51,6 +54,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import numpy as np
 from PySide6.QtCore import QEvent, QEventLoop, QPoint, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QSurfaceFormat
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
@@ -98,6 +102,7 @@ from sashimono.core.commands import (
 from sashimono.core.io import Preset, PresetStore
 from sashimono.core.io.aliases import AliasStore
 from sashimono.core.io.library import PRESET, Library
+from sashimono.core.material_library import CATEGORY_SOUND_EFFECT, LibraryFolder
 from sashimono.core.model import (
     AnimatedValue,
     Clip,
@@ -113,8 +118,10 @@ from sashimono.core.timebase import FrameRate
 from sashimono.effects.definition import registry
 from sashimono.effects.sources import TEXT
 from sashimono.effects.strokes import STROKE
+from sashimono.engine.audio.library_sound import PreviewPlayer
 from sashimono.runtime import PackageStatus, PackStatus
 from sashimono.ui.compat_dialog import CompatibilityDialog
+from sashimono.ui.explorer import VIEW_ICONS, ExplorerPanel
 from sashimono.ui.inspector import InspectorPanel
 from sashimono.ui.library_dialog import LibraryDialog
 from sashimono.ui.library_save import SaveDialog
@@ -1158,6 +1165,82 @@ def shot_preferences(context: Context) -> QImage:
     return _grab_dialog(_full_preferences())
 
 
+def _write_sample_sound(path: Path, seconds: float, level_db: float) -> None:
+    """見本の音（正弦波）を WAV で書く
+
+    同梱の効果音は無く、配布物の音を写真に入れることもできないので、その場で作る
+    大きさを変えておくと、一覧の「音の大きさ」の列に違う値が並ぶ
+    """
+    rate = 48000
+    count = int(seconds * rate)
+    amplitude = 10 ** (level_db / 20)
+    samples = [
+        int(32767 * amplitude * math.sin(2 * math.pi * 440 * i / rate)) for i in range(count)
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(struct.pack(f"<{count}h", *samples))
+
+
+class _SilentSink:
+    """下見の音を鳴らさない口 撮っている間に本人の机で音が出ないようにする"""
+
+    def write(self, samples: np.ndarray) -> None:
+        del samples
+
+    def close(self, drain: bool) -> None:
+        del drain
+
+
+def shot_explorer(context: Context) -> QImage:
+    """エクスプローラー 登録した動画のフォルダをアイコンで出し、1 本を下見に出したところ"""
+    if context.work is None or context.media is None:
+        raise ShotError("作業用のフォルダか見本の素材が無いので、エクスプローラーを撮れない")
+    library = context.work / "素材"
+    movies = library / "動画"
+    sounds = library / "効果音"
+    movies.mkdir(parents=True, exist_ok=True)
+    for name in ("オープニング.mp4", "街.mp4", "まとめ.mp4"):
+        shutil.copyfile(context.media, movies / name)
+    _write_sample_sound(sounds / "ドン.wav", 0.8, -8.0)
+    _write_sample_sound(sounds / "ピコン.wav", 0.4, -12.0)
+    panel = ExplorerPanel(
+        [
+            LibraryFolder(str(sounds), CATEGORY_SOUND_EFFECT),
+            LibraryFolder(str(movies), "video"),
+        ],
+        player=PreviewPlayer(sink=lambda _rate, _channels: _SilentSink()),
+        thumbs=context.work / "explorer-thumbs",
+    )
+    hide_from_screen(panel)
+    panel.resize(1100, 640)
+    panel.show()
+    try:
+        panel.open_folder(str(movies))
+        panel.set_view_mode(VIEW_ICONS)
+        # 見本の絵は裏の糸で作る 出そろう前に撮ると灰色の箱が並ぶ
+        _wait(panel, 4.0)
+        panel.select_file(movies / "街.mp4")
+        _wait(panel, 1.5)
+        hide_work_folder(panel)
+        return grab(panel)
+    finally:
+        panel.shutdown()
+        panel.deleteLater()
+
+
+def _wait(widget: QWidget, seconds: float) -> None:
+    """``seconds`` 秒のあいだ画面の仕事を回す 裏の糸の結果がタイマーで入るのを待つ"""
+    del widget
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        QApplication.processEvents()
+        time.sleep(0.02)
+
+
 def _full_preferences() -> PreferencesDialog:
     """設定の窓を、巻物にせず全部が見える高さで開く
 
@@ -2062,6 +2145,7 @@ SHOTS: tuple[Shot, ...] = (
     Shot("ymm4-shelf", "テンプレートの棚（見本の YMM4）", shot_ymm4_shelf, needs_media=False),
     Shot("ymm4-template", "YMM4 のテンプレートの再現", shot_ymm4_template, needs_media=False),
     Shot("preferences", "Wiki の設定のページ", shot_preferences, needs_media=False),
+    Shot("explorer", "README のエクスプローラー", shot_explorer),
     Shot("compat-report", "Wiki の困ったときのページ", shot_compat_report, needs_media=False),
     # ここから Wiki の手順書 名前の頭は手順書のページ
     Shot("first-new", "手順書 最初の 1 本: 新規", wiki_first_new, needs_media=False, wiki=True),
