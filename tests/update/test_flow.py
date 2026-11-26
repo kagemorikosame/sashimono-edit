@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from sashimono.core.io.locks import try_hold
+from sashimono.core.io.locks import HeldLock, is_held, try_hold
 from sashimono.update.flow import (
     UpdateBusyError,
     UpdateChoices,
@@ -80,6 +80,26 @@ class TestApplyingOnStart:
         assert (plan.mode, plan.pid, tuple(plan.arguments)) == ("apply", os.getpid(), ("作品.sme",))
         # 印は入れ替え係を起こす前に下ろす 失敗し続ける機械で、起動のたびに試さない
         assert not store.load().apply_on_start
+
+    def test_no_window_can_stage_until_the_swapper_runs(
+        self, layout: Layout, store: UpdateStateStore
+    ) -> None:
+        """予約した版を照らしてから入れ替え係が走り出すまで、落とす側の錠を押さえる（#528）
+        押さえないと、照らした直後にほかの窓が別の版を落とし、予約していない版へ入れ替わる
+        """
+        _stage(layout, "1.2.0")
+        store.save(UpdateState(ready_version="1.2.0", apply_on_start=True, apply_chosen=True))
+        stage_lock = lock_path(STAGE_LOCK, store.path.parent)
+        held: list[bool] = []
+
+        def swap(_plan: SwapPlan) -> bool:
+            held.append(is_held(stage_lock))
+            return True
+
+        assert apply_on_start(["x"], layout=layout, store=store, swap=swap, current="1.1.0")
+        assert held == [True]
+        # 走り出した後は入れ替え係の錠が守る 持ったままだと、閉じるまで落とす側が止まる
+        assert not is_held(stage_lock)
 
     def test_files_that_cannot_be_carried_stop_the_swap(
         self, layout: Layout, store: UpdateStateStore
@@ -548,6 +568,42 @@ class TestOneAtATime:
                 prepare(manifest, transport=transport, layout=layout, store=store)
         finally:
             held.release()
+
+    def test_a_swapper_started_while_waiting_for_the_lock_stops_it(
+        self, layout: Layout, store: UpdateStateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """落とす側の錠を取る直前に、ほかの窓が入れ替え係を起こして錠を放した（#528）
+        錠を取る前にしか入れ替え係を見ないと、入れ替えている最中の .new を別の版へ差し替える
+        """
+        transport, manifest = release(Ed25519PrivateKey.generate(), "1.2.0")
+        swapping: list[HeldLock | None] = []
+
+        def swapper_starts_first(path: Path) -> HeldLock | None:
+            swapping.append(try_hold(lock_path(SWAP_LOCK, store.path.parent)))
+            return try_hold(path)
+
+        monkeypatch.setattr("sashimono.update.flow.try_hold", swapper_starts_first)
+        try:
+            with pytest.raises(UpdateBusyError):
+                prepare(manifest, transport=transport, layout=layout, store=store)
+        finally:
+            for held in swapping:
+                if held is not None:
+                    held.release()
+        assert transport.requested == []
+        assert not is_held(lock_path(STAGE_LOCK, store.path.parent))
+
+    def test_settling_spares_a_running_swap(self, layout: Layout, store: UpdateStateStore) -> None:
+        # 入れ替え係が走っている間に待つ物の無い置き場を消すと、入れ替えている最中の物が消える
+        _stage(layout, "1.2.0")
+        held = try_hold(lock_path(SWAP_LOCK, store.path.parent))
+        assert held is not None
+        try:
+            settle(layout=layout, store=store, current="1.1.0", results=[])
+        finally:
+            held.release()
+        assert layout.staged.exists()
+        assert not is_held(lock_path(STAGE_LOCK, store.path.parent))
 
     def test_settling_spares_a_stage_in_progress(
         self, layout: Layout, store: UpdateStateStore
