@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 
 from sashimono import __version__
 from sashimono.core.io import load_project, save_project
-from sashimono.core.io.locks import is_held, try_hold
+from sashimono.core.io.locks import HeldLock, is_held, try_hold
 from sashimono.core.io.serialize import FORMAT_VERSION, PRE_UPGRADE_SUFFIX
 from sashimono.core.model import Project
 from sashimono.ui import updates as updates_module
@@ -405,6 +405,62 @@ class TestRestarting:
         assert not ready.controller.restart_now(NEWER)
         assert ready.launched == []
         assert ready.informed and ready.informed[-1][0] == "入れ替えを止めました"
+
+    def test_parts_starting_during_the_save_question_wait_again(self, ready: _Harness) -> None:
+        """保存の確認の窓が開いている間も画面の時計は回り、部品の自動更新が始まりうる
+        見直さずに渡すと、窓を閉じる所で部品の入れ替えを止め、部品の更新が終わらないまま入れ替わる
+        """
+
+        def parts_begin() -> bool:
+            ready.waits = [PARTS]
+            return True
+
+        ready.controller._confirm_close = parts_begin
+        assert not ready.controller.restart_now()
+        assert ready.launched == []
+        assert ready.controller._waiting == ("apply", NEWER)
+
+    def test_a_conversation_begun_during_the_save_question_refuses(self, ready: _Harness) -> None:
+        # 確認の間に始めた会話を見ずに渡すと、頼んだ編集が途中で切れる
+        def conversation_begins() -> bool:
+            ready.blockers = ["AI アシスタントが作業しています"]
+            return True
+
+        ready.controller._confirm_close = conversation_begins
+        assert not ready.controller.restart_now()
+        assert ready.launched == []
+        assert ready.informed and "AI アシスタントが作業しています" in ready.informed[-1][1]
+
+    def test_a_swap_begun_during_the_save_question_starts_nothing(self, ready: _Harness) -> None:
+        """確認の間にほかの窓が入れ替え係を起こした 渡すと入れ替え係が 2 つ走る"""
+        swap_lock = lock_path(SWAP_LOCK, ready.store.path.parent)
+        taken: list[HeldLock | None] = []
+
+        def swap_begins() -> bool:
+            taken.append(try_hold(swap_lock))
+            return True
+
+        ready.controller._confirm_close = swap_begins
+        try:
+            assert not ready.controller.restart_now()
+        finally:
+            for held in taken:
+                if held is not None:
+                    held.release()
+        assert ready.launched == []
+        assert ready.informed and ready.informed[-1][0] == "ほかの窓で入れ替えを始めています"
+
+    def test_an_unwritable_update_folder_says_so(
+        self, ready: _Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 錠を作れずに投げると、押した〔今すぐ再起動して入れる〕が黙って何も起こさない
+        def unwritable(_path: Path) -> HeldLock | None:
+            raise PermissionError("書けない")
+
+        monkeypatch.setattr(updates_module, "try_hold", unwritable)
+        assert not ready.controller.restart_now()
+        assert ready.launched == []
+        assert ready.informed and ready.informed[-1][0] == "入れ替えを始められません"
 
     def test_no_other_window_can_stage_while_handing_over(
         self, ready: _Harness, monkeypatch: pytest.MonkeyPatch

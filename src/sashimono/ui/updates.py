@@ -784,8 +784,17 @@ class UpdateController(QObject):
         assert self._layout is not None
         # 新しい頼みを見る前に、前に待っていた分をやめる 残すと、この頼みを断った後に前の頼み
         # （新しい版へ入れる）が部品の更新の終わりで動き、選び直した方（戻す）と違う物が走る
-        # 待てる作業だけなら、下で今の頼みとして待ち直す
+        # 待てる作業だけなら、_may_go が今の頼みとして待ち直す
         self._stop_waiting()
+        # 保存の確認の前にも 1 度見る 断るか待つと分かっているのに、保存を尋ねて手を止めさせない
+        if not self._may_go(mode, version) or self._busy_elsewhere():
+            return False
+        if not self._confirm_close():
+            return False
+        return self._hand_over(mode, version)
+
+    def _may_go(self, mode: str, version: str) -> bool:
+        """断る作業も待てる作業も無いか 断るなら理由を知らせ、待てるなら待ち直して偽を返す"""
         blockers = [*self._blockers()]
         if self._moving:
             # exe の隣のスクリプトを移している最中に入れ替えると、写す側（carry_user_files）と
@@ -802,28 +811,42 @@ class UpdateController(QObject):
         if waits:
             self._wait_for(mode, version, waits)
             return False
-        if self._busy_elsewhere():
+        return True
+
+    def _hand_over(self, mode: str, version: str) -> bool:
+        """入れ替え係へ渡す 渡してよいかの見直しは、すべてここで落とす側の錠を押さえてから行う
+
+        保存の確認や尋ねる窓が開いている間も画面の時計は回り、部品の自動更新が始まったり、
+        ほかの窓が別の版を落としたり入れ替え係を起こしたりする（#528 のレビューで 5 回続いた
+        取り合い） 見直しをこの 1 か所にまとめ、錠を押さえてから見る ここから入れ替え係が
+        走り出すまでは、写すのも起こすのも待つのもこの場で行い画面の時計を回さないので、
+        見た後に変わる物は無い 走り出した後は入れ替え係の錠を見て、落とす側（prepare）が止まる
+        """
+        try:
+            stage_lock = try_hold(lock_path(STAGE_LOCK, self._store.path.parent))
+        except OSError as exc:
+            # 更新の置き場に錠を作れない 書けない所で入れ替えると、結果も残せずに止まる
+            self._inform("入れ替えを始められません", f"更新の置き場に書き込めません（{exc}）")
             return False
-        if not self._confirm_close():
-            return False
-        # 確認で迷っている間に、ほかの窓が入れ替えを始めたかもしれない もう一度見る
-        if self._busy_elsewhere():
-            return False
-        # 版を照らしてから入れ替え係が走り出すまで、落とす側の錠を押さえる 押さえないと、
-        # 照らした直後にほかの窓が別の版を落として置き場を差し替え、本人が選んでいない版へ
-        # 入れ替わる 入れ替え係が走り出せば、入れ替え係の錠を見て落とす側が止まる（prepare）
-        stage_lock = try_hold(lock_path(STAGE_LOCK, self._store.path.parent))
         if stage_lock is None:
             self._inform_staging_elsewhere()
             return False
         try:
-            return self._hand_over(mode, version)
+            return self._hand_over_holding(mode, version)
         finally:
             stage_lock.release()
 
-    def _hand_over(self, mode: str, version: str) -> bool:
-        """選んだ版を照らし、本人の物を写して入れ替え係へ渡す 落とす側の錠を押さえて呼ぶ"""
+    def _hand_over_holding(self, mode: str, version: str) -> bool:
+        """落とす側の錠を押さえて呼ぶ 見直してから、本人の物を写して入れ替え係を起こす"""
         assert self._layout is not None
+        # 確認の窓の間に、会話・字幕起こし・部品の自動更新などが始まったかもしれない
+        if not self._may_go(mode, version):
+            return False
+        # 確認の窓の間に、ほかの窓が入れ替え係を起こしたかもしれない 落とす側の錠は自分が
+        # 持っているので、入れ替え係の錠だけを見る
+        if busy_with(self._store.path.parent) == "swap":
+            self._inform_other_swap()
+            return False
         if not self._still_there(mode, version):
             # 確認の間に置き場が別の版へ変わった（ほかの窓が落とし終えた・ベータを切った）
             # このまま進むと、本人が選んでいない版へ入れ替える 止めて選び直してもらう

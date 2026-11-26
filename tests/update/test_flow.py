@@ -101,6 +101,22 @@ class TestApplyingOnStart:
         # 走り出した後は入れ替え係の錠が守る 持ったままだと、閉じるまで落とす側が止まる
         assert not is_held(stage_lock)
 
+    def test_an_unwritable_update_folder_starts_normally(
+        self, layout: Layout, store: UpdateStateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """更新の置き場に錠を作れない（書けない所） 投げると、予約が無くても編集画面が開かない"""
+
+        def unwritable(_path: Path) -> HeldLock | None:
+            raise PermissionError("書けない")
+
+        monkeypatch.setattr("sashimono.update.flow.try_hold", unwritable)
+        assert not apply_on_start(["x"], layout=layout, store=store, current="1.1.0")
+
+        # 待つ物の無い置き場の片付けも、錠を作れなければ黙って次の起動へ回す
+        _stage(layout, "1.2.0")
+        settle(layout=layout, store=store, current="1.1.0", results=[])
+        assert layout.staged.exists()
+
     def test_files_that_cannot_be_carried_stop_the_swap(
         self, layout: Layout, store: UpdateStateStore
     ) -> None:

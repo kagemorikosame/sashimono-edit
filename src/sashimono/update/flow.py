@@ -203,7 +203,12 @@ def apply_on_start(
     # 予約した版を照らしてから入れ替え係が走り出すまで、落とす側の錠を押さえる 押さえないと、
     # 照らした直後にほかの窓が別の版を落として置き場を差し替え、予約していない版へ入れ替わる
     # （画面からの入れ替え UpdateController._restart と同じ守り #528）
-    stage_lock = try_hold(lock_path(STAGE_LOCK, store.path.parent))
+    try:
+        stage_lock = try_hold(lock_path(STAGE_LOCK, store.path.parent))
+    except OSError:
+        # 更新の置き場に錠を作れない（書けない所） 入れ替えずにいつもどおり起動する
+        # 投げると、予約が無くても編集画面が開かない
+        return False
     if stage_lock is None:
         return False
     try:
@@ -340,7 +345,10 @@ def _drop_staged(layout: Layout, folder: Path) -> None:
     前の物や、入れ替えている最中の物を消してしまう） 落とす側の錠を押さえてから入れ替え係の
     錠を見る 見てから消すまでの間に、ほかの窓が落とし始めたり入れ替え係を起こしたりしない
     """
-    lock = try_hold(lock_path(STAGE_LOCK, folder))
+    try:
+        lock = try_hold(lock_path(STAGE_LOCK, folder))
+    except OSError:
+        return  # 錠を作れない所では片付けない 次の起動でまた試すだけで、起動は止めない
     if lock is None:
         return
     try:
