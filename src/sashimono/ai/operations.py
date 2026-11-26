@@ -3606,13 +3606,18 @@ def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
     def look_and_measure() -> None:
         """見て回るのも測るのも裏（大きな登録先で画面のスレッドを止めない）"""
         try:
-            scans = [scan for scan in library.scan_for_ai() if scan.folder in folders]
+            # 名前とお気に入りは見て回る上限より先に当てる 打ち切った後で絞ると、2 万を越える
+            # 登録先で上限より後ろにある物が、名前で探しても見つからない
+            def wanted_file(file: LibraryFile) -> bool:
+                return bool(match_files([file], query)) and (
+                    not favorites_only or library.is_favorite(file)
+                )
+
+            scans = [
+                scan for scan in library.scan_for_ai(accept=wanted_file) if scan.folder in folders
+            ]
             look.missing = sum(1 for scan in scans if scan.missing)
-            look.found.extend(
-                file
-                for file in match_files((file for scan in scans for file in scan.files), query)
-                if not favorites_only or library.is_favorite(file)
-            )
+            look.found.extend(file for scan in scans for file in scan.files)
             look.scanned.set()
             # 前に測れなかったファイルは、変わるまで測る数を使わずに飛ばす 飛ばさないと、読めない
             # ファイルが頭に並んだときに、呼び直すたびに同じ物で数を使い切り、後ろが測られない

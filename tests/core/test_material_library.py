@@ -571,3 +571,20 @@ def test_a_book_nested_too_deep_is_read_as_empty(tmp_path: Path) -> None:
     book = MeasureBook(path=store)
     book.preload()
     assert book.get(file) is None
+
+
+def test_an_id_beyond_the_scan_limit_is_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 壊れると、2 万を越える登録先で、上限より後ろにあるファイルの印を引いても見つからない
+    from functools import partial
+
+    for name in ("a.wav", "b.wav", "c.wav"):
+        _touch(tmp_path / "SE" / name)
+    monkeypatch.setattr(
+        material_library, "scan_folder", partial(material_library.scan_folder, limit=1)
+    )
+    library = MaterialLibrary(folders=(LibraryFolder(str(tmp_path / "SE"), CATEGORY_SOUND_EFFECT),))
+    wanted = file_id(tmp_path / "SE" / "c.wav")
+    found = library.find_for_ai(wanted)
+    assert found is not None and found.name == "c.wav"

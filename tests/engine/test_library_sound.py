@@ -406,3 +406,19 @@ class TestPreviewPlayer:
         player.pause()
         wait_until(sinks[0].closed.is_set, "止めた後の片付け")
         assert sinks[0].drained is False
+
+    def test_closing_forgets_the_last_error(self, tmp_path: Path) -> None:
+        # 壊れると、鳴らせなかったファイルを閉じた後も、前の失敗の訳が下見に出続ける
+        path = write_video(tmp_path / "動画.mp4", 1.0, tone_db=-20.0)
+
+        def broken(_rate: int, _channels: int) -> _Sink:
+            raise RuntimeError("出口がありません")
+
+        clock = _Clock()
+        player = PreviewPlayer(sink=broken, clock=clock)
+        player.open(path)
+        player.play()
+        wait_until(lambda: player.error is not None, "鳴らせない知らせ")
+        player.close()
+        assert player.error is None
+        assert player._by_clock is False and player._written == 0.0

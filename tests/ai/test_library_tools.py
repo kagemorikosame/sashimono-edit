@@ -500,9 +500,9 @@ class TestFifthReview:
         release = threading.Event()
         original = MaterialLibrary.scan_for_ai
 
-        def slow(library: MaterialLibrary) -> list[Any]:
+        def slow(library: MaterialLibrary, accept: Any = None) -> list[Any]:
             release.wait()
-            return original(library)
+            return original(library, accept)
 
         monkeypatch.setattr(MaterialLibrary, "scan_for_ai", slow)
         pending = run(work, "search_library")
@@ -523,7 +523,7 @@ class TestFifthReview:
         row = _file(work, "ドン.wav")
         work.material = replace(work.material, ai_categories=(CATEGORY_MUSIC,))
 
-        def no_scan(_library: MaterialLibrary) -> list[Any]:
+        def no_scan(_library: MaterialLibrary, _accept: Any = None) -> list[Any]:
             raise AssertionError("見て回り直した")
 
         monkeypatch.setattr(MaterialLibrary, "scan_for_ai", no_scan)
@@ -541,7 +541,7 @@ class TestSelfReviewFive:
         self, work: _LibraryHost, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # 壊れると、知らない印を 1 つ渡されただけで、画面のスレッドで登録先を全部見て回る
-        def no_scan(_library: MaterialLibrary) -> list[Any]:
+        def no_scan(_library: MaterialLibrary, _accept: Any = None) -> list[Any]:
             raise AssertionError("見て回った")
 
         monkeypatch.setattr(MaterialLibrary, "scan_for_ai", no_scan)
@@ -625,3 +625,19 @@ class TestSixthReview:
         _search(work, query="拍手")
         looks = operations._LIBRARY_LOOKS[work.material.book]
         assert len(looks) == 1
+
+
+class TestCodexAndCopilot:
+    def test_a_name_beyond_the_scan_limit_is_found(
+        self, work: _LibraryHost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 壊れると、2 万を越える登録先で、上限より後ろにある効果音を名前で探しても見つからない
+        from functools import partial
+
+        from sashimono.core import material_library
+
+        monkeypatch.setattr(
+            material_library, "scan_folder", partial(material_library.scan_folder, limit=1)
+        )
+        names = [row["name"] for row in _search(work, query="拍手")["files"]]
+        assert names == ["拍手大.wav"]

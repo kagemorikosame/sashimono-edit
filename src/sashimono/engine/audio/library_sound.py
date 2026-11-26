@@ -299,6 +299,11 @@ class PreviewPlayer:
             self._position = 0.0
             self._frame = None
             self._still_pending = False
+            # 前のファイルの状態は全部初めへ戻す 残すと、閉じた後も前の失敗の訳が出続けるか、
+            # 次のファイルの終わり方と再開の位置を前のファイルの段で決める
+            self._error = None
+            self._by_clock = False
+            self._written = 0.0
 
     @property
     def path(self) -> Path | None:

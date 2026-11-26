@@ -796,15 +796,19 @@ class MaterialLibrary:
         """AI が見てよいフォルダ 選ばれていない分類のフォルダは名前も見せない"""
         return tuple(folder for folder in self.folders if folder.category in self.ai_categories)
 
-    def scan_for_ai(self) -> list[FolderScan]:
+    def scan_for_ai(self, accept: Callable[[LibraryFile], bool] | None = None) -> list[FolderScan]:
         """AI が見てよいフォルダを見て回る 中に別に登録したフォルダがあれば、そこには入らない
         （その登録の分類が AI に使わせる物なら、それ自身として別に見て回る）
+
+        ``accept`` は絞り込み（名前・お気に入り・印） 見て回る上限（:data:`SCAN_LIMIT`）より
+        先に当てる 打ち切った後で絞ると、上限より後ろにある物は名前で探しても見つからない
         """
         others = [folder.path for folder in self.folders]
         scans = [
             scan_folder(
                 folder,
                 skip=[path for path in others if not same_place(path, folder.path)],
+                accept=accept,
             )
             for folder in self.ai_folders
         ]
@@ -835,7 +839,8 @@ class MaterialLibrary:
             # 覚えていない印は見て回らずに断る（画面のスレッドから呼ぶ道具のため） 呼び手は
             # search_library で探し直すよう伝える
             return None
-        for found in self.scan_for_ai():
+        # 探す印だけを拾う（上限より後ろのファイルでも見つける）
+        for found in self.scan_for_ai(accept=lambda file: file.id == wanted):
             for file in found.files:
                 if file.id == wanted:
                     return file
