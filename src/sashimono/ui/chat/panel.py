@@ -78,6 +78,8 @@ from sashimono.ai.session import (
     system_prompt,
 )
 from sashimono.core.commands import Author
+from sashimono.core.material_library import file_id
+from sashimono.core.model import MediaItem
 from sashimono.ui.chat.direction_box import DirectionPlanBox
 from sashimono.ui.chat.parts_updater import PartsUpdater
 from sashimono.ui.chat.plan_box import PlanBox, plan_progress
@@ -1867,7 +1869,25 @@ class ChatPanel(QWidget):
         """
         if self._queued:
             return
-        result = proposal_for(self._host.document).apply(self._host.document)
+        library = self._host.material_library
+        before = {media.id for media in self._host.document.project.media}
+        # 登録したフォルダから取り込む効果音は、付ける今の設定でも AI に使ってよい物だけ
+        # 見て回らずに覚えた印で確かめ、同じ音は 1 回だけ確かめる（画面のスレッドで、項目の数だけ
+        # 登録先を全部見て回らない 計画の音は search_library で覚えた物）
+        checked: dict[str, bool] = {}
+
+        def allowed(media: MediaItem) -> bool:
+            key = file_id(media.path)
+            if key not in checked:
+                checked[key] = library.find_for_ai(key, scan=False) is not None
+            return checked[key]
+
+        result = proposal_for(self._host.document).apply(self._host.document, allowed=allowed)
+        # 計画から取り込んだ素材にも解析（波形と絵の並び）を頼む ほかの読み込みの道と同じ
+        # 頼まないと、取り込んだ効果音の波形がタイムラインに出ない
+        for media in self._host.document.project.media:
+            if media.id not in before:
+                self._host.analyze(media)
         if result is not None:
             note = f"演出を {len(result.applied)} 個付けました（取り消し 1 回で全部戻ります）"
             if result.skipped:

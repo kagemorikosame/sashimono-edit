@@ -20,6 +20,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -50,6 +51,7 @@ from sashimono.ai.auto_fix import (
 from sashimono.ai.direction_plan import (
     ProposalView,
     build_items,
+    file_version,
     proposal_for,
     sound_problem,
 )
@@ -301,6 +303,16 @@ from sashimono.core.io.presets import Preset
 from sashimono.core.io.serialize import SUFFIX, json_text
 from sashimono.core.io.subtitles import SUBTITLE_SUFFIXES, subtitles_in_range
 from sashimono.core.jetcut import cut_targets, merge_ranges, plan_cuts
+from sashimono.core.material_library import (
+    CATEGORIES as LIBRARY_CATEGORIES,
+)
+from sashimono.core.material_library import (
+    CATEGORY_MUSIC,
+    LibraryFile,
+    MaterialLibrary,
+    MeasureBook,
+    match_files,
+)
 from sashimono.core.mixing import (
     DEFAULT_PEAK_CEILING_DB,
     DUCK_ATTACK_MS_RANGE,
@@ -2757,8 +2769,9 @@ def _get_direction_recipes(host: EditorHost, arguments: dict[str, Any]) -> objec
             "cue は find_highlights の signals と同じ名前で、その盛り上がりに action を付けます"
             " per_minute は 1 分あたりの上限、min_gap_seconds は同じ kind どうしをあける秒数"
             "（レシピをまたいで数えます） amount は寄るなら拡大率の %、揺らすなら幅の画素で、"
-            "emphasis の scale_percent・amplitude_px に渡します 効果音は本人が取り込んだ音の素材"
-            "から選び、無ければ付けずにそう伝えます 付けた後は measure_direction で数えます"
+            "emphasis の scale_percent・amplitude_px に渡します 効果音は search_library で本人が"
+            "登録したフォルダから選ぶか、本人が取り込んだ音の素材から選び、無ければ付けずに"
+            "そう伝えます 付けた後は measure_direction で数えます"
             " 強さとジャンルは本人の設定で、頼みの文で言われたときだけ引数で変えます"
         ),
     }
@@ -2828,9 +2841,20 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
     if end <= start:
         raise ToolError("範囲（start_frame〜end_frame）が空です")
     sound = None
+    version: tuple[int, int] | None = None
     raw_sound = arguments.get("sound_media_id")
+    raw_file = arguments.get("sound_file_id")
+    if raw_sound and raw_file:
+        raise ToolError("sound_media_id と sound_file_id はどちらか 1 つだけ渡してください")
     if raw_sound:
         sound = _require_media(project, str(raw_sound))
+    elif raw_file:
+        # 登録したフォルダの効果音（#522） 計画に出すだけで、取り込むのは人の〔付ける〕
+        # 取り込むのは〔付ける〕のとき その間にファイルが差し替わったら付けない 版は調べる前と後の
+        # 両方で取り、同じときだけ調べた素材と組にする（調べている間に差し替わると、古い長さの
+        # 素材に新しい版を付けてしまう）
+        sound, version = _library_media_versioned(host, raw_file)
+    if sound is not None:
         problem = sound_problem(sound)
         if problem is not None:
             raise ToolError(problem)
@@ -2847,6 +2871,7 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         [ClipId(p.source) if p.source else None for p in planned],
         sound,
         end,
+        version,
     )
     view = proposal_for(host.document).propose(items, dropped, DIRECTION_STRENGTHS[taste.strength])
     note = (
@@ -2858,7 +2883,18 @@ def _propose_direction(host: EditorHost, arguments: dict[str, Any]) -> object:
         " 項目の続き（next_offset）は get_direction_plan に offset を渡して読みます"
     )
     if any(rule.recipe.action == "sound" for rule in book.rules) and sound is None:
-        note += " 効果音は sound_media_id に本人が取り込んだ短い音の素材を渡すと計画に入ります"
+        note += (
+            " 効果音は sound_file_id に search_library の効果音（category が sound_effect）の"
+            " file_id を、または sound_media_id に本人が取り込んだ短い音の素材を渡すと計画に"
+            "入ります どちらも無ければ付けずにそう伝えます"
+        )
+    elif sound is not None and raw_file:
+        note += (
+            # 名前はここに書かない この道具は名前と場所を送ると宣言していない（AI は
+            # search_library の返事で名前を読んでいる）
+            " 効果音は登録したフォルダから選んだ音です〔付ける〕で作品の素材へ取り込みます"
+            " 使った素材の名前とフォルダ（search_library の name と folder）を返事に書きます"
+        )
     return _proposal_result(view, {}, note)
 
 
@@ -2878,6 +2914,9 @@ def _proposal_result(view: ProposalView, arguments: dict[str, Any], note: str) -
         head["skipped"] = [
             {"number": number, "reason": reason} for number, reason in view.result.skipped
         ]
+    # 付けた後は実際に使った素材を出す 計画の後で同じファイルを取り込んでいれば計画の素材は
+    # 作品に無く、そのまま返すと作品に無い素材の ID を AI が使いに行く
+    used = dict(view.result.media) if view.result is not None else {}
     rows = [
         {
             "number": item.number,
@@ -2888,7 +2927,9 @@ def _proposal_result(view: ProposalView, arguments: dict[str, Any], note: str) -
             "end_frame": item.end_frame,
             "amount": item.amount,
             "clip_id": str(item.clip_id) if item.clip_id is not None else None,
-            "media_id": str(item.media_id) if item.media_id is not None else None,
+            "media_id": str(used.get(item.number, item.media_id))
+            if item.media_id is not None
+            else None,
             "excluded": item.number in view.excluded,
         }
         for item in view.items
@@ -3465,6 +3506,359 @@ def _search_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     # 短い語で何万行も当たり、詰めて何千本のクリップがある作品だと画面が止まる
     rows = _RowsOf(hits, lambda hit: _hit_row(project, hit))
     return _paged_after(head, rows, arguments, "hits", "" if hits else _NOTHING_FOUND)
+
+
+# --- 登録したフォルダの素材（エクスプローラー #520 #522） ---
+
+#: 1 回の search_library で新しく測るファイルの数 測るのは編集画面のスレッドで、1 本ごとに
+#: 頭の 1 分をデコードする（0.1〜0.3 秒） 数百本を一度に測ると画面が止まる 測った物は覚え、
+#: 次の呼び出しでは測らない
+LIBRARY_MEASURE_PER_CALL = 20
+
+#: 登録が無い・使ってよい分類が無いときの案内 付けずに理由を返す（#522 の決まり）
+_NO_LIBRARY = (
+    "AI が使ってよいフォルダが登録されていません 効果音や BGM は付けずに、そう伝えます"
+    " 本人がエクスプローラー（表示 → エクスプローラー）でフォルダを分類を付けて登録し、"
+    "表示 → 設定… の「エクスプローラー: AI に使わせる分類」で選ぶと使えます"
+)
+
+
+def _library_category(library: MaterialLibrary, arguments: dict[str, Any]) -> str | None:
+    """引数 ``category`` 本人が AI に使わせない分類は断る（黙って空を返すと、無いと誤る）"""
+    raw = arguments.get("category")
+    if raw is None:
+        return None
+    # 文字か確かめてから表で引く 配列や辞書を渡されると、表で引く所で型の例外になり道具ごと落ちる
+    if not isinstance(raw, str) or raw not in LIBRARY_CATEGORIES:
+        raise ToolError(f"category は {'・'.join(LIBRARY_CATEGORIES)} のどれかです")
+    if raw not in library.ai_categories:
+        raise ToolError(
+            f"{LIBRARY_CATEGORIES[str(raw)]}の分類は、本人が AI に使わせない設定にしています"
+            " 使わずに、そう伝えます（選ぶのは本人 表示 → 設定… の"
+            "「エクスプローラー: AI に使わせる分類」）"
+        )
+    return str(raw)
+
+
+#: 測り終えるのを待つ上限（秒） 越えたら測れた分だけで答える（残りは次の呼び出しで測る）
+LIBRARY_MEASURE_WAIT = 60.0
+
+
+@dataclass
+class _LibraryLook:
+    """裏で見て回る・測る仕事 1 つ
+
+    見て回り終えたか（``scanned``）と測り終えたか（``done``）を分けて持つ
+
+    同じ頼み（場所・分類・名前・お気に入り）が走っている間に呼び直されたら、新しく見て回らずに
+    この仕事を待つ 待ちきれずに答えたときも、呼び直せば続きを待てる
+    """
+
+    scanned: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+    found: list[LibraryFile] = field(default_factory=list)
+    missing: int = 0
+
+
+#: 走っている見て回る仕事 本人の測った物の控えごと（作品の窓ごと）に、頼みの形で引く
+_LIBRARY_LOOKS: weakref.WeakKeyDictionary[MeasureBook, dict[tuple[object, ...], _LibraryLook]] = (
+    weakref.WeakKeyDictionary()
+)
+_LIBRARY_LOOKS_LOCK = threading.Lock()
+
+
+def _search_library(host: EditorHost, arguments: dict[str, Any]) -> object:
+    """登録したフォルダから、AI が使ってよい分類の素材を名前と長さで探す（#522）
+
+    見て回るのも測るのも裏のスレッドで行い、終わってから答える（:class:`Pending`） 道具は画面の
+    スレッドで動くので、ここで見て回ったり 20 本をデコードしたりすると数秒のあいだ画面が止まる
+    答えは待った後の今の設定（登録・分類・BGM）で組み直す
+    """
+    library = host.material_library
+    category = _library_category(library, arguments)
+    query = arguments.get("query", "")
+    if not isinstance(query, str):
+        raise ToolError("query は文字で渡してください")
+    shortest = _optional_number(arguments, "min_seconds", 0.0)
+    longest = _optional_number(arguments, "max_seconds", 0.0)
+    # 本人がお気に入りに入れた物だけ（いつもの効果音） 使ってよい分類の外の物は、
+    # お気に入りでも出さない（見て回るのが使ってよい分類のフォルダだけなので）
+    favorites_only = _flag_argument(arguments, "favorites_only", False)
+    folders = [
+        folder for folder in library.ai_folders if category is None or folder.category == category
+    ]
+    if not folders:
+        return _library_head(library) | {"files_total": 0, "files": [], "note": _NO_LIBRARY}
+    key = (tuple(library.folders), library.ai_categories, category, query, favorites_only)
+    with _LIBRARY_LOOKS_LOCK:
+        looks = _LIBRARY_LOOKS.setdefault(library.book, {})
+        look = looks.get(key)
+        fresh = look is None or look.done.is_set()
+        if fresh:
+            # 終わった仕事は置いておかない（待っている呼び出しは仕事を直に持つので、外しても
+            # 読める） 置いたままにすると、違う名前で探すたびに見つけた一覧が窓を閉じるまで残る
+            for old in [name for name, held in looks.items() if held.done.is_set()]:
+                del looks[old]
+            look = _LibraryLook()
+            looks[key] = look
+    assert look is not None
+
+    def look_and_measure() -> None:
+        """見て回るのも測るのも裏（大きな登録先で画面のスレッドを止めない）"""
+        try:
+            # 名前とお気に入りは見て回る上限より先に当てる 打ち切った後で絞ると、2 万を越える
+            # 登録先で上限より後ろにある物が、名前で探しても見つからない
+            def wanted_file(file: LibraryFile) -> bool:
+                return bool(match_files([file], query)) and (
+                    not favorites_only or library.is_favorite(file)
+                )
+
+            scans = [
+                scan for scan in library.scan_for_ai(accept=wanted_file) if scan.folder in folders
+            ]
+            look.missing = sum(1 for scan in scans if scan.missing)
+            look.found.extend(file for scan in scans for file in scan.files)
+            look.scanned.set()
+            # 前に測れなかったファイルは、変わるまで測る数を使わずに飛ばす 飛ばさないと、読めない
+            # ファイルが頭に並んだときに、呼び直すたびに同じ物で数を使い切り、後ろが測られない
+            wanted = [
+                file
+                for file in look.found
+                if library.measured(file, allow_measure=False) is None and not library.tried(file)
+            ][:LIBRARY_MEASURE_PER_CALL]
+            for file in wanted:
+                library.measured(file, allow_measure=True)
+        finally:
+            look.scanned.set()
+            look.done.set()
+
+    def finish() -> object:
+        now = host.material_library
+        head = _library_head(now)
+        if not look.scanned.is_set():
+            # 見て回り終えていない 空の答え（素材が無い）と見分けが付くように、途中だと返す
+            return head | {
+                "scanning": True,
+                "files_total": 0,
+                "files": [],
+                "note": (
+                    "登録したフォルダをまだ見て回っています（大きいか応答の遅い登録先） 少し待って"
+                    "同じ引数で呼び直すと、続きを待ちます"
+                ),
+            }
+        # 待っている間に本人が登録や AI に使わせる分類を変えていれば、今の設定で絞り直し、
+        # 今の持ち主（一番深い登録）の分類とフォルダで答える 待つ前の物のまま返すと、使わせない
+        # と決めた分類の名前が出るか、後から子を別の分類で登録した素材を前の分類で知らせる
+        allowed: list[LibraryFile] = []
+        for file in look.found:
+            owner = now.owner_of(file.path)
+            if owner is None or owner.category not in now.ai_categories:
+                continue
+            if category is not None and owner.category != category:
+                continue
+            current = LibraryFile(file.path, owner, file.size, file.modified_ns)
+            if favorites_only and not now.is_favorite(current):
+                continue
+            allowed.append(current)
+        summary = head | {"folders_missing": look.missing}
+        return _library_rows(host, now, summary, allowed, shortest, longest, arguments)
+
+    if fresh:
+        threading.Thread(target=look_and_measure, name="search-library", daemon=True).start()
+    return Pending(wait=look.done.wait, seconds=LIBRARY_MEASURE_WAIT, then=finish)
+
+
+def _library_head(library: MaterialLibrary) -> dict[str, Any]:
+    """答えの頭 使ってよい分類と、BGM を頼まれなくても付けてよいか（どちらも今の本人の設定）"""
+    return {
+        "categories": [
+            {"category": key, "name": LIBRARY_CATEGORIES[key]} for key in library.ai_categories
+        ],
+        "auto_bgm": library.auto_bgm,
+    }
+
+
+def _library_rows(
+    host: EditorHost,
+    library: MaterialLibrary,
+    head: dict[str, Any],
+    matched: Sequence[LibraryFile],
+    shortest: float | None,
+    longest: float | None,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """測った物で行を作る（測らない 測るのは :func:`_search_library` の裏の仕事）"""
+    used = {os.path.normcase(str(media.path)): media.id for media in _project(host).media}
+    rows: list[dict[str, Any]] = []
+    unmeasured = 0
+    for file in matched:
+        known = library.measured(file, allow_measure=False)
+        if known is None:
+            unmeasured += 1
+            if shortest is not None or longest is not None:
+                # 長さの分からない物は、長さで絞る頼みには出さない（後で測れば出る）
+                continue
+        elif (shortest is not None and known.seconds < shortest) or (
+            longest is not None and known.seconds > longest
+        ):
+            continue
+        row: dict[str, Any] = {
+            "file_id": file.id,
+            "name": file.name,
+            "folder": file.subfolder,
+            "category": file.category,
+            "favorite": library.is_favorite(file),
+            "measured": known is not None,
+        }
+        if known is not None:
+            row["seconds"] = round(known.seconds, 2)
+            row["loudness_lufs"] = known.loudness
+            row["peak_dbfs"] = known.peak
+        media_id = used.get(os.path.normcase(str(file.path)))
+        if media_id is not None:
+            row["media_id"] = str(media_id)
+        rows.append(row)
+    # 測った物を書くのは窓（閉じるとき） 道具のコードはファイルを書かない（#327 の決まり）
+    head = dict(head)
+    head["files_total"] = len(rows)
+    head["not_measured"] = unmeasured
+    note = (
+        "file_id を place_sound・place_media の library_file_id か、propose_direction の"
+        " sound_file_id に渡すと、作品の素材へ取り込んで使います（取り消し 1 回で戻る）"
+        " 効果音は短い音（10 秒以下）、BGM は長い音から選びます 手がかりは名前・フォルダ・"
+        "長さ（seconds）・頭の 1 分の大きさ（loudness_lufs）だけで、曲の雰囲気は分かりません"
+        " 使った素材の名前とフォルダは返事に書きます"
+    )
+    filtered = shortest is not None or longest is not None
+    if unmeasured:
+        note += (
+            f" {unmeasured} 個はまだ測っていません（measured が false 1 回に"
+            f" {LIBRARY_MEASURE_PER_CALL} 個ずつ測る） 呼び直すと続きを測ります"
+        )
+    if head["folders_missing"]:
+        note += " 見つからない登録のフォルダがあります（消えたか移った） 本人に伝えます"
+    if CATEGORY_MUSIC in library.ai_categories and not library.auto_bgm:
+        note += " BGM は頼まれたときだけ付けます（本人の設定）"
+    result = _paged_after(head, rows, arguments, "files", note)
+    if filtered and unmeasured and "next_offset" in result:
+        # 長さで絞るときは、後で測れた物が返した行より前に入ることがある offset で続きを
+        # 読むと、その物を飛ばして同じ行を 2 度読む 測り終えるまでは続きを出さず、頭から呼び直させる
+        del result["next_offset"]
+        result["note"] = (
+            str(result.get("note", ""))
+            + " まだ測っていない物があるので続き（next_offset）は出していません offset を付けずに"
+            "頭から呼び直してください"
+        )
+    return result
+
+
+def _library_media(host: EditorHost, raw: object) -> tuple[MediaItem, bool]:
+    """``library_file_id`` のファイルの素材と、作品の素材にまだ無いか（取り込みが要るか）
+
+    同じファイルを前に取り込んでいれば、その素材を使う もう 1 本素材を足すと、同じ音が
+    素材一覧に 2 つ並び、取り消しの後も片方だけが残る
+    """
+    if not isinstance(raw, str) or not raw:
+        raise ToolError("library_file_id は search_library の file_id を文字で渡してください")
+    # 覚えていない印は見て回らずに断る 道具は画面のスレッドで動くので、ここで登録したフォルダを
+    # 全部見て回ると大きな登録先で画面が止まる（search_library は裏で見て回り、印を覚える）
+    file = host.material_library.find_for_ai(raw, scan=False)
+    if file is None:
+        raise ToolError(
+            f"library_file_id のファイルが見つかりません: {raw}（本人が AI に使わせる分類の"
+            "フォルダの物だけを指せます search_library で探し直してください）"
+        )
+    key = os.path.normcase(str(file.path))
+    for media in host.document.project.media:
+        if os.path.normcase(str(media.path)) == key:
+            return media, False
+    try:
+        return host.probe(file.path), True
+    except ToolError:
+        # 開けない訳の文には場所が入る 名前と場所を送ると宣言していない道具（propose_direction）
+        # からも呼ぶので、場所を出さずに断る
+        raise ToolError(
+            f"登録したフォルダのファイルを開けません（{raw}） 壊れているか、読めない形式です"
+            " 別の file_id を選んでください"
+        ) from None
+
+
+def _library_media_versioned(
+    host: EditorHost, raw: object
+) -> tuple[MediaItem, tuple[int, int] | None]:
+    """:func:`_library_media` と、取り込みが要る素材なら調べたときのファイルの版
+
+    版は調べる前と後で取り、読めないか違えば断る（調べた長さと版が同じファイルの物と言えない）
+    作品の素材にもうある物は版を持たない（取り込まないので差し替わりの心配が無い）
+    """
+    if isinstance(raw, str) and raw:
+        known = host.material_library.find_for_ai(raw, scan=False)
+        before = file_version(known.path) if known is not None else None
+    else:
+        before = None
+    media, fresh = _library_media(host, raw)
+    if not fresh:
+        return media, None
+    after = file_version(media.path)
+    if before is None or before != after:
+        raise ToolError(
+            f"登録したフォルダのファイルが調べている間に変わりました（{raw}）"
+            " もう一度呼んでください"
+        )
+    return media, after
+
+
+def _hiding_library_names(
+    handler: Callable[[EditorHost, dict[str, Any]], object],
+) -> Callable[[EditorHost, dict[str, Any]], object]:
+    """登録したフォルダの素材を置く道具の断りの文から、まだ取り込んでいない素材の名前を除く
+
+    断りの文（「X に音がありません」など）は伏せる表を通るが、表には作品の素材の名前しか無い
+    取り込む前の素材の名前は、名前と場所を送らないと決めた人の所でもそのまま出る 印に置き換える
+    """
+
+    def guarded(host: EditorHost, arguments: dict[str, Any]) -> object:
+        try:
+            return handler(host, arguments)
+        except ToolError as exc:
+            raw = arguments.get("library_file_id")
+            if not isinstance(raw, str) or not raw:
+                raise
+            file = host.material_library.find_for_ai(raw, scan=False)
+            text = str(exc)
+            if file is not None:
+                text = text.replace(file.name, f"〔{raw}〕").replace(file.path.stem, f"〔{raw}〕")
+            raise ToolError(text) from None
+
+    return guarded
+
+
+def _media_or_library(host: EditorHost, arguments: dict[str, Any]) -> tuple[MediaItem, bool]:
+    """引数の素材 ``media_id`` か ``library_file_id`` のどちらか 2 つ目は取り込みが要るか"""
+    has_media = arguments.get("media_id") not in (None, "")
+    has_file = arguments.get("library_file_id") not in (None, "")
+    if has_media == has_file:
+        raise ToolError(
+            "media_id（作品の素材）か library_file_id（search_library の file_id）の"
+            "どちらか 1 つを渡してください"
+        )
+    if has_file:
+        return _library_media(host, arguments["library_file_id"])
+    return _require_media(_project(host), str(arguments["media_id"])), False
+
+
+def _library_note(
+    media: MediaItem, fresh_import: bool, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """登録したフォルダから置いたときに添える欄 使った素材の名前とフォルダを返事に書かせる #522"""
+    if arguments.get("library_file_id") in (None, ""):
+        return {}
+    return {
+        "media_id": str(media.id),
+        "imported": fresh_import,
+        "folder": media.path.parent.name,
+        "library_note": "使った素材の名前とフォルダ（folder）を返事に書きます",
+    }
 
 
 def _hit_row(project: Project, hit: Hit) -> dict[str, Any]:
@@ -5214,25 +5608,53 @@ def _import_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not isinstance(raw, list):
         raise ToolError("paths はファイルパスの配列で渡してください")
     paths = [Path(entry) for entry in _string_items(raw, "paths")]
-    if not paths:
-        raise ToolError("paths が空です")
+    raw_ids = arguments.get("library_file_ids") or []
+    if not isinstance(raw_ids, list):
+        raise ToolError("library_file_ids は search_library の file_id の配列で渡してください")
+    ids = _string_items(raw_ids, "library_file_ids")
+    if not paths and not ids:
+        raise ToolError("paths か library_file_ids のどちらかに 1 つ以上渡してください")
+    # 素材一覧へ入れるだけ（エクスプローラーの〔素材一覧へ読み込む〕と同じ #521）
+    pool_only = _flag_argument(arguments, "pool_only", False)
+
+    sources: list[tuple[MediaItem, bool]] = []
+    held = {os.path.normcase(Path(media.path).absolute()): media for media in _project(host).media}
+    for path in paths:
+        if not path.exists():
+            raise ToolError(f"ファイルがありません: {path}")
+        # 前に読み込んだ同じファイルはその素材を使う 開き直すと別の ID になり、素材一覧に増える
+        existing = held.get(os.path.normcase(path.absolute()))
+        sources.append((existing, False) if existing is not None else (host.probe(path), True))
+    sources.extend(_library_media(host, entry) for entry in ids)
+    # 同じファイルは場所で 1 つにまとめる（同じ印の 2 度・場所と印の両方で渡した物）
+    # 未取り込みのファイルを 2 度開くと、どちらも前の文書を見て「まだ無い」と決め、
+    # 別の素材として 2 つ登録される
+    unique: dict[str, tuple[MediaItem, bool]] = {}
+    for media, fresh in sources:
+        unique.setdefault(os.path.normcase(Path(media.path).absolute()), (media, fresh))
+    sources = list(unique.values())
 
     project = _project(host)
     commands: list[Command] = []
     added: list[str] = []
-    for path in paths:
-        if not path.exists():
-            raise ToolError(f"ファイルがありません: {path}")
-        media = host.probe(path)
-        batch = insert_media(project, media, at_frame=None, split_audio=host.splits_media)
+    for media, fresh in sources:
+        if pool_only:
+            # 前に取り込んだ同じファイルは足さない 同じ名前の素材が一覧に並ぶだけになる
+            batch: list[Command] = [AddMedia(media)] if fresh else []
+        else:
+            batch = insert_media(project, media, at_frame=None, split_audio=host.splits_media)
         for command in batch:
             project = command.apply(project)
         commands.extend(batch)
-        host.analyze(media)
         added.append(f"{media.name} ({media.id})")
 
-    host.apply_commands(commands, f"素材を読み込み: {len(paths)} 件")
-    return {"imported": added} | _small_placed(project, commands)
+    if commands:
+        label = "素材一覧へ読み込み" if pool_only else "素材を読み込み"
+        host.apply_commands(commands, f"{label}: {len(sources)} 件")
+    for media, fresh in sources:
+        if fresh:
+            host.analyze(media)
+    return {"imported": added} | ({} if pool_only else _small_placed(project, commands))
 
 
 def _small_placed(project: Project, commands: Sequence[Command]) -> dict[str, Any]:
@@ -5405,12 +5827,15 @@ def _media_spans(
 
 def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
-    media = _require_media(project, str(arguments.get("media_id", "")))
+    media, fresh_import = _media_or_library(host, arguments)
     at_frame = _placed_frame(arguments)
     # 区間は開き直した後の素材で確かめる 古い作品の素材は短いファイルに差し替わっていることがある
     fresh = _with_known_video_end(host, media)
     if "ranges" in arguments:
-        return _place_spans(host, fresh, _media_spans(project, fresh, arguments), at_frame)
+        spans = _place_spans(host, fresh, _media_spans(project, fresh, arguments), at_frame)
+        if fresh_import:
+            host.analyze(fresh)
+        return spans | _library_note(fresh, fresh_import, arguments)
     commands = insert_media(
         project,
         fresh,
@@ -5420,7 +5845,14 @@ def _place_media(host: EditorHost, arguments: dict[str, Any]) -> object:
     if not commands:
         raise ToolError(f"{media.name} は長さが無いので置けません")
     host.apply_commands(commands, f"配置: {media.name}")
-    return {"placed": media.name} | _small_placed(_project(host), commands)
+    if fresh_import:
+        # 取り込んだ素材は読み込みと同じく解析を頼む 頼まないと波形も絵の並びも出ない
+        host.analyze(fresh)
+    return (
+        {"placed": media.name}
+        | _library_note(fresh, fresh_import, arguments)
+        | _small_placed(_project(host), commands)
+    )
 
 
 def _place_spans(
@@ -5428,7 +5860,7 @@ def _place_spans(
     media: MediaItem,
     spans: list[tuple[Fraction, Fraction]],
     at_frame: int | None,
-) -> object:
+) -> dict[str, Any]:
     """素材の一部を順に並べて置く 取り消し 1 回で全部戻る 置いたクリップの ID を返す"""
     project = _project(host)
     commands = place_media_spans(
@@ -7859,7 +8291,7 @@ def _fixed_param(clip: Clip, kind: str, name: str, value: float) -> Clip:
 
 def _place_sound(host: EditorHost, arguments: dict[str, Any]) -> object:
     project = _project(host)
-    media = _require_media(project, str(arguments.get("media_id", "")))
+    media, fresh_import = _media_or_library(host, arguments)
     if not media.has_audio:
         raise ToolError(f"{media.name} に音がありません")
     if media.has_video or media.is_still:
@@ -7935,14 +8367,26 @@ def _place_sound(host: EditorHost, arguments: dict[str, Any]) -> object:
                 clip = _fixed_param(clip, FADE_EFFECT_KIND, "fade_out", fade_out)
             commands.append(AddClip(command.track_id, clip))
     host.apply_commands(commands, f"音を置く: {media.name}")
+    if fresh_import:
+        host.analyze(media)
     added = [command for command in commands if isinstance(command, AddClip)]
-    return {
+    result: dict[str, Any] = {
         "placed": len(added),
         "clip_ids": [str(command.clip.id) for command in added],
         "track_ids": list(dict.fromkeys(str(command.track_id) for command in added)),
         "from_frame": at,
         "to_frame": max(command.clip.timeline_end for command in added),
     }
+    note = _library_note(media, fresh_import, arguments)
+    if note:
+        # BGM を敷いたら声と重なる所を下げる（#522 の目標 3） 頼まれた BGM でも、話している間
+        # ずっと同じ大きさで鳴ると声が聞き取りにくい
+        note["name"] = media.name
+        note["library_note"] = (
+            "使った素材の名前（name）とフォルダ（folder）を返事に書きます BGM なら duck_audio で"
+            "声と重なる所を下げます"
+        )
+    return result | note
 
 
 def _auto_color(host: EditorHost, arguments: dict[str, Any]) -> object:
@@ -11969,6 +12413,49 @@ OPERATIONS: tuple[Operation, ...] = (
         preview=from_result(),
     ),
     Operation(
+        name="search_library",
+        description=(
+            "本人がエクスプローラーに登録したフォルダから、AI が使ってよい分類（本人の設定 既定は"
+            "効果音 sound_effect と BGM music）の素材を名前・フォルダ・長さで探す（読むだけ）"
+            " 効果音や BGM を付けるときは、作品に音の素材が無くてもまずこれで探す"
+            " 返す file_id を place_sound・place_media の library_file_id か propose_direction の"
+            " sound_file_id に渡す 長さ（seconds）と頭の 1 分の大きさ（loudness_lufs）は測って"
+            "覚えた物（1 回に数十個ずつ測る） 雰囲気は分からないので名前とフォルダで選ぶ"
+            " 登録が無いか使ってよい分類で無ければ付けずにそう伝える auto_bgm が false なら"
+            " BGM は頼まれたときだけ付ける 一覧（files）は" + PAGING_NOTE
+        ),
+        schema=_schema(
+            {
+                "category": {
+                    "type": "string",
+                    "enum": list(LIBRARY_CATEGORIES),
+                    "description": (
+                        "分類 "
+                        + "・".join(f"{k}（{v}）" for k, v in LIBRARY_CATEGORIES.items())
+                        + " 省くと AI が使ってよい分類すべて"
+                    ),
+                },
+                "query": _string(
+                    "名前で絞る語（空白で区切ると全部を含む物 下のフォルダの名前も見る）"
+                    " 例「拍手」「ドン 爆発」"
+                ),
+                "min_seconds": _number("この秒より短い物を外す（BGM を探すとき）"),
+                "max_seconds": _number("この秒より長い物を外す（効果音は 10 以下）"),
+                "favorites_only": _boolean(
+                    "本人がお気に入りに入れた物（とお気に入りのフォルダの中の物）だけ"
+                    " 「いつもの」と頼まれたときに使う（既定 false）"
+                ),
+                **_paging(),
+            }
+        ),
+        handler=_search_library,
+        # 返すのはファイルとフォルダの名前（名前と場所）と測った数と本人の設定（分類と BGM）
+        # 場所そのものは返さない（file_id で指させる）
+        sends=frozenset({Outbound.PROJECT, Outbound.APP_SETTINGS, Outbound.FILES}),
+        preview=from_result(),
+        name_keys=frozenset({"name", "folder"}),
+    ),
+    Operation(
         name="media_scene_sheet",
         description=(
             "素材（動画）の場面ごとの真ん中の絵を 1 枚に並べる 場面の説明を作るための絵で、"
@@ -12500,6 +12987,10 @@ OPERATIONS: tuple[Operation, ...] = (
                 "sound_media_id": _string(
                     "効果音に使う本人の素材（音だけ・短い） 省くと効果音は計画に入れない"
                 ),
+                "sound_file_id": _string(
+                    "効果音に使う登録したフォルダの音（search_library の file_id 音だけ・"
+                    "10 秒以下） 〔付ける〕で作品の素材へ取り込む sound_media_id とどちらか 1 つ"
+                ),
                 "strength": {
                     "type": "string",
                     "enum": list(DIRECTION_STRENGTHS),
@@ -12602,16 +13093,25 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation(
         name="import_media",
-        description="ファイルを読み込んでタイムラインの末尾へ置く",
+        description=(
+            "ファイルを読み込んでタイムラインの末尾へ置く library_file_ids（search_library の"
+            " file_id）で登録したフォルダの素材も読み込める pool_only を true にすると素材一覧へ"
+            "入れるだけで置かない 取り消し 1 回で戻る"
+        ),
         schema=_schema(
             {
                 "paths": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "ファイルパス",
-                }
+                },
+                "library_file_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "登録したフォルダの素材（search_library の file_id）",
+                },
+                "pool_only": _boolean("素材一覧へ入れるだけで置かない（既定 false）"),
             },
-            ["paths"],
         ),
         handler=_import_media,
         sends=_WITH_FILES,
@@ -12652,11 +13152,15 @@ OPERATIONS: tuple[Operation, ...] = (
         description=(
             "読み込み済みの素材をタイムラインへ置く ranges を渡すと素材の一部だけを、渡した順に"
             "隙間なく並べて置く 長い素材から何か所か取るときは全体を置いて分割せず ranges を使う"
-            " 取り消し 1 回で全部戻る"
+            " library_file_id（search_library の file_id）を渡すと、登録したフォルダの素材を"
+            "取り込んで置く 取り消し 1 回で全部戻る"
         ),
         schema=_schema(
             {
-                "media_id": _string("置く素材"),
+                "media_id": _string("置く素材 library_file_id とどちらか 1 つ"),
+                "library_file_id": _string(
+                    "登録したフォルダの素材（search_library の file_id） 作品の素材へ取り込んで置く"
+                ),
                 "at_frame": _integer("置く位置 省略すると末尾"),
                 "ranges": {
                     "type": "array",
@@ -12672,12 +13176,11 @@ OPERATIONS: tuple[Operation, ...] = (
                     },
                 },
             },
-            ["media_id"],
         ),
-        handler=_place_media,
+        handler=_hiding_library_names(_place_media),
         sends=_WITH_FILES,
         preview=from_arguments(),
-        name_keys=frozenset({"placed"}),
+        name_keys=frozenset({"placed", "folder"}),
         writes=True,
     ),
     Operation(
@@ -14415,11 +14918,16 @@ OPERATIONS: tuple[Operation, ...] = (
             "空いたレイヤー）の空いた所へ置く until_frame を渡すと、そこまで素材を繰り返して"
             "敷き詰め（loop が true のとき）、最後の 1 本を until_frame で切る 音量とフェードは"
             "置いたクリップの音量・フェードの欄に入る 動画の素材は place_media で置く"
-            " 取り消し 1 回で戻る"
+            " library_file_id（search_library の file_id）を渡すと、登録したフォルダの音を"
+            "作品の素材へ取り込んで置く（取り込みも同じ取り消しの段） BGM を敷いたら duck_audio で"
+            "声と重なる所を下げる 取り消し 1 回で戻る"
         ),
         schema=_schema(
             {
-                "media_id": _string("置く素材（音だけの素材）"),
+                "media_id": _string("置く素材（音だけの素材） library_file_id とどちらか 1 つ"),
+                "library_file_id": _string(
+                    "登録したフォルダの音（search_library の file_id） 作品の素材へ取り込んで置く"
+                ),
                 "at_frame": _integer("置く位置 省くと再生位置"),
                 "track_id": _string("置きたいトラック 埋まっていればほかの空いたトラックへ"),
                 "until_frame": _integer("ここで終える（BGM を敷く範囲の終わり）"),
@@ -14428,12 +14936,12 @@ OPERATIONS: tuple[Operation, ...] = (
                 "fade_in_seconds": _number("頭のフェードイン 秒（0〜60）"),
                 "fade_out_seconds": _number("終わりのフェードアウト 秒（0〜60）"),
             },
-            ["media_id"],
         ),
-        handler=_place_sound,
+        handler=_hiding_library_names(_place_sound),
         writes=True,
         sends=_WITH_FILES,
         preview=from_arguments(),
+        name_keys=frozenset({"name", "folder"}),
     ),
     Operation(
         name="transcribe",
